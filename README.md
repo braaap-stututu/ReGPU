@@ -44,6 +44,9 @@ Options: `REGPU_FSR3` (with the FidelityFX signed DLLs), `REGPU_DLSS` and `REGPU
 which helps cross-builds from Linux. The header has to come from the same `src/gpu/fsr1.hlsl`: rebuild it
 when that file or its entry points change.
 
+Shader speed: `REGPU_OPTIMIZE_SHADERS=1` rebuilds shaders optimised in the background; `REGPU_OPTIMIZE_LEVEL=1|2|3`
+(default 1) sets the fxc level, with its own cache files per level.
+
 Ship Microsoft's `d3dcompiler_47.dll` (the Windows SDK's `Redist\D3D\x64`, redistributable) beside
 your executable: ReGPU loads it from there first. Under Wine/Proton the system copy is Wine's own,
 which can't compile the translated shaders.
