@@ -2936,8 +2936,11 @@ void ApplyOutputSize()
     g_upscale.dlaaOut.Reset();
     g_upscale.renderWidth = g_upscale.renderHeight = 0;
     g_upscale.reset = true;
-    PresenterResize(OutputWidth(), OutputHeight());
-    Log("renderer: output %ux%u (live)", OutputWidth(), OutputHeight());
+    // The swap chain is the whole resolution, as at start (CreateWindowAndDevice): with a forced
+    // aspect ratio the image (the render size) is narrower and goes in its middle on black. Sized
+    // to the image instead, a host window of another shape stretched it out of proportion.
+    PresenterResize(w, h);
+    Log("renderer: output %ux%u (live, render %ux%u)", w, h, OutputWidth(), OutputHeight());
 }
 
 // A new guest frame size (NoteFrontBuffer), taken at the start of a frame like a new output size. The EDRAM surfaces
