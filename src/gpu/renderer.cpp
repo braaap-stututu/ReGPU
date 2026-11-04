@@ -7540,8 +7540,7 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
     // for later passes to draw through (FH1's minimap came out as white blobs for a moment when the world
     // loaded: 27 such draws were dropped while their pipelines built, the first frame after the load).
     // REGPU_SKIP_PLAIN_RECTS=1: skippable like the rest, as before.
-    if (PlainRectMustDraw() || ScreenPassMustDraw())
-        return false;
+    const bool opaque = (blend & 0xFF1F1F1F) == 0x00010001 || (blend & 0x1F) == 1 && ((blend >> 8) & 0x1F) == 0;
     // Only a draw into a screen-wide pass (pitch 1280: the main view, redrawn next frame) may be skipped. An
     // off-screen pass may be drawn once and kept: FM3 builds a car's livery (vinyl layers, blended) once per car
     // load, and a layer skipped there stayed missing until the car was rebuilt (first boots, a cold cache; FH1's
@@ -7550,7 +7549,18 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
     static LiveSwitch skipOffscreen("REGPU_SKIP_OFFSCREEN");
     if (!skipOffscreen && !WidePass())
         return false;
-    const bool opaque = (blend & 0xFF1F1F1F) == 0x00010001 || (blend & 0x1F) == 1 && ((blend >> 8) & 0x1F) == 0;
+    // A blended plain rect is a fade, flash or tint, not a clear: dropped for a frame, it only shows a
+    // frame without the effect. It waited for its pipeline as clears do (Too Human, a first visit to a
+    // level: 21 and 17 ms stalls, both fades). REGPU_MUST_DRAW_BLENDED_RECTS=1: they wait, as before.
+    // (A plain rect is decided here, before the screen-pass rule, which would make every one wait.)
+    static LiveSwitch mustDrawBlendedRects("REGPU_MUST_DRAW_BLENDED_RECTS");
+    if (PlainRectMustDraw())
+    {
+        if (opaque || mustDrawBlendedRects)
+            return false;
+    }
+    else if (ScreenPassMustDraw())
+        return false;
     return !opaque || GameSettled();
 }
 
