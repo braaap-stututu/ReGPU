@@ -29,6 +29,7 @@ using Clock = std::chrono::steady_clock;
 #include "render/presenter.h"
 #include "gpu/renderer.h"
 #include "render/xr.h"
+#include "gpu/shader_scan.h"
 #include "precise_sleep.h"
 
 extern HANDLE g_profiledWorker; // renderer.cpp
@@ -79,6 +80,13 @@ struct Gpu
     std::mutex interruptMutex;
     std::condition_variable interruptCv;
     std::vector<std::pair<uint32_t, uint32_t>> pendingInterrupts; // source, cpu
+    // regpu::StopInterrupts: the stop, and the dispatches counted in (DispatchInterrupt). Sequentially
+    // consistent on both sides: a dispatch either sees the stop and touches nothing, or the stop sees it
+    // counted and waits for it. stopCv wakes the stop when the count falls, under stopMutex.
+    std::atomic<bool> interruptsStopped{ false };
+    std::atomic<uint32_t> dispatching{ 0 };
+    std::mutex stopMutex;
+    std::condition_variable stopCv;
 
     std::atomic<uint64_t> swaps{ 0 };
     std::atomic<uint32_t> lastPacket{ 0 };
@@ -1012,6 +1020,23 @@ thread_local PPCContext* t_cpContext = nullptr;
 
 void DispatchInterrupt(PPCContext& ctx, uint32_t source, uint32_t cpu)
 {
+    // regpu::StopInterrupts: counted in before the stop test and out after the callback (on every exit),
+    // so the whole dispatch, the PCR write as well as the call, is either waited for or never started.
+    // Dispatches on different threads only share the counter: none waits for another here.
+    g_gpu.dispatching.fetch_add(1);
+    struct CountOut
+    {
+        ~CountOut()
+        {
+            if (g_gpu.dispatching.fetch_sub(1) == 1 && g_gpu.interruptsStopped.load())
+            {
+                std::lock_guard lock(g_gpu.stopMutex);
+                g_gpu.stopCv.notify_all();
+            }
+        }
+    } countOut;
+    if (g_gpu.interruptsStopped.load())
+        return; // dropped: the host is shutting down
     const uint32_t callback = g_gpu.interruptCallback;
     if (!callback)
         return;
@@ -1030,6 +1055,8 @@ void DispatchInterrupt(PPCContext& ctx, uint32_t source, uint32_t cpu)
 
 // Vblank callbacks run on a guest thread of their own, like the console's
 // DPC; command-stream interrupts run on the command processor thread.
+// After regpu::StopInterrupts it keeps taking what is raised (and what was queued at the stop), and
+// DispatchInterrupt drops each one.
 void InterruptLoop(PPCContext& ctx)
 {
     for (;;)
@@ -2343,6 +2370,29 @@ void regpu::triple::SubmitViews(const View (&views)[3])
     for (int i = 0; i < 3; i++)
         stereo::g_tripleIn[i] = views[i];
     stereo::g_tripleAt = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+}
+
+bool regpu::StopInterrupts(uint32_t waitMs)
+{
+    // From here on every dispatch returns at once and no shader scan pass starts; then wait for the
+    // dispatches already past the test and the scan pass in flight, both within the one deadline. The
+    // vblank, interrupt and command processor threads keep running: only interrupt callbacks and the
+    // scan stop (the command processor's own reads and writes of guest memory are not covered). A
+    // command processor waiting in the INTERRUPT packet for the draws and fences before it is not
+    // counted until it reaches DispatchInterrupt, which then drops the interrupt.
+    const auto deadline = Clock::now() + std::chrono::milliseconds(waitMs);
+    g_gpu.interruptsStopped.store(true);
+    ShaderScanStop();
+    std::unique_lock lock(g_gpu.stopMutex);
+    const bool idle = g_gpu.stopCv.wait_until(lock, deadline, [] { return g_gpu.dispatching.load() == 0; });
+    lock.unlock();
+    const bool scanIdle = ShaderScanWaitStopped(deadline);
+    if (idle && scanIdle)
+        Log("gpu: interrupts and shader scan stopped");
+    else
+        Log("gpu: interrupts and shader scan stopped; %s still running after %u ms",
+            !idle && !scanIdle ? "a callback and a shader scan pass were" : !idle ? "a callback was" : "a shader scan pass was", waitMs);
+    return idle && scanIdle;
 }
 
 void regpu::SetFrameLimit(uint32_t maxFps, bool vsync)
