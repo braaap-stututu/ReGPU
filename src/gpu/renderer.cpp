@@ -12560,6 +12560,36 @@ ID3D12Resource* PrepareOverlay()
     }, false);
 }
 
+// The host presents (PresenterHostPresents, Host::presentImage): hands it the picture after the list that
+// made it was submitted, in place of PresenterRecordCopy and PresenterPresent. The states are the ones that
+// list leaves the resources in; the overlay (PrepareOverlayOn's result) is a copy source.
+void HostPresent(regpu::PresentImage::Kind kind, ID3D12Resource* image, D3D12_RESOURCE_STATES imageState, ID3D12Resource* overlay)
+{
+    regpu::PresentImage picture{};
+    picture.kind = kind;
+    picture.frame = g_r.frame;
+    picture.image = image;
+    if (image)
+    {
+        const D3D12_RESOURCE_DESC desc = image->GetDesc();
+        picture.width = uint32_t(desc.Width);
+        picture.height = desc.Height;
+        picture.imageState = uint32_t(imageState);
+    }
+    picture.overlay = overlay;
+    if (overlay)
+    {
+        picture.overlayWidth = kOverlayW;
+        picture.overlayHeight = kOverlayH;
+        picture.overlayX = picture.overlayY = 24; // where PresenterRecordCopy puts it
+        picture.overlayState = uint32_t(D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
+    // Read once, here: a host that clears the pointer (at its shutdown) is not called any more; the
+    // picture is then simply not shown.
+    if (const auto present = regpu::GetHost().presentImage)
+        present(picture);
+}
+
 // Presents the last frame again with the overlay on top, on a separate command list
 // (the frame's own list is mid-recording while the command processor waits).
 void HoldPresent()
@@ -12603,7 +12633,7 @@ void HoldPresent()
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     g_hold.list->ResourceBarrier(1, &b);
-    const bool ok = PresenterRecordCopy(g_hold.list.Get(), g_hold.image.Get(), overlay, kOverlayW, kOverlayH, timer, kTimerW, kTimerH);
+    const bool ok = PresenterHostPresents() || PresenterRecordCopy(g_hold.list.Get(), g_hold.image.Get(), overlay, kOverlayW, kOverlayH, timer, kTimerW, kTimerH);
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     g_hold.list->ResourceBarrier(1, &b);
     g_hold.list->Close();
@@ -12612,7 +12642,11 @@ void HoldPresent()
     ID3D12CommandList* lists[] = { g_hold.list.Get() };
     g_r.recorder.Real(); // (after what the replay stream still queues)
     SubmitLists(1, lists);
-    PresenterPresent();
+    if (PresenterHostPresents())
+        HostPresent(regpu::PresentImage::Kind::Hold, g_hold.image.Get(),
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, overlay);
+    else
+        PresenterPresent();
     // Wait for it: the allocator and upload buffer are reused at the next hold.
     const UINT64 value = g_r.nextFence++;
     g_r.queue->Signal(g_r.fence.Get(), value);
@@ -12693,7 +12727,7 @@ void BootPresent(const std::vector<uint8_t>& rgba)
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     g_hold.list->ResourceBarrier(1, &b);
-    const bool ok = PresenterRecordCopy(g_hold.list.Get(), texture.Get());
+    const bool ok = PresenterHostPresents() || PresenterRecordCopy(g_hold.list.Get(), texture.Get());
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     g_hold.list->ResourceBarrier(1, &b);
     g_hold.list->Close();
@@ -12702,7 +12736,10 @@ void BootPresent(const std::vector<uint8_t>& rgba)
     ID3D12CommandList* lists[] = { g_hold.list.Get() };
     g_r.recorder.Real(); // (after what the replay stream still queues)
     SubmitLists(1, lists);
-    PresenterPresent();
+    if (PresenterHostPresents())
+        HostPresent(regpu::PresentImage::Kind::Boot, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
+    else
+        PresenterPresent();
     const UINT64 value = g_r.nextFence++;
     g_r.queue->Signal(g_r.fence.Get(), value);
     if (g_r.fence->GetCompletedValue() < value)
@@ -18234,7 +18271,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         // (Supersampling grades into a texture first: the downsample reads it.)
         // (A smaller front buffer is graded into its own image: grading straight into the back buffer needs equal sizes.)
         graded = GradeFrontBuffer(image, it->second.guestFormat == 7,
-            gammaCopy || GetSettings().enhance || GetSettings().ssaa > 1.0f || TripleMode() || !frontFullSize ? nullptr : &job);
+            gammaCopy || PresenterHostPresents() || GetSettings().enhance || GetSettings().ssaa > 1.0f || TripleMode() || !frontFullSize ? nullptr : &job);
         if (job.valid)
             gradeJob = &job;
         D3D12_RESOURCE_BARRIER b{};
@@ -18272,7 +18309,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     // otherwise waited for the replay here (Real) and then in the driver's Present (frame-queue throttling): ~10% of
     // its time on FM3's CPU-bound grid. Each frame end is one or the other; the next frame start follows its own read.
     static LiveSwitch asyncPresentSwitch("REGPU_ASYNC_PRESENT");
-    const bool asyncPresent = asyncPresentSwitch;
+    // (Not with a host presenter: it is handed the picture after the submission, on this thread.)
+    const bool asyncPresent = asyncPresentSwitch && !PresenterHostPresents();
     struct AsyncEnd
     {
         bool copy = false;
@@ -18293,7 +18331,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     else
     {
         regpu::xr::SetCaptureTag(vrTag);
-        presenting = fromResolve && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH, timer, kTimerW, kTimerH, fps, kFpsW, kFpsH,
+        // (The host presents: no copy; it is handed the picture after the submission, below.)
+        presenting = !PresenterHostPresents() && fromResolve && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH, timer, kTimerW, kTimerH, fps, kFpsW, kFpsH,
             gradeJob ? GradeIntoBackBuffer : nullptr, gradeJob);
     }
     {
@@ -18538,7 +18577,19 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         C().list->Close();
         ID3D12CommandList* lists[] = { C().list->Real() };
         SubmitLists(1, lists);
-        if (presenting)
+        if (PresenterHostPresents())
+        {
+            // Every swap, with or without a picture. `shown` in the state the list leaves it: the resolved
+            // and the graded image were put back above; the enhanced, supersampled, triple-screen and
+            // REGPU_VIEW_* ones stay copy sources.
+            D3D12_RESOURCE_STATES shownState = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            if (shown == image)
+                shownState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            else if (shown == graded)
+                shownState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            HostPresent(regpu::PresentImage::Kind::Frame, fromResolve ? shown : nullptr, shownState, overlay);
+        }
+        else if (presenting)
             PresenterPresent();
         Frame().fence = g_r.nextFence++;
         g_r.queue->Signal(g_r.fence.Get(), Frame().fence);
