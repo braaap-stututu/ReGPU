@@ -228,6 +228,8 @@ struct Upscale
     ComPtr<ID3D12Resource> motion;
     ComPtr<ID3D12DescriptorHeap> motionRtvHeap;
     D3D12_CPU_DESCRIPTOR_HANDLE motionRtv{};
+    vk::Image* vkMotion = nullptr;   // Vulkan: the motion and reactive targets (motionRtv, reactiveRtv), made with the
+    vk::Image* vkReactive = nullptr; // upscalers' conversion (phase 4); motion draws need both
     // The reactive mask for FSR 3/4 (R8, output size, the motion pipelines' third target): blended draws that
     // were not found in last frame (dynamic geometry: smoke, dust, sparks, particles) write how much they
     // cover; opaque draws leave it alone. The upscaler then trusts the new frame there instead of smearing
@@ -1864,8 +1866,17 @@ struct DrawState
     D3D12_RECT scissor{ -1, -1, -1, -1 };
     uint32_t stencilRef = ~0u;
     float blendFactor[4] = { -1, -1, -1, -1 };
-    ID3D12PipelineState* pso = nullptr;
+    VkPipeline pso = VK_NULL_HANDLE;
     D3D12_GPU_DESCRIPTOR_HANDLE table2{}, table3{}, samplers{};
+    bool texturesBound = false;               // Vulkan: sets 1-3 bound in this command buffer
+    VkDescriptorSet set0 = VK_NULL_HANDLE;    // Vulkan: the set 0 last bound (with its offsets)
+    uint32_t set0Offsets[3] = { ~0u, ~0u, ~0u };
+    struct VkIndexBinding
+    {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        VkIndexType type = VK_INDEX_TYPE_UINT16;
+    } vkIndexBuffer;
     D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     bool motionTargets = false; // the motion target is bound as the second render target
     bool motionRoot = false;    // the motion root signature is set
@@ -1873,6 +1884,30 @@ struct DrawState
     void Invalidate() { *this = DrawState{}; }
 };
 thread_local DrawState g_drawState;
+
+// A D3D viewport as Vulkan's, flipped to D3D's y-up NDC with a negative height (core since Vulkan 1.1): the translated
+// vertex shaders' positions and the pipelines' front faces stay as on D3D12.
+VkViewport ToVkViewport(const D3D12_VIEWPORT& v)
+{
+    return { v.TopLeftX, v.TopLeftY + v.Height, v.Width, -v.Height, v.MinDepth, v.MaxDepth };
+}
+// A D3D rectangle as a Vulkan one (offsets clamped at 0: Vulkan refuses negative scissor offsets).
+VkRect2D ToVkRect(const D3D12_RECT& r)
+{
+    const LONG left = std::max<LONG>(r.left, 0), top = std::max<LONG>(r.top, 0);
+    return { { int32_t(left), int32_t(top) }, { uint32_t(std::max<LONG>(r.right - left, 0)), uint32_t(std::max<LONG>(r.bottom - top, 0)) } };
+}
+VkPrimitiveTopology ToVkTopology(D3D_PRIMITIVE_TOPOLOGY t)
+{
+    switch (t)
+    {
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    case D3D_PRIMITIVE_TOPOLOGY_LINELIST: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+    case D3D_PRIMITIVE_TOPOLOGY_POINTLIST: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    }
+}
 
 // Texture cache key: address (4 KB aligned), format (6 bits), width and height (13 bits each).
 uint64_t TextureKey(uint32_t address, uint32_t format, uint32_t w, uint32_t h)
@@ -7697,7 +7732,7 @@ void WaitHoldingImpl(const std::function<bool()>& done);
 // Waits for the build (draws are never dropped: a missing pipeline used to leave
 // shadow passes undrawn). Cold builds can take 100+ ms; the overlay says so.
 // `force`: wait even with REGPU_ASYNC_PIPELINES (draws a pass cannot lose, see SkippableDraw).
-ID3D12PipelineState* WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry, bool force = false)
+VkPipeline WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry, bool force = false)
 {
     static LiveSwitch async("REGPU_ASYNC_PIPELINES");
     if (async && !force && entry->state.load(std::memory_order_acquire) == 0)
@@ -7708,7 +7743,7 @@ ID3D12PipelineState* WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry
     if (static LiveSwitch noInline("REGPU_NO_INLINE_PIPELINE"); !noInline)
         entry->Build();
     WaitHoldingImpl([&] { return entry->state.load(std::memory_order_acquire) != 0; });
-    return entry->state.load() == 1 ? entry->pso.Get() : nullptr;
+    return entry->state.load() == 1 ? entry->vk : VK_NULL_HANDLE;
 }
 
 PipelineKey MakePipelineKey(uint64_t vsHash, uint64_t psHash, bool depthOnly, bool cullable)
@@ -7832,7 +7867,7 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
 }
 
 extern thread_local bool g_hyperProbe;
-ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false, bool stripCut = false,
+VkPipeline GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false, bool stripCut = false,
     bool coverage = false, bool noKill = false, uint32_t fetchMask = 0)
 {
     PipelineKey key = MakePipelineKey(C().vsHash, C().psHash, depthOnly, cullable);
@@ -7857,10 +7892,10 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         key.flags |= 0x800; // (EnsurePipeline)
     if (stripCut)
         key.flags |= 0x100; // strips restart at index 0xFFFF (DrawImpl)
-    thread_local std::unordered_map<PipelineKey, ID3D12PipelineState*, PipelineKeyHash> ready; // (cleared when the pipelines are replaced: g_pipelineGen)
+    thread_local std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> ready; // (cleared when the pipelines are replaced: g_pipelineGen)
     // Runs of draws share a pipeline: the last one's answer first, before the map.
     thread_local PipelineKey lastKey{};
-    thread_local ID3D12PipelineState* lastPso = nullptr;
+    thread_local VkPipeline lastPso = VK_NULL_HANDLE;
     thread_local uint32_t gen = 0;
     if (const uint32_t now = g_pipelineGen.load(std::memory_order_acquire); now != gen)
     {
@@ -7900,8 +7935,8 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         }
         if (it != g_r.pipelines.end() && it->second->state.load(std::memory_order_acquire) == 1)
         {
-            ready.emplace(key, it->second->pso.Get());
-            return it->second->pso.Get();
+            ready.emplace(key, it->second->vk);
+            return it->second->vk;
         }
         entry = EnsurePipeline(vs, ps, key);
     }
@@ -7923,7 +7958,7 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     // (without this, async dropped opaque one-time draws too: a render-to-texture that runs once, such as a
     // baked texture, stayed black for good). REGPU_ASYNC_DROP_UNSKIPPABLE=1: dropped, as before.
     static LiveSwitch dropUnskippable("REGPU_ASYNC_DROP_UNSKIPPABLE");
-    ID3D12PipelineState* pso = WaitForPipeline(entry, PlainRectMustDraw() || !dropUnskippable);
+    VkPipeline pso = WaitForPipeline(entry, PlainRectMustDraw() || !dropUnskippable);
     if (g_perfTiming)
         if (const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count(); ms > 2.0)
             Log("perf: GetPipeline waited %.1f ms for pipeline %016llx/%016llx (state was %d)", ms, (unsigned long long)key.vs, (unsigned long long)key.ps, 0);
@@ -15848,7 +15883,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             g_tstat.shaderNotReady++;
     }
     D3D12_GPU_VIRTUAL_ADDRESS motionPrevious = 0; // last frame's vertex constants of this draw (b2)
-    ID3D12PipelineState* pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true, stripCut && directIndex) : nullptr;
+    VkPipeline pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true, stripCut && directIndex) : VK_NULL_HANDLE;
     const CompiledShader* psUsed = nullptr; // the pixel shader drawn with, when not a motion pipeline
     if (wantMotion && motion && !pso)
         g_tstat.noPipeline++;
@@ -16917,8 +16952,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         {
             float color[4];
             ClearColor(lc.colorFormat, lc.colorLo, lc.colorHi, color);
-            TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
-            C().list->ClearRenderTargetView(C().rtv, color, 1, &rows);
+            TransitionColor(vk::Use::ColorTarget);
+            const VkRect2D rect = ToVkRect(rows);
+            C().vkList->ClearColor(C().vkColor->target, C().vkColor->Extent(), color, 1, &rect);
         }
         if (lc.depth)
         {
@@ -16929,7 +16965,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 const uint32_t ex = d >> 20, m = d & 0xFFFFF;
                 depth = std::clamp(ex ? std::ldexp(1.0f + float(m) / 1048576.0f, int(ex) - 15) : std::ldexp(float(m) / 1048576.0f, -14), 0.0f, 1.0f);
             }
-            C().list->ClearDepthStencilView(C().dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, depth, UINT8(lc.depthValue & 0xFF), 1, &rows);
+            const VkRect2D rect = ToVkRect(rows);
+            C().vkList->ClearDepthStencil(C().vkDepth->target, C().vkDepth->Extent(), true, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, depth,
+                uint8_t(lc.depthValue & 0xFF), 1, &rect);
         }
     }
     if (LiveSwitch &traceWidened = g_sw_REGPU_TRACE_TILE_WIDEN; traceWidened && TileMerge::t_widened)
@@ -16957,22 +16995,27 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (memcmp(&ds.viewport, &vp, sizeof(vp)) != 0)
     {
         ds.viewport = vp;
-        C().list->RSSetViewports(1, &vp);
+        const VkViewport v = ToVkViewport(vp);
+        C().vkList->SetViewports(1, &v);
     }
     if (memcmp(&ds.scissor, &hostScissor, sizeof(hostScissor)) != 0)
     {
         ds.scissor = hostScissor;
-        C().list->RSSetScissorRects(1, &hostScissor);
+        const VkRect2D r = ToVkRect(hostScissor);
+        C().vkList->SetScissors(1, &r);
     }
     TraceSurfaceUse(hostScissor);
     if (const uint32_t ref = gpureg::Get(RB_STENCILREFMASK) & 0xFF; ref != ds.stencilRef)
     {
         ds.stencilRef = ref;
-        C().list->OMSetStencilRef(ref);
+        C().vkList->SetStencilReference(ref);
     }
     // The game asked for the colour target to be cleared before this draw (Host::clearBeforeDraw).
     if (clearBefore)
-        C().list->ClearRenderTargetView(C().rtv, clearColour, 1, &hostScissor);
+    {
+        const VkRect2D r = ToVkRect(hostScissor);
+        C().vkList->ClearColor(C().vkColor->target, C().vkColor->Extent(), clearColour, 1, &r);
+    }
     // The EDRAM is one memory: a depth-only draw (mode 5) writing depth and stencil FF at the colour
     // surface's own base leaves its tiles reading white as colour. FH1 starts its night light buffer
     // this way (a rectangle at depth 1): left black, every pixel decoded as full light.
@@ -16984,7 +17027,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             (gpureg::Get(RB_STENCILREFMASK) & 0xFF) == 0xFF && ((gpureg::Get(RB_COLOR_INFO) ^ gpureg::Get(RB_DEPTH_INFO)) & 0xFFF) == 0)
         {
             const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-            C().list->ClearRenderTargetView(C().rtv, white, 1, &hostScissor);
+            const VkRect2D r = ToVkRect(hostScissor);
+            C().vkList->ClearColor(C().vkColor->target, C().vkColor->Extent(), white, 1, &r);
         }
     }
     {
@@ -16993,7 +17037,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         if (memcmp(ds.blendFactor, factor, sizeof(factor)) != 0)
         {
             memcpy(ds.blendFactor, factor, sizeof(factor));
-            C().list->OMSetBlendFactor(factor);
+            C().vkList->SetBlendConstants(factor);
         }
     }
     // REGPU_FETCH_VARIANTS (FetchVariant): the slots whose fetch constant is plain this draw (pc->tinfo/tbias as
@@ -17079,27 +17123,25 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         if (plain)
             if (const CompiledShader* f = FetchShader(*psUsed, plain))
-                if (ID3D12PipelineState* fp = GetPipeline(vs, *f, edramMode == 5, cullable, false, stripCut && directIndex, false, psUsed != &ps, plain))
+                if (VkPipeline fp = GetPipeline(vs, *f, edramMode == 5, cullable, false, stripCut && directIndex, false, psUsed != &ps, plain))
                     pso = fp;
     }
     if (motion != ds.motionRoot)
     {
-        // Motion pipelines have their own root signature; switching clears the root arguments.
+        // (D3D12: motion pipelines had their own root signature. Vulkan: one pipeline layout, b2 in set 0.)
         ds.motionRoot = motion;
-        C().list->SetGraphicsRootSignature(motion ? g_r.motionRootSignature.Get() : g_r.rootSignature.Get());
-        ds.table2 = ds.table3 = D3D12_GPU_DESCRIPTOR_HANDLE{};
     }
     if (motion != ds.motionTargets)
     {
         ds.motionTargets = motion;
-        const D3D12_CPU_DESCRIPTOR_HANDLE targets[3] = { C().rtv, g_upscale.motionRtv, g_upscale.reactiveRtv };
-        C().list->OMSetRenderTargets(motion ? 3 : 1, targets, FALSE, &C().dsv);
+        vk::Image* const extra[2] = { g_upscale.vkMotion, g_upscale.vkReactive };
+        C().vkList->SetTargets(SurfaceTargets(motion ? 2 : 0, extra));
     }
     if (pso != ds.pso)
     {
         ds.pso = pso;
         const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        C().list->SetPipelineState(pso);
+        C().vkList->BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
         if (g_perfTiming)
         {
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -17353,27 +17395,25 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             }
         }
     }
-    C().list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
-    C().list->SetGraphicsRootConstantBufferView(1, f.ring->GetGPUVirtualAddress() + psOffset);
-    if (motion)
-        C().list->SetGraphicsRootConstantBufferView(LeanFetch() ? 5 : 4, motionPrevious);
-    if (const D3D12_GPU_DESCRIPTOR_HANDLE t2 = Gpu(g_r.srvHeap.Get(), f.descriptorBase, g_r.srvStride); t2.ptr != ds.table2.ptr)
+    // The constant blocks: set 0's dynamic uniform ranges at this draw's ring offsets (D3D12: root CBVs b0, b1, b2), and
+    // the bindless sets once per command buffer (only set 0 is bound per draw). b2: last frame's vertex constants of
+    // a motion draw, at motionPrevious (still a D3D12 address: the motion variants are converted in phase 4; 0 until).
     {
-        ds.table2 = t2;
-        C().list->SetGraphicsRootDescriptorTable(2, t2);
-    }
-    if (const D3D12_GPU_DESCRIPTOR_HANDLE t3 = Gpu(g_r.srvHeap.Get(), kBindlessBase, g_r.srvStride); t3.ptr != ds.table3.ptr)
-    {
-        ds.table3 = t3;
-        C().list->SetGraphicsRootDescriptorTable(3, t3);
-        ds.samplers = {}; // set again with it (after a root signature switch)
-    }
-    if (g_r.samplerHeap)
-        if (const D3D12_GPU_DESCRIPTOR_HANDLE s = SamplerTable(); s.ptr != ds.samplers.ptr)
+        const UINT bank = g_samplerBank.load(std::memory_order_relaxed) % kSamplerBanks;
+        VkDescriptorSet set0 = f.vkSet0[bank];
+        const uint32_t offsets[3] = { uint32_t(vsOffset), uint32_t(psOffset), 0 };
+        if (!ds.texturesBound)
         {
-            ds.samplers = s;
-            C().list->SetGraphicsRootDescriptorTable(4, s);
+            C().vkList->BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, g_r.vkBindings.layout, 1, 3, g_r.vkBindings.textureSets);
+            ds.texturesBound = true;
         }
+        if (set0 != ds.set0 || memcmp(offsets, ds.set0Offsets, sizeof(offsets)) != 0)
+        {
+            ds.set0 = set0;
+            memcpy(ds.set0Offsets, offsets, sizeof(offsets));
+            C().vkList->BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, g_r.vkBindings.layout, 0, 1, &set0, 3, offsets);
+        }
+    }
     // REGPU_CAPTURE_COMPOSITE=<n>: trace (as F12) the n-th frame that draws into the 2048-wide
     // surface (pitch field 0x820: a 2048-wide composite), from its first such draw on.
     if (static const int compositeN = getenv("REGPU_CAPTURE_COMPOSITE") ? atoi(getenv("REGPU_CAPTURE_COMPOSITE")) : 0;
@@ -17561,15 +17601,15 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // passed). From pgr4-native's occlusion pairs. REGPU_NO_OCCLUSION_COVERAGE=1: not drawn (Total = ZPass).
     static LiveSwitch noCoverage("REGPU_NO_OCCLUSION_COVERAGE");
     // (A draw worker's draw is never inside the command processor's query: gpu.cpp seg::g_query.)
-    ID3D12PipelineState* coveragePso = !C().worker && g_occlusionOpen && !noCoverage && !motion && g_occlusionCount + 2 <= kOcclusionPerFrame
-        ? GetPipeline(vs, ps, edramMode == 5, cullable, false, stripCut && directIndex, true) : nullptr;
+    VkPipeline coveragePso = !C().worker && g_occlusionOpen && !noCoverage && !motion && g_occlusionCount + 2 <= kOcclusionPerFrame
+        ? GetPipeline(vs, ps, edramMode == 5, cullable, false, stripCut && directIndex, true) : VK_NULL_HANDLE;
     {
         const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const D3D_PRIMITIVE_TOPOLOGY topology = indexedCount && prim == 6 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         if (topology != g_drawState.topology)
         {
             g_drawState.topology = topology;
-            C().list->IASetPrimitiveTopology(topology);
+            C().vkList->SetPrimitiveTopology(ToVkTopology(topology));
         }
         // Index buffers live in the index arena or this frame's upload ring: bound as a view of the whole buffer,
         // with the draw's place as its start index, consecutive draws share one binding (a new view almost every
@@ -17627,15 +17667,16 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             if (exp == 3)
             {
                 const D3D12_RECT one{ 0, 0, 1, 1 };
-                C().list->RSSetScissorRects(1, &one);
+                const VkRect2D r = ToVkRect(one);
+                C().vkList->SetScissors(1, &r);
                 g_drawState.scissor = one;
             }
             if (exp == 1)
                 ;
             else if (indexedCount)
-                C().list->DrawIndexedInstanced(exp == 2 ? std::min<UINT>(indexedCount, 3) : indexedCount, 1, startIndex, 0, 0);
+                C().vkList->DrawIndexed(exp == 2 ? std::min<UINT>(indexedCount, 3) : indexedCount, 1, startIndex, 0, 0);
             else
-                C().list->DrawInstanced(exp == 2 ? std::min<UINT>(directIndex ? directVertices : UINT(list.size()), 3) : (directIndex ? directVertices : UINT(list.size())), 1, 0, 0);
+                C().vkList->Draw(exp == 2 ? std::min<UINT>(directIndex ? directVertices : UINT(list.size()), 3) : (directIndex ? directVertices : UINT(list.size())), 1, 0, 0);
             if (stat)
                 C().list->EndQuery(g_statQueries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, statQuery);
         };
@@ -17665,12 +17706,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             EndOcclusionPart();
             const UINT covered = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
             C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, covered);
-            C().list->SetPipelineState(coveragePso);
+            C().vkList->BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, coveragePso);
             issue();
             C().list->EndQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, covered);
             C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, covered, 1, g_occlusionReadback.Get(), UINT64(covered) * 8);
             g_occlusionCurrent.coverage.push_back(covered);
-            C().list->SetPipelineState(pso);
+            C().vkList->BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
             g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
             g_occlusionCurrent.main.push_back(g_occlusionIndex);
             C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
