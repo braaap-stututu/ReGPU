@@ -3,13 +3,14 @@
 // (TemporalEvaluate in renderer.cpp; the same DlssSetup/DlssFrame). Runs on any GPU with Shader Model 6.4 (the DP4a
 // path; Intel Arc uses its XMX units). libxess.dll is loaded at run time from beside the executable, so a build or
 // an install without it just reports XeSS unavailable (the renderer then upscales with FSR 1). Headers from Intel's
-// XeSS SDK (REGPU_XESS_DIR at build time; the SDK's licence lets libxess.dll be redistributed unmodified).
+// XeSS SDK (REGPU_XESS_DIR at build time; the SDK's licence lets libxess.dll be redistributed unmodified). On Vulkan
+// (xess_vk.h): the images' views go in, inputs in SHADER_READ_ONLY_OPTIMAL and the output in GENERAL.
 #include "gpu/dlss.h"
 #include "gpu/xess.h"
 
 #include <windows.h>
 #include <xess/xess.h>
-#include <xess/xess_d3d12.h>
+#include <xess/xess_vk.h>
 
 #include <string>
 
@@ -20,9 +21,9 @@ namespace
 struct Api
 {
     decltype(&xessGetVersion) getVersion = nullptr;
-    decltype(&xessD3D12CreateContext) createContext = nullptr;
-    decltype(&xessD3D12Init) init = nullptr;
-    decltype(&xessD3D12Execute) execute = nullptr;
+    decltype(&xessVKCreateContext) createContext = nullptr;
+    decltype(&xessVKInit) init = nullptr;
+    decltype(&xessVKExecute) execute = nullptr;
     decltype(&xessDestroyContext) destroyContext = nullptr;
     decltype(&xessSetVelocityScale) setVelocityScale = nullptr;
     decltype(&xessSetJitterScale) setJitterScale = nullptr;
@@ -42,7 +43,7 @@ struct Xess
 {
     bool tried = false, available = false;
     Api api;
-    ID3D12Device* device = nullptr;
+    vk::Device* device = nullptr;
     Context contexts[kContexts];
     uint64_t uses = 0;
     uint32_t version[3] = {};
@@ -54,14 +55,26 @@ bool Load(HMODULE m, const char* name, T& out)
     out = reinterpret_cast<T>(GetProcAddress(m, name));
     return out != nullptr;
 }
+
+xess_vk_image_view_info View(const vk::Image& image)
+{
+    const VkImageAspectFlags aspect = image.aspects & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    return { image.view, image.image, { aspect, 0, 1, 0, 1 }, image.desc.format, image.desc.width, image.desc.height };
+}
+
+xess_result_t CreateContext(xess_context_handle_t* out)
+{
+    const vk::Device& d = *g_xess.device;
+    return g_xess.api.createContext(d.instance, d.physical, d.device, out);
+}
 } // namespace
 
-bool XessInit(ID3D12Device* device)
+bool XessInit(vk::Device& device)
 {
     if (g_xess.tried)
         return g_xess.available;
     g_xess.tried = true;
-    g_xess.device = device;
+    g_xess.device = &device;
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     std::wstring path = exe;
@@ -73,8 +86,8 @@ bool XessInit(ID3D12Device* device)
         return false;
     }
     Api& a = g_xess.api;
-    if (!Load(m, "xessGetVersion", a.getVersion) || !Load(m, "xessD3D12CreateContext", a.createContext) || !Load(m, "xessD3D12Init", a.init) ||
-        !Load(m, "xessD3D12Execute", a.execute) || !Load(m, "xessDestroyContext", a.destroyContext) ||
+    if (!Load(m, "xessGetVersion", a.getVersion) || !Load(m, "xessVKCreateContext", a.createContext) || !Load(m, "xessVKInit", a.init) ||
+        !Load(m, "xessVKExecute", a.execute) || !Load(m, "xessDestroyContext", a.destroyContext) ||
         !Load(m, "xessSetVelocityScale", a.setVelocityScale) || !Load(m, "xessSetJitterScale", a.setJitterScale))
     {
         Log("xess: libxess.dll lacks an expected export: XeSS unavailable");
@@ -82,9 +95,9 @@ bool XessInit(ID3D12Device* device)
     }
     xess_version_t v{};
     a.getVersion(&v);
-    if (a.createContext(device, &g_xess.contexts[0].handle) != XESS_RESULT_SUCCESS)
+    if (CreateContext(&g_xess.contexts[0].handle) != XESS_RESULT_SUCCESS)
     {
-        Log("xess: no context on this GPU (needs Shader Model 6.4): XeSS unavailable");
+        Log("xess: no context on this GPU (or the device lacks what XeSS needs): XeSS unavailable");
         return false;
     }
     g_xess.available = true;
@@ -92,7 +105,7 @@ bool XessInit(ID3D12Device* device)
     return true;
 }
 
-bool XessEvaluate(ID3D12GraphicsCommandList* list, const DlssSetup& setup, const DlssFrame& frame)
+bool XessEvaluate(VkCommandBuffer cb, const DlssSetup& setup, const DlssFrame& frame)
 {
     if (!g_xess.available)
         return false;
@@ -120,7 +133,7 @@ bool XessEvaluate(ID3D12GraphicsCommandList* list, const DlssSetup& setup, const
                 if (c.lastUse < pick->lastUse)
                     pick = &c;
         }
-        if (!pick->handle && a.createContext(g_xess.device, &pick->handle) != XESS_RESULT_SUCCESS)
+        if (!pick->handle && CreateContext(&pick->handle) != XESS_RESULT_SUCCESS)
         {
             Log("xess: another context could not be made");
             return false;
@@ -129,7 +142,8 @@ bool XessEvaluate(ID3D12GraphicsCommandList* list, const DlssSetup& setup, const
         // XeSS's ratios.
         static const xess_quality_settings_t qualities[] = { XESS_QUALITY_SETTING_AA, XESS_QUALITY_SETTING_QUALITY, XESS_QUALITY_SETTING_BALANCED,
             XESS_QUALITY_SETTING_PERFORMANCE, XESS_QUALITY_SETTING_ULTRA_PERFORMANCE };
-        xess_d3d12_init_params_t p{};
+        xess_vk_init_params_t p{};
+        p.pipelineCache = g_xess.device->pipelineCache;
         p.outputResolution = { setup.outputWidth, setup.outputHeight };
         p.qualitySetting = qualities[setup.quality > 4 ? 1 : setup.quality];
         p.initFlags = XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE | (setup.depthInverted ? XESS_INIT_FLAG_INVERTED_DEPTH : 0) |
@@ -149,11 +163,11 @@ bool XessEvaluate(ID3D12GraphicsCommandList* list, const DlssSetup& setup, const
     // Motion in the texture's units, scaled to render pixels (current to previous, as DLSS); jitter in render pixels.
     a.setVelocityScale(ctx->handle, frame.motionScaleX, frame.motionScaleY);
     a.setJitterScale(ctx->handle, 1.0f, 1.0f);
-    xess_d3d12_execute_params_t e{};
-    e.pColorTexture = frame.color;
-    e.pVelocityTexture = frame.motion;
-    e.pDepthTexture = frame.depth;
-    e.pOutputTexture = frame.output;
+    xess_vk_execute_params_t e{};
+    e.colorTexture = View(*frame.color);
+    e.velocityTexture = View(*frame.motion);
+    e.depthTexture = View(*frame.depth);
+    e.outputTexture = View(*frame.output);
     e.jitterOffsetX = frame.jitterX;
     e.jitterOffsetY = frame.jitterY;
     e.exposureScale = 1.0f;
@@ -161,7 +175,7 @@ bool XessEvaluate(ID3D12GraphicsCommandList* list, const DlssSetup& setup, const
     e.inputWidth = setup.renderWidth;
     e.inputHeight = setup.renderHeight;
     ctx->lastUse = ++g_xess.uses;
-    const xess_result_t r = a.execute(ctx->handle, list, &e);
+    const xess_result_t r = a.execute(ctx->handle, cb, &e);
     if (r != XESS_RESULT_SUCCESS)
     {
         static int logged = 0;

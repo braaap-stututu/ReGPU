@@ -4,10 +4,13 @@
 // is. The OpenXR loader (openxr_loader.dll beside the exe) is loaded only when VR is asked for.
 #include <cstdint>
 
-struct ID3D12Device;
-struct ID3D12CommandQueue;
-struct ID3D12GraphicsCommandList;
-struct ID3D12Resource;
+#include "gpu/vk/vk_loader.h"
+
+namespace vk
+{
+struct Device;
+struct Image;
+}
 
 namespace regpu::xr
 {
@@ -15,19 +18,20 @@ namespace regpu::xr
 bool Wanted();
 // Starts the headset thread on ReGPU's device and queue (after they exist). It waits for a headset and keeps
 // retrying, so the game runs normally without one.
-void Start(ID3D12Device* device, ID3D12CommandQueue* queue);
-// The back buffer holds the finished frame (state COPY_DEST, left so): copies it for the headset. No-op unless a
+void Start(vk::Device& device);
+// The back buffer holds the finished frame (TRANSFER_DST_OPTIMAL, left so): copies it for the headset. No-op unless a
 // headset session runs.
-void CaptureFrame(ID3D12GraphicsCommandList* list, ID3D12Resource* backBuffer);
+void CaptureFrame(VkCommandBuffer cb, VkImage backBuffer, uint32_t width, uint32_t height, VkFormat format);
 
 // Step 3, true stereo (REGPU_VR=stereo, gpu.cpp stereo::): the frame's main view drawn twice, once per eye.
 // StereoFrame: this frame is to be drawn in stereo (a head-tracked frame, from SubmitFramePose; or REGPU_VR_STEREO_TEST
 // without a headset); `clipPerMetre` = P00 of the frame's projection (clip x per metre of sideways offset at w 1),
 // `halfIpd` = half the eye distance (metres).
 bool StereoFrame(float& clipPerMetre, float& halfIpd);
-// The headset's image for eye 0 (left) or 1 (right) at w x h, state COMMON (to be left so), or null without a session.
-// (eye 2: the HUD panel's image, premultiplied alpha; StereoHudCaptured once it is written this frame.)
-ID3D12Resource* StereoTarget(int eye, uint32_t w, uint32_t h);
+// The headset's image for eye 0 (left) or 1 (right) at w x h (a storage image; its state tracked as ReGPU's own), or
+// null without a session. (eye 2: the HUD panel's image, premultiplied alpha; StereoHudCaptured once it is written
+// this frame.)
+vk::Image* StereoTarget(int eye, uint32_t w, uint32_t h);
 void StereoHudCaptured();
 // Head-tracked mono frames (REGPU_VR=cockpit) take the HUD apart too (the same capture as stereo: renderer.cpp
 // StereoHudDraw): true on a posed frame while a headset session runs (or REGPU_VR_STEREO_TEST).

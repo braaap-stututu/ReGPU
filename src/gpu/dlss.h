@@ -1,9 +1,10 @@
 #pragma once
 #include <cstdint>
 
-#include <d3d12.h>
+#include "gpu/vk/device.h"
+#include "gpu/vk/resources.h"
 
-// NVIDIA DLSS / DLAA (dlss.cpp).
+// The temporal upscalers' common inputs (DLSS in dlss.cpp, FSR 3/4 in fsr3.cpp, XeSS in xess.cpp), on Vulkan.
 struct DlssSetup
 {
     uint32_t renderWidth = 0, renderHeight = 0, outputWidth = 0, outputHeight = 0;
@@ -15,18 +16,19 @@ struct DlssSetup
 
 struct DlssFrame
 {
-    // Inputs in NON_PIXEL_SHADER_RESOURCE state, the output in UNORDERED_ACCESS.
-    ID3D12Resource *color, *depth, *motion, *output;
-    // FSR 3/4 only: the reactive mask (R8, in NON_PIXEL_SHADER_RESOURCE like the other inputs), or null. Where
-    // it is set the upscaler trusts this frame's colour over its history (smoke, sparks, particles).
-    ID3D12Resource* reactive = nullptr;
+    // Inputs in SHADER_READ_ONLY_OPTIMAL (sampled), the output in GENERAL (a storage image). Each image's sampled view
+    // is used (vk::Image::view).
+    const vk::Image *color, *depth, *motion, *output;
+    // FSR 3/4 only: the reactive mask (R8, sampled like the other inputs), or null. Where it is set the upscaler trusts
+    // this frame's colour over its history (smoke, sparks, particles).
+    const vk::Image* reactive = nullptr;
     float jitterX, jitterY;           // render pixels
     float motionScaleX, motionScaleY; // motion texture values to render pixels
     float frameTimeMs;
     bool reset;
 };
 
-// False without an RTX GPU, driver support or nvngx_dlss.dll.
-bool DlssInit(ID3D12Device* device);
-// Records the upscale into `list` (the real command list).
-bool DlssEvaluate(ID3D12GraphicsCommandList* list, const DlssSetup& setup, const DlssFrame& frame);
+// False without an RTX GPU, driver support, nvngx_dlss.dll, or the device extensions NGX needs (vk::Device::ngx).
+bool DlssInit(vk::Device& device);
+// Records the upscale into `cb` (the real command buffer, outside rendering).
+bool DlssEvaluate(VkCommandBuffer cb, const DlssSetup& setup, const DlssFrame& frame);

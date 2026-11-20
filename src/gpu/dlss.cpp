@@ -1,13 +1,17 @@
-// NVIDIA DLSS (Super Resolution, and DLAA at native scale) through NGX. The renderer hands
-// over the scene's colour, depth and motion vectors at render size and gets the upscaled
-// image in the output texture (see TemporalEvaluate in renderer.cpp). Needs nvngx_dlss.dll
-// next to the executable (copied there by the build) and an RTX GPU.
+// NVIDIA DLSS (Super Resolution, and DLAA at native scale) through NGX on Vulkan. The renderer hands over the scene's
+// colour, depth and motion vectors at render size and gets the upscaled image in the output image (see
+// TemporalEvaluate in renderer.cpp). Needs nvngx_dlss.dll next to the executable (copied there by the build), an RTX
+// GPU, and the device extensions NGX asks for (VK_NVX_binary_import, VK_NVX_image_view_handle: vk::Device::ngx).
+// Built only with the DLSS SDK (REGPU_DLSS); its Vulkan form has not been compiled on the machine that converted it
+// (no SDK there): check it builds before relying on it.
 #include "gpu/dlss.h"
 
+#if defined(_WIN32)
 #include <windows.h>
+#endif
 
-#include <nvsdk_ngx.h>
-#include <nvsdk_ngx_helpers.h>
+#include <nvsdk_ngx_vk.h>
+#include <nvsdk_ngx_helpers_vk.h>
 
 #include "log.h"
 
@@ -16,7 +20,7 @@ namespace
 struct Dlss
 {
     bool tried = false, available = false;
-    ID3D12Device* device = nullptr;
+    vk::Device* device = nullptr;
     NVSDK_NGX_Parameter* params = nullptr;
     NVSDK_NGX_Handle* feature = nullptr;
     DlssSetup setup{};
@@ -24,23 +28,38 @@ struct Dlss
 
 // Made up for this port (NGX wants a GUID-shaped project id).
 const char kProjectId[] = "6b3a9c2e-4f1d-4e8a-9b7c-2d5f8e1a3c47";
+
+NVSDK_NGX_Resource_VK Resource(const vk::Image& image, bool readWrite)
+{
+    const VkImageAspectFlags aspect = image.aspects & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    const VkImageSubresourceRange range{ aspect, 0, 1, 0, 1 };
+    return NVSDK_NGX_Create_ImageView_Resource_VK(image.view, image.image, range, image.desc.format, image.desc.width, image.desc.height, readWrite);
+}
 }
 
-bool DlssInit(ID3D12Device* device)
+bool DlssInit(vk::Device& device)
 {
     if (g_dlss.tried)
         return g_dlss.available;
     g_dlss.tried = true;
-    g_dlss.device = device;
-    wchar_t path[MAX_PATH] = L".";
-    GetTempPathW(MAX_PATH, path);
-    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init_with_ProjectID(kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", path, device);
+    g_dlss.device = &device;
+    if (!device.ngx)
+    {
+        Log("dlss: the device lacks VK_NVX_binary_import / VK_NVX_image_view_handle (not an NVIDIA GPU or driver)");
+        return false;
+    }
+    wchar_t path[260] = L".";
+#if defined(_WIN32)
+    GetTempPathW(260, path);
+#endif
+    NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_Init_with_ProjectID(kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", path, device.instance, device.physical,
+        device.device, vkGetInstanceProcAddr, vkGetDeviceProcAddr);
     if (NVSDK_NGX_FAILED(r))
     {
         Log("dlss: NGX init failed (%08X): not an NVIDIA RTX GPU or driver, or nvngx_dlss.dll missing", unsigned(r));
         return false;
     }
-    r = NVSDK_NGX_D3D12_GetCapabilityParameters(&g_dlss.params);
+    r = NVSDK_NGX_VULKAN_GetCapabilityParameters(&g_dlss.params);
     int supported = 0, needsUpdate = 0;
     if (NVSDK_NGX_SUCCEED(r))
     {
@@ -57,7 +76,7 @@ bool DlssInit(ID3D12Device* device)
     return true;
 }
 
-bool DlssEvaluate(ID3D12GraphicsCommandList* list, const DlssSetup& setup, const DlssFrame& frame)
+bool DlssEvaluate(VkCommandBuffer cb, const DlssSetup& setup, const DlssFrame& frame)
 {
     if (!g_dlss.available)
         return false;
@@ -66,7 +85,7 @@ bool DlssEvaluate(ID3D12GraphicsCommandList* list, const DlssSetup& setup, const
     {
         if (g_dlss.feature)
         {
-            NVSDK_NGX_D3D12_ReleaseFeature(g_dlss.feature);
+            NVSDK_NGX_VULKAN_ReleaseFeature(g_dlss.feature);
             g_dlss.feature = nullptr;
         }
         static const NVSDK_NGX_PerfQuality_Value qualities[] = { NVSDK_NGX_PerfQuality_Value_DLAA, NVSDK_NGX_PerfQuality_Value_MaxQuality,
@@ -79,7 +98,7 @@ bool DlssEvaluate(ID3D12GraphicsCommandList* list, const DlssSetup& setup, const
         create.Feature.InPerfQualityValue = qualities[setup.quality > 4 ? 1 : setup.quality];
         create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure |
             (setup.depthInverted ? NVSDK_NGX_DLSS_Feature_Flags_DepthInverted : 0) | (setup.hdr ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0);
-        const NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSS_EXT(list, 1, 1, &g_dlss.feature, g_dlss.params, &create);
+        const NVSDK_NGX_Result r = NGX_VULKAN_CREATE_DLSS_EXT1(g_dlss.device->device, cb, 1, 1, &g_dlss.feature, g_dlss.params, &create);
         if (NVSDK_NGX_FAILED(r))
         {
             Log("dlss: create failed (%08X) for %ux%u -> %ux%u", unsigned(r), setup.renderWidth, setup.renderHeight, setup.outputWidth,
@@ -91,11 +110,13 @@ bool DlssEvaluate(ID3D12GraphicsCommandList* list, const DlssSetup& setup, const
         Log("dlss: %ux%u -> %ux%u, quality %u%s", setup.renderWidth, setup.renderHeight, setup.outputWidth, setup.outputHeight, setup.quality,
             setup.hdr ? ", HDR" : "");
     }
-    NVSDK_NGX_D3D12_DLSS_Eval_Params eval{};
-    eval.Feature.pInColor = frame.color;
-    eval.Feature.pInOutput = frame.output;
-    eval.pInDepth = frame.depth;
-    eval.pInMotionVectors = frame.motion;
+    NVSDK_NGX_Resource_VK color = Resource(*frame.color, false), output = Resource(*frame.output, true), depth = Resource(*frame.depth, false),
+                          motion = Resource(*frame.motion, false);
+    NVSDK_NGX_VK_DLSS_Eval_Params eval{};
+    eval.Feature.pInColor = &color;
+    eval.Feature.pInOutput = &output;
+    eval.pInDepth = &depth;
+    eval.pInMotionVectors = &motion;
     eval.InJitterOffsetX = frame.jitterX;
     eval.InJitterOffsetY = frame.jitterY;
     eval.InRenderSubrectDimensions = { setup.renderWidth, setup.renderHeight };
@@ -103,7 +124,7 @@ bool DlssEvaluate(ID3D12GraphicsCommandList* list, const DlssSetup& setup, const
     eval.InMVScaleX = frame.motionScaleX;
     eval.InMVScaleY = frame.motionScaleY;
     eval.InFrameTimeDeltaInMsec = frame.frameTimeMs;
-    const NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSS_EXT(list, g_dlss.feature, g_dlss.params, &eval);
+    const NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cb, g_dlss.feature, g_dlss.params, &eval);
     if (NVSDK_NGX_FAILED(r))
     {
         static int logged = 0;

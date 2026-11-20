@@ -1737,11 +1737,11 @@ void BuildConstants(const vk::VkShader* vs, const vk::VkShader* ps, gpu::VSConst
 
 bool VulkanRendererEnabled()
 {
-    // Config::renderer (the host's choice); REGPU_RENDERER=vulkan or d3d12 overrides it for tests.
+    // The parts bin's second renderer (FM2's): only for comparisons now that renderer.cpp is Vulkan, with
+    // REGPU_RENDERER=fm2vk. (Config::renderer is gone.)
     static const bool enabled = [] {
-        if (const char* v = getenv("REGPU_RENDERER"); v && *v)
-            return _stricmp(v, "vulkan") == 0;
-        return GetSettings().renderer == regpu::Config::Renderer::Vulkan;
+        const char* v = getenv("REGPU_RENDERER");
+        return v && _stricmp(v, "fm2vk") == 0;
     }();
     return enabled;
 }

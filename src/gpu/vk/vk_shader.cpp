@@ -51,8 +51,16 @@ bool ReadAll(const std::string& path, std::vector<uint32_t>& out)
 }
 
 #if defined(_WIN32)
-bool CompileDxcInProcess(const std::string& hlsl, bool pixel, bool disableOptimizations, std::vector<uint32_t>& spirv,
-    std::string* error, bool& unavailable)
+std::wstring Wide(const char* s)
+{
+    std::wstring w;
+    for (; *s; s++)
+        w += wchar_t(*s);
+    return w;
+}
+
+bool CompileDxcInProcess(const std::string& hlsl, const char* profile, const char* entry, bool vertexDefine, bool disableOptimizations,
+    std::vector<uint32_t>& spirv, std::string* error, bool& unavailable)
 {
     using CreateInstance = HRESULT(WINAPI*)(REFCLSID, REFIID, LPVOID*);
     static const auto create = [] {
@@ -72,12 +80,13 @@ bool CompileDxcInProcess(const std::string& hlsl, bool pixel, bool disableOptimi
         unavailable = true;
         return false;
     }
+    const std::wstring wideProfile = Wide(profile), wideEntry = Wide(entry);
     std::vector<LPCWSTR> arguments = {
-        L"-HV", L"2018", L"-T", pixel ? L"ps_6_0" : L"vs_6_0", L"-E", L"main", L"-spirv", L"-fvk-use-dx-layout",
+        L"-HV", L"2018", L"-T", wideProfile.c_str(), L"-E", wideEntry.c_str(), L"-spirv", L"-fvk-use-dx-layout",
         L"-fspv-target-env=vulkan1.2",
         L"-fvk-b-shift", L"0", L"0", L"-fvk-t-shift", L"100", L"0", L"-fvk-s-shift", L"200", L"0", L"-fvk-u-shift", L"300", L"0",
     };
-    if (!pixel)
+    if (vertexDefine)
         arguments.insert(arguments.end(), { L"-D", L"REGPU_VERTEX_STAGE" });
     if (disableOptimizations || getenv("REGPU_VK_SHADER_OD"))
         arguments.push_back(L"-Od");
@@ -152,7 +161,28 @@ bool SpirvCached(const std::string& hlsl, uint64_t key, const std::filesystem::p
     return std::filesystem::exists(cacheDir / "spv" / (std::to_string(key) + "_" + std::to_string(HlslContentHash(hlsl)) + ".spv"), ec);
 }
 
+namespace
+{
+bool Compile(const std::string& hlsl, const char* profile, const char* entry, bool vertexDefine, uint64_t key, const std::filesystem::path& cacheDir,
+    std::vector<uint32_t>& spirv, std::string* error, bool disableOptimizations);
+}
+
 bool CompileHlsl(const std::string& hlsl, bool pixel, uint64_t key, const std::filesystem::path& cacheDir,
+    std::vector<uint32_t>& spirv, std::string* error, bool disableOptimizations)
+{
+    return Compile(hlsl, pixel ? "ps_6_0" : "vs_6_0", "main", !pixel, key, cacheDir, spirv, error, disableOptimizations);
+}
+
+bool CompileHlslStage(const std::string& hlsl, const char* profile, const char* entry, const std::filesystem::path& cacheDir,
+    std::vector<uint32_t>& spirv, std::string* error)
+{
+    const uint64_t key = HashSource(std::string(profile) + ":" + entry);
+    return Compile(hlsl, profile, entry, false, key, cacheDir, spirv, error, false);
+}
+
+namespace
+{
+bool Compile(const std::string& hlsl, const char* profile, const char* entry, bool vertexDefine, uint64_t key, const std::filesystem::path& cacheDir,
     std::vector<uint32_t>& spirv, std::string* error, bool disableOptimizations)
 {
     // The key is the GUEST shader hash, which does not change when the translator does, so the cache file name also
@@ -168,7 +198,7 @@ bool CompileHlsl(const std::string& hlsl, bool pixel, uint64_t key, const std::f
 
 #if defined(_WIN32)
     bool unavailable = false;
-    if (CompileDxcInProcess(hlsl, pixel, disableOptimizations, spirv, error, unavailable))
+    if (CompileDxcInProcess(hlsl, profile, entry, vertexDefine, disableOptimizations, spirv, error, unavailable))
     {
         if (!cacheDir.empty())
             WriteCached(cacheDir, key, contentHash, spirv);
@@ -232,10 +262,10 @@ bool CompileHlsl(const std::string& hlsl, bool pixel, uint64_t key, const std::f
     // result the Direct3D 12 compiler gives; this is how to tell a miscompile from a translation.
     const char* optimise = getenv("REGPU_VK_SHADER_OD") || disableOptimizations ? " -Od" : "";
     const int written = snprintf(command, sizeof command,
-        "%s -HV 2018 -T %s -E main -spirv -fvk-use-dx-layout -fspv-target-env=vulkan1.2%s%s"
+        "%s -HV 2018 -T %s -E %s -spirv -fvk-use-dx-layout -fspv-target-env=vulkan1.2%s%s"
         " -fvk-b-shift 0 0 -fvk-t-shift 100 0 -fvk-s-shift 200 0 -fvk-u-shift 300 0"
         " -Fo \"%s\" \"%s\" 2>&1",
-        dxcCommand.c_str(), pixel ? "ps_6_0" : "vs_6_0", pixel ? "" : " -D REGPU_VERTEX_STAGE", optimise, spvPath.c_str(),
+        dxcCommand.c_str(), profile, entry, vertexDefine ? " -D REGPU_VERTEX_STAGE" : "", optimise, spvPath.c_str(),
         hlslPath.c_str());
     if (written < 0 || size_t(written) >= sizeof command)
     {
@@ -267,5 +297,6 @@ bool CompileHlsl(const std::string& hlsl, bool pixel, uint64_t key, const std::f
         out.write(reinterpret_cast<const char*>(spirv.data()), std::streamsize(spirv.size() * 4));
     }
     return ok;
+}
 }
 }

@@ -144,12 +144,13 @@ VkImageAspectFlags AspectsOf(VkFormat f)
 }
 
 VkImageView CreateView(Device& d, const Image& image, VkImageViewType type, VkFormat format, VkImageAspectFlags aspects, uint32_t baseMip,
-    uint32_t mips, uint32_t baseLayer, uint32_t layers)
+    uint32_t mips, uint32_t baseLayer, uint32_t layers, VkComponentMapping components)
 {
     VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
     vi.image = image.image;
     vi.viewType = type;
     vi.format = format;
+    vi.components = components;
     vi.subresourceRange = { aspects, baseMip, mips, baseLayer, layers };
     VkImageView view = VK_NULL_HANDLE;
     const VkResult result = vkCreateImageView(d.device, &vi, nullptr, &view);

@@ -62,12 +62,24 @@ if(NOT REGPU_DLSS)
     list(REMOVE_ITEM REGPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/dlss.cpp")
 endif()
 # Intel XeSS (src/gpu/xess.cpp, FM3 port session 43): the SDK's headers (libxess.dll is loaded at run time, beside the exe).
-set(REGPU_XESS_DIR "" CACHE PATH "Intel XeSS SDK folder (with inc/xess/xess_d3d12.h); empty: built without")
-if(NOT (REGPU_XESS_DIR AND EXISTS "${REGPU_XESS_DIR}/inc/xess/xess_d3d12.h"))
+set(REGPU_XESS_DIR "" CACHE PATH "Intel XeSS SDK folder (with inc/xess/xess_vk.h); empty: built without")
+if(NOT (REGPU_XESS_DIR AND EXISTS "${REGPU_XESS_DIR}/inc/xess/xess_vk.h"))
     list(REMOVE_ITEM REGPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/xess.cpp")
 endif()
 
-# The FSR1, depth copy, gamma and enhance compute shaders, compiled into a header at build time.
+# The FSR1, depth copy, gamma and enhance compute shaders, compiled into a header at build time (SPIR-V, by DXC: the Vulkan
+# SDK's, REGPU_DXC_EXE, or dxc on PATH).
+file(GLOB REGPU_SDK_DXC "$ENV{VULKAN_SDK}/Bin/dxc.exe" "C:/VulkanSDK/*/Bin/dxc.exe" "$ENV{VULKAN_SDK}/bin/dxc")
+set(REGPU_SDK_DXC_FIRST "")
+if(REGPU_SDK_DXC)
+    list(SORT REGPU_SDK_DXC ORDER DESCENDING)
+    list(GET REGPU_SDK_DXC 0 REGPU_SDK_DXC_FIRST)
+endif()
+if(REGPU_SDK_DXC_FIRST)
+    set(REGPU_DXC_EXE "${REGPU_SDK_DXC_FIRST}" CACHE FILEPATH "DXC with SPIR-V output (for ReGPU's embedded compute shaders)")
+else()
+    find_program(REGPU_DXC_EXE NAMES dxc DOC "DXC with SPIR-V output (for ReGPU's embedded compute shaders)")
+endif()
 set(REGPU_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${REGPU_GENERATED}")
 if(REGPU_FSR1_CS)
@@ -76,7 +88,7 @@ if(REGPU_FSR1_CS)
         DEPENDS "${REGPU_FSR1_CS}")
 else()
 add_custom_command(OUTPUT "${REGPU_GENERATED}/fsr1_cs.h"
-    COMMAND py -3 -I "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_hlsl.py" "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/fsr1.hlsl" "${REGPU_GENERATED}/fsr1_cs.h"
+    COMMAND py -3 -I "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_hlsl.py" --dxc "${REGPU_DXC_EXE}" "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/fsr1.hlsl" "${REGPU_GENERATED}/fsr1_cs.h"
             EasuMain,RcasMain,DepthCopyMain,GammaMain,EnhanceMain,ViewMain "${REGPU_FFX}/api/internal/gpu" "${REGPU_FFX}/upscalers/fsr3/include/gpu/fsr1"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/fsr1.hlsl" "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_hlsl.py")
 endif()
@@ -87,7 +99,7 @@ list(APPEND REGPU_SOURCES "${REGPU_GENERATED}/fsr1_cs.h")
 # SearchTex.h, cmaa2/CMAA2.hlsl), when the port provides it (REGPU_POSTAA_FILTERS=1).
 set(REGPU_AA_DIR "" CACHE PATH "Folder with fxaa/, smaa/ and cmaa2/ (the third-party anti-aliasing shaders)")
 add_custom_command(OUTPUT "${REGPU_GENERATED}/postaa_cs.h"
-    COMMAND py -3 -I "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_hlsl.py" "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/postaa.hlsl" "${REGPU_GENERATED}/postaa_cs.h"
+    COMMAND py -3 -I "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_hlsl.py" --dxc "${REGPU_DXC_EXE}" "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/postaa.hlsl" "${REGPU_GENERATED}/postaa_cs.h"
             PrepMain,FinishMain,CopyMain,TaaMain,SsaaMain
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/postaa.hlsl" "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_hlsl.py")
 list(APPEND REGPU_SOURCES "${REGPU_GENERATED}/postaa_cs.h")
@@ -104,7 +116,7 @@ if(REGPU_AA_DIR AND EXISTS "${REGPU_AA_DIR}/fxaa/Fxaa3_11.h" AND EXISTS "${REGPU
         endif()
         file(GLOB aa_deps "${REGPU_AA_DIR}/${aa}/*")
         add_custom_command(OUTPUT "${REGPU_GENERATED}/postaa_${aa}_cs.h"
-            COMMAND py -3 -I "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_hlsl.py" "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/postaa_${aa}.hlsl"
+            COMMAND py -3 -I "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_hlsl.py" --dxc "${REGPU_DXC_EXE}" "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/postaa_${aa}.hlsl"
                     "${REGPU_GENERATED}/postaa_${aa}_cs.h" ${entries} "${REGPU_AA_DIR}/${aa}"
             DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/postaa_${aa}.hlsl" "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_hlsl.py" ${aa_deps})
         list(APPEND REGPU_SOURCES "${REGPU_GENERATED}/postaa_${aa}_cs.h")
@@ -124,7 +136,7 @@ target_compile_definitions(regpu PUBLIC ${REGPU_GUEST_DEFINES})
 target_include_directories(regpu PRIVATE src "${REGPU_GENERATED}")
 # VR through OpenXR (src/render/xr.cpp, REGPU_VR=screen): the OpenXR SDK's include/openxr headers. The loader DLL is
 # loaded at run time (openxr_loader.dll beside the exe), so nothing links against it.
-if(REGPU_XESS_DIR AND EXISTS "${REGPU_XESS_DIR}/inc/xess/xess_d3d12.h")
+if(REGPU_XESS_DIR AND EXISTS "${REGPU_XESS_DIR}/inc/xess/xess_vk.h")
     target_compile_definitions(regpu PRIVATE REGPU_XESS=1)
     target_include_directories(regpu PRIVATE "${REGPU_XESS_DIR}/inc")
 endif()
@@ -152,7 +164,7 @@ target_link_libraries(regpu PUBLIC d3d12 dxgi ws2_32 winmm synchronization oneco
 if(REGPU_FSR3)
     target_compile_definitions(regpu PRIVATE REGPU_FSR3=1)
     target_include_directories(regpu PRIVATE "${REGPU_FFX}/api/include" "${REGPU_FFX}/upscalers/include")
-    target_link_libraries(regpu PUBLIC "${REGPU_FFX}/signedbin/amd_fidelityfx_loader_dx12.lib")
+    target_link_libraries(regpu PUBLIC "${REGPU_FFX}/signedbin/amd_fidelityfx_loader_vk.lib")
 endif()
 if(REGPU_DLSS)
     target_compile_definitions(regpu PRIVATE REGPU_DLSS=1)

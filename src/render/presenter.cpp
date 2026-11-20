@@ -1,7 +1,8 @@
-// Native output: a window with a D3D12 flip-model swap chain. The guest's
-// VdSwap hands a frame over; a render thread presents it without blocking
-// the guest. Until the D3D hooks draw real content the frame is a clear
-// whose shade pulses with the frame count, proving the path end to end.
+// Native output: a window with a Vulkan swap chain. The guest's VdSwap hands a frame over; until the renderer draws
+// (PresenterUseRenderer), a render thread presents the presenter's own frames (a clear whose shade pulses with the
+// frame count, or a CPU image: PresenterSubmitImage). Then the renderer copies each finished frame into the swap
+// chain's image (PresenterRecordCopy), submits it with the acquire's wait (PresenterSubmit) and presents
+// (PresenterPresent).
 #include "render/xr.h"
 #include <algorithm>
 #include <chrono>
@@ -20,19 +21,19 @@
 
 #include "live_switch.h"
 #include "log.h"
-#include "live_switch.h"
 #include "precise_sleep.h"
 #include "render/presenter.h"
 #include "gpu/vk/device.h"
+#include "gpu/vk/resources.h"
 #include "regpu/regpu.h"
 #include "settings.h"
 
 using Microsoft::WRL::ComPtr;
 
-
 namespace
 {
-constexpr UINT kBuffers = 3;
+constexpr UINT kBuffers = 3;  // the presenter's own frames in flight
+constexpr UINT kAcquire = 8;  // acquire semaphores, used in turn
 constexpr UINT kWidth = 1280, kHeight = 720;
 
 struct Presenter
@@ -40,33 +41,51 @@ struct Presenter
     HWND window = nullptr;
     HWND surface = nullptr; // the child window holding the swap chain (not with Config::hostWindow)
     std::atomic<bool> fullscreen{ false };
-    ComPtr<ID3D12Device> device;
-    ComPtr<ID3D12CommandQueue> queue;
-    ComPtr<IDXGISwapChain3> swapChain;
-    ComPtr<ID3D12DescriptorHeap> rtvHeap;
-    UINT rtvStride = 0;
-    ComPtr<ID3D12Resource> backBuffers[kBuffers];
-    ComPtr<ID3D12CommandAllocator> allocators[kBuffers];
-    ComPtr<ID3D12GraphicsCommandList> list;
-    ComPtr<ID3D12Fence> fence;
-    UINT64 fenceValues[kBuffers] = {};
-    UINT64 nextFence = 1;
-    HANDLE fenceEvent = nullptr;
+
+    // The swap chain.
+    vk::Device* d = nullptr;
+    VkSurfaceKHR vkSurface = VK_NULL_HANDLE;
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkExtent2D extent{};
+    bool vsync = true;           // the mode it was made with (FIFO; else immediate where offered)
+    std::atomic<bool> recreate{ false };
+    std::vector<VkImage> images;
+    std::vector<VkImageView> views;
+    std::vector<VkSemaphore> rendered; // per image: the frame's commands are done (the present waits on it)
+    VkSemaphore acquired[kAcquire] = {};
+    uint64_t acquiredUse[kAcquire] = {}; // the device timeline value of the submission that waited on each
+    uint32_t acquireNext = 0;
+    // The image acquired for the frame being made (PresenterRecordCopy) until it is presented; its acquire semaphore
+    // until a submission waits on it (PresenterSubmit).
+    uint32_t imageIndex = UINT32_MAX;
+    int pendingAcquire = -1;
+    bool submitted = false;
+    std::recursive_mutex swapMutex; // (the presenter's thread and the renderer's)
+    vk::Image gradeTarget;          // a graded picture of another size than the back buffer, before it is scaled
+
+    // The presenter's own frames.
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cbs[kBuffers] = {};
+    uint64_t cbDone[kBuffers] = {};
+    vk::Buffer upload[kBuffers];
+    vk::Image cpuImage; // the submitted CPU image on the GPU (RGBA8)
+    UINT ownFrame = 0;
 
     std::mutex mutex;
     std::condition_variable cv;
     uint64_t pendingFrame = 0;
     std::vector<uint8_t> image; // latest submitted RGBA8, imageWidth x imageHeight
     uint32_t imageWidth = 0, imageHeight = 0;
-    ComPtr<ID3D12Resource> upload[kBuffers];
-    uint64_t uploadBytes[kBuffers] = {}; // each upload buffer's size (grown for larger submitted images)
-    // The Vulkan backend presents into the window itself (PresenterClaimWindow): the presenter then draws nothing.
+    // The parts-bin Vulkan backend presents into the window itself (PresenterClaimWindow): the presenter then draws nothing.
     std::atomic<bool> claimed{ false };
     uint64_t presentedFrame = 0;
     std::atomic<bool> ready{ false };
 };
 
 Presenter g_p;
+std::atomic<bool> g_rendererActive{ false };
+bool g_hostPresents = false; // Host::presentImage in use (PresenterInit, before the renderer's thread starts)
 }
 
 // The size the game renders at (settings: resolution and forced aspect ratio).
@@ -106,8 +125,6 @@ void Check(HRESULT hr, const char* what)
 std::mutex g_deviceMutex;
 ComPtr<ID3D12Device> g_device;
 ComPtr<ID3D12CommandQueue> g_queue;
-std::atomic<bool> g_rendererActive{ false };
-bool g_hostPresents = false; // Host::presentImage in use (PresenterInit, before the renderer's thread starts)
 
 // The GPU to draw on: the high-performance one. On a laptop with two (NVIDIA Optimus, AMD switchable
 // graphics) Direct3D's default adapter is the integrated GPU unless the executable exports
@@ -146,22 +163,8 @@ void EnsureDevice()
     std::lock_guard lock(g_deviceMutex);
     if (g_device)
         return;
-    // The host's device and queue (Config::hostDevice, hostQueue): ReGPU renders on them and holds its
-    // own reference. No adapter is chosen (the host chose it), and the debug layer, GPU-based validation
-    // and DRED below act only before a device exists, so they are the host's to turn on.
     const Settings& settings = GetSettings();
-    if (settings.hostDevice || settings.hostQueue)
-    {
-        if (!settings.hostDevice || !settings.hostQueue)
-            Fatal("presenter: Config::hostDevice and hostQueue are set together or not at all (only %s is set)",
-                settings.hostDevice ? "hostDevice" : "hostQueue");
-        g_device = static_cast<ID3D12Device*>(settings.hostDevice);
-        g_queue = static_cast<ID3D12CommandQueue*>(settings.hostQueue);
-        Log("presenter: using the host's device and queue");
-        if (getenv("REGPU_D3D12_DEBUG") || getenv("REGPU_DRED") || getenv("REGPU_ADAPTER"))
-            Log("presenter: REGPU_D3D12_DEBUG, REGPU_DRED and REGPU_ADAPTER do nothing (the host made the device)");
-        return;
-    }
+    (void)settings;
     if (getenv("REGPU_D3D12_DEBUG"))
     {
         ComPtr<ID3D12Debug> debug;
@@ -358,6 +361,208 @@ bool SpanMonitors()
     return on;
 }
 
+// The swap chain made (again) at the surface's size: after a resize, a vsync change, or an out-of-date present. The
+// queue is idle first (the old images may still be in a present).
+bool CreateSwapchain()
+{
+    vk::Device& d = *g_p.d;
+    VkSurfaceCapabilitiesKHR caps{};
+    vk::Check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(d.physical, g_p.vkSurface, &caps), "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    VkExtent2D extent = caps.currentExtent;
+    if (extent.width == UINT32_MAX)
+        extent = { std::clamp(GetSettings().width ? GetSettings().width : kWidth, caps.minImageExtent.width, caps.maxImageExtent.width),
+            std::clamp(GetSettings().height ? GetSettings().height : kHeight, caps.minImageExtent.height, caps.maxImageExtent.height) };
+    if (!extent.width || !extent.height)
+        return false; // (minimised)
+    uint32_t count = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(d.physical, g_p.vkSurface, &count, nullptr);
+    std::vector<VkSurfaceFormatKHR> formats(count);
+    vkGetPhysicalDeviceSurfaceFormatsKHR(d.physical, g_p.vkSurface, &count, formats.data());
+    VkSurfaceFormatKHR format = formats.empty() ? VkSurfaceFormatKHR{ VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR } : formats[0];
+    for (VkFormat want : { VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM })
+    {
+        auto it = std::find_if(formats.begin(), formats.end(),
+            [&](const VkSurfaceFormatKHR& f) { return f.format == want && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; });
+        if (it != formats.end())
+        {
+            format = *it;
+            break;
+        }
+    }
+    vkGetPhysicalDeviceSurfacePresentModesKHR(d.physical, g_p.vkSurface, &count, nullptr);
+    std::vector<VkPresentModeKHR> modes(count);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(d.physical, g_p.vkSurface, &count, modes.data());
+    const bool vsync = GetSettings().vsync;
+    auto has = [&](VkPresentModeKHR m) { return std::find(modes.begin(), modes.end(), m) != modes.end(); };
+    const VkPresentModeKHR mode = vsync ? VK_PRESENT_MODE_FIFO_KHR
+        : has(VK_PRESENT_MODE_IMMEDIATE_KHR) ? VK_PRESENT_MODE_IMMEDIATE_KHR
+        : has(VK_PRESENT_MODE_MAILBOX_KHR)   ? VK_PRESENT_MODE_MAILBOX_KHR
+                                             : VK_PRESENT_MODE_FIFO_KHR;
+    VkSwapchainCreateInfoKHR ci{ VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
+    ci.surface = g_p.vkSurface;
+    ci.minImageCount = std::max(caps.minImageCount, 3u);
+    if (caps.maxImageCount)
+        ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
+    ci.imageFormat = format.format;
+    ci.imageColorSpace = format.colorSpace;
+    ci.imageExtent = extent;
+    ci.imageArrayLayers = 1;
+    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ci.preTransform = caps.currentTransform;
+    ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    ci.presentMode = mode;
+    ci.clipped = VK_TRUE;
+    ci.oldSwapchain = g_p.swapchain;
+    {
+        std::lock_guard lock(d.queueLock);
+        vkQueueWaitIdle(d.queue);
+    }
+    VkSwapchainKHR made = VK_NULL_HANDLE;
+    const VkResult r = vkCreateSwapchainKHR(d.device, &ci, nullptr, &made);
+    for (VkImageView v : g_p.views)
+        vkDestroyImageView(d.device, v, nullptr);
+    for (VkSemaphore sem : g_p.rendered)
+        vkDestroySemaphore(d.device, sem, nullptr);
+    g_p.views.clear();
+    g_p.rendered.clear();
+    g_p.images.clear();
+    if (g_p.swapchain)
+        vkDestroySwapchainKHR(d.device, g_p.swapchain, nullptr);
+    g_p.swapchain = VK_NULL_HANDLE;
+    g_p.imageIndex = UINT32_MAX;
+    g_p.submitted = false;
+    if (r != VK_SUCCESS)
+    {
+        Log("presenter: swap chain %ux%u not made: %s", extent.width, extent.height, vk::ResultName(r));
+        return false;
+    }
+    g_p.swapchain = made;
+    g_p.format = format.format;
+    g_p.extent = extent;
+    g_p.vsync = vsync;
+    vkGetSwapchainImagesKHR(d.device, made, &count, nullptr);
+    g_p.images.resize(count);
+    vkGetSwapchainImagesKHR(d.device, made, &count, g_p.images.data());
+    for (VkImage image : g_p.images)
+    {
+        VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vi.image = image;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = format.format;
+        vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VkImageView view = VK_NULL_HANDLE;
+        vk::Check(vkCreateImageView(d.device, &vi, nullptr, &view), "vkCreateImageView(swap chain)");
+        g_p.views.push_back(view);
+        VkSemaphoreCreateInfo si{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        VkSemaphore sem = VK_NULL_HANDLE;
+        vk::Check(vkCreateSemaphore(d.device, &si, nullptr, &sem), "vkCreateSemaphore(rendered)");
+        g_p.rendered.push_back(sem);
+    }
+    Log("presenter: swap chain %ux%u, %u images, format %d, %s", extent.width, extent.height, count, int(format.format),
+        mode == VK_PRESENT_MODE_FIFO_KHR ? "vsync" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate (tearing)" : "mailbox");
+    return true;
+}
+
+// The next image of the swap chain for the frame being made (the one already acquired, if not yet presented).
+bool Acquire()
+{
+    vk::Device& d = *g_p.d;
+    if (g_p.imageIndex != UINT32_MAX)
+        return true;
+    if (!g_p.swapchain || g_p.recreate || g_p.vsync != GetSettings().vsync)
+    {
+        g_p.recreate = false;
+        if (!CreateSwapchain())
+            return false;
+    }
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        const uint32_t slot = g_p.acquireNext;
+        if (g_p.acquiredUse[slot])
+            vk::WaitFor(d, g_p.acquiredUse[slot]); // (its last wait has run: it can be signalled again)
+        uint32_t index = 0;
+        const VkResult r = vkAcquireNextImageKHR(d.device, g_p.swapchain, UINT64_MAX, g_p.acquired[slot], VK_NULL_HANDLE, &index);
+        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)
+        {
+            if (r == VK_SUBOPTIMAL_KHR)
+                g_p.recreate = true; // (after this frame)
+            g_p.imageIndex = index;
+            g_p.pendingAcquire = int(slot);
+            g_p.acquireNext = (slot + 1) % kAcquire;
+            return true;
+        }
+        if (r != VK_ERROR_OUT_OF_DATE_KHR || !CreateSwapchain())
+        {
+            Log("presenter: vkAcquireNextImageKHR: %s", vk::ResultName(r));
+            return false;
+        }
+    }
+    return false;
+}
+
+void ImageBarrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 srcStages, VkAccessFlags2 srcAccess,
+    VkPipelineStageFlags2 dstStages, VkAccessFlags2 dstAccess)
+{
+    VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    b.srcStageMask = srcStages;
+    b.srcAccessMask = srcAccess;
+    b.dstStageMask = dstStages;
+    b.dstAccessMask = dstAccess;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cb, &di);
+}
+
+// A blit of src's rectangle (sx0, sy0)-(sx1, sy1) to the back buffer's (dx0, dy0)-(dx1, dy1); both in their transfer
+// layouts. Linear filtering when the size changes.
+void Blit(VkCommandBuffer cb, VkImage src, VkImage dst, int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1, int32_t dx0, int32_t dy0, int32_t dx1,
+    int32_t dy1)
+{
+    if (sx1 <= sx0 || sy1 <= sy0 || dx1 <= dx0 || dy1 <= dy0)
+        return;
+    VkImageBlit b{};
+    b.srcSubresource = b.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    b.srcOffsets[0] = { sx0, sy0, 0 };
+    b.srcOffsets[1] = { sx1, sy1, 1 };
+    b.dstOffsets[0] = { dx0, dy0, 0 };
+    b.dstOffsets[1] = { dx1, dy1, 1 };
+    const bool scaled = sx1 - sx0 != dx1 - dx0 || sy1 - sy0 != dy1 - dy0;
+    vkCmdBlitImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, scaled ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+}
+
+// Presents the acquired image (its frame submitted: PresenterSubmit).
+void PresentAcquired()
+{
+    std::lock_guard swap(g_p.swapMutex);
+    if (g_p.imageIndex == UINT32_MAX || !g_p.submitted)
+        return;
+    vk::Device& d = *g_p.d;
+    VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &g_p.rendered[g_p.imageIndex];
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &g_p.swapchain;
+    pi.pImageIndices = &g_p.imageIndex;
+    VkResult r;
+    {
+        std::lock_guard lock(d.queueLock);
+        r = vkQueuePresentKHR(d.queue, &pi);
+    }
+    g_p.imageIndex = UINT32_MAX;
+    g_p.submitted = false;
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
+        g_p.recreate = true;
+    else if (r != VK_SUCCESS)
+        Log("presenter: vkQueuePresentKHR: %s", vk::ResultName(r));
+}
+
 void CreateWindowAndDevice()
 {
     // Physical pixels for the window ReGPU opens (an unaware window at 125% scaling would be stretched).
@@ -426,176 +631,124 @@ void CreateWindowAndDevice()
     }
     Log("presenter: picture in %s", g_p.surface ? "a child window (black bars)" : "the game window");
 
-    ComPtr<IDXGIFactory4> factory;
-    Check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
-    EnsureDevice();
-    g_p.device = g_device;
-    g_p.queue = g_queue;
-    regpu::xr::Start(g_device.Get(), g_queue.Get()); // (REGPU_VR: the headset thread, on this device and queue)
-
-    DXGI_SWAP_CHAIN_DESC1 sd{};
-    sd.Width = outW;
-    sd.Height = outH;
-    sd.Scaling = DXGI_SCALING_STRETCH;
-    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.SampleDesc.Count = 1;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount = kBuffers;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
-    ComPtr<IDXGISwapChain1> sc1;
-    Check(factory->CreateSwapChainForHwnd(g_p.queue.Get(), g_p.surface ? g_p.surface : g_p.window, &sd, nullptr, nullptr, &sc1), "CreateSwapChainForHwnd");
-    Check(sc1.As(&g_p.swapChain), "IDXGISwapChain3");
-    factory->MakeWindowAssociation(g_p.window, DXGI_MWA_NO_ALT_ENTER);
-
-    D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = kBuffers;
-    Check(g_p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_p.rtvHeap)), "CreateDescriptorHeap");
-    g_p.rtvStride = g_p.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    for (UINT i = 0; i < kBuffers; i++)
+    // The device (ReGPU's own, or the host's) and the swap chain on the window.
+    vk::Device& d = RenderVkDevice();
+    g_p.d = &d;
+    if (!d.swapchain)
+        Fatal("presenter: the Vulkan device has no swap chain support (VK_KHR_swapchain)");
+    VkWin32SurfaceCreateInfoKHR si{ VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR };
+    si.hinstance = GetModuleHandleW(nullptr);
+    si.hwnd = g_p.surface ? g_p.surface : g_p.window;
+    vk::Check(vkCreateWin32SurfaceKHR(d.instance, &si, nullptr, &g_p.vkSurface), "vkCreateWin32SurfaceKHR");
+    VkBool32 supported = VK_FALSE;
+    vkGetPhysicalDeviceSurfaceSupportKHR(d.physical, d.queueFamily, g_p.vkSurface, &supported);
+    if (!supported)
+        Fatal("presenter: the graphics queue can't present to this window");
+    for (VkSemaphore& sem : g_p.acquired)
     {
-        Check(g_p.swapChain->GetBuffer(i, IID_PPV_ARGS(&g_p.backBuffers[i])), "GetBuffer");
-        D3D12_CPU_DESCRIPTOR_HANDLE h = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        h.ptr += SIZE_T(i) * g_p.rtvStride;
-        g_p.device->CreateRenderTargetView(g_p.backBuffers[i].Get(), nullptr, h);
-        Check(g_p.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_p.allocators[i])), "CreateCommandAllocator");
+        VkSemaphoreCreateInfo sci{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        vk::Check(vkCreateSemaphore(d.device, &sci, nullptr, &sem), "vkCreateSemaphore(acquired)");
     }
-    Check(g_p.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_p.allocators[0].Get(), nullptr, IID_PPV_ARGS(&g_p.list)),
-        "CreateCommandList");
-    g_p.list->Close();
-    Check(g_p.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_p.fence)), "CreateFence");
-    g_p.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-
-    D3D12_HEAP_PROPERTIES hp{};
-    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC rd{};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = UINT64(kWidth) * kHeight * 4;
-    rd.Height = 1;
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1;
-    rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    for (UINT i = 0; i < kBuffers; i++)
-        Check(g_p.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                  IID_PPV_ARGS(&g_p.upload[i])),
-            "CreateCommittedResource(upload)"),
-            g_p.uploadBytes[i] = rd.Width;
+    {
+        std::lock_guard swap(g_p.swapMutex);
+        CreateSwapchain();
+    }
+    VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = d.queueFamily;
+    vk::Check(vkCreateCommandPool(d.device, &pci, nullptr, &g_p.pool), "vkCreateCommandPool(presenter)");
+    VkCommandBufferAllocateInfo ai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    ai.commandPool = g_p.pool;
+    ai.commandBufferCount = kBuffers;
+    vk::Check(vkAllocateCommandBuffers(d.device, &ai, g_p.cbs), "vkAllocateCommandBuffers(presenter)");
+    regpu::xr::Start(d); // (REGPU_VR: the headset thread, on this device and queue)
 }
 
-void Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
-{
-    D3D12_RESOURCE_BARRIER b{};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = resource;
-    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = before;
-    b.Transition.StateAfter = after;
-    g_p.list->ResourceBarrier(1, &b);
-}
-
+// The presenter's own frame (before the renderer draws): the submitted CPU image centred, or a pulsing clear.
 void DrawFrame(uint64_t frame)
 {
-    const UINT i = g_p.swapChain->GetCurrentBackBufferIndex();
-    if (g_p.fence->GetCompletedValue() < g_p.fenceValues[i])
-    {
-        g_p.fence->SetEventOnCompletion(g_p.fenceValues[i], g_p.fenceEvent);
-        WaitForSingleObject(g_p.fenceEvent, INFINITE);
-    }
-    g_p.allocators[i]->Reset();
-    g_p.list->Reset(g_p.allocators[i].Get(), nullptr);
-    ID3D12Resource* backBuffer = g_p.backBuffers[i].Get();
-
-    // The submitted image is any size (the Vulkan backend sends the output size); it is centred in the back buffer and
-    // cropped to it. It used to be assumed 1280x720 and copied to the top-left corner of a larger swap chain.
+    vk::Device& d = *g_p.d;
+    std::lock_guard swap(g_p.swapMutex);
+    const UINT i = g_p.ownFrame++ % kBuffers;
+    if (g_p.cbDone[i])
+        vk::WaitFor(d, g_p.cbDone[i]);
+    VkCommandBuffer cb = g_p.cbs[i];
+    vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &bi);
+    // The submitted image (any size: the parts-bin backend sends the output size) goes to the GPU through this frame's
+    // upload buffer.
     bool copied = false;
     uint32_t imageW = 0, imageH = 0;
     {
         std::lock_guard lock(g_p.mutex);
         imageW = g_p.imageWidth;
         imageH = g_p.imageHeight;
-        // D3D12 wants the rows of a placed footprint 256-byte aligned.
-        const uint32_t rowPitch = (imageW * 4 + 255) & ~255u;
-        const uint64_t bytes = uint64_t(rowPitch) * imageH;
-        if (bytes && g_p.image.size() == size_t(imageW) * imageH * 4)
+        const uint64_t bytes = uint64_t(imageW) * imageH * 4;
+        if (bytes && g_p.image.size() == bytes)
         {
-            if (g_p.uploadBytes[i] < bytes)
+            if (g_p.upload[i].size < bytes)
             {
-                D3D12_HEAP_PROPERTIES hp{};
-                hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-                D3D12_RESOURCE_DESC rd{};
-                rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-                rd.Width = bytes;
-                rd.Height = 1;
-                rd.DepthOrArraySize = 1;
-                rd.MipLevels = 1;
-                rd.SampleDesc.Count = 1;
-                rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-                // This buffer's last use was waited for above (fenceValues[i]), so it can be replaced.
-                g_p.upload[i].Reset();
-                g_p.uploadBytes[i] = SUCCEEDED(g_p.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_p.upload[i]))) ? bytes : 0;
+                vk::Destroy(d, g_p.upload[i]); // (its last use was waited for above)
+                g_p.upload[i] = vk::CreateBuffer(d, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, vk::Memory::Upload, "presenter upload");
             }
-            if (g_p.uploadBytes[i] >= bytes)
+            if (g_p.upload[i].mapped)
             {
-                void* mapped = nullptr;
-                g_p.upload[i]->Map(0, nullptr, &mapped);
-                if (rowPitch == imageW * 4)
-                    memcpy(mapped, g_p.image.data(), g_p.image.size());
-                else
-                    for (uint32_t y = 0; y < imageH; y++)
-                        memcpy(static_cast<uint8_t*>(mapped) + size_t(y) * rowPitch, g_p.image.data() + size_t(y) * imageW * 4, size_t(imageW) * 4);
-                g_p.upload[i]->Unmap(0, nullptr);
+                memcpy(g_p.upload[i].mapped, g_p.image.data(), bytes);
                 copied = true;
             }
         }
     }
-
+    if (!Acquire())
+    {
+        vkEndCommandBuffer(cb);
+        return;
+    }
+    const VkImage back = g_p.images[g_p.imageIndex];
+    ImageBarrier(cb, back, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+        VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    const float pulse = 0.15f + 0.1f * float((frame % 120) < 60 ? frame % 60 : 60 - frame % 60) / 60.0f;
+    VkClearColorValue clear{};
+    if (!copied)
+    {
+        clear.float32[0] = 0.05f, clear.float32[1] = pulse, clear.float32[2] = 0.12f;
+    }
+    clear.float32[3] = 1.0f;
+    const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdClearColorImage(cb, back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
     if (copied)
     {
-        const D3D12_RESOURCE_DESC backDesc = backBuffer->GetDesc();
-        const uint32_t backW = uint32_t(backDesc.Width), backH = backDesc.Height;
-        const uint32_t copyW = std::min(imageW, backW), copyH = std::min(imageH, backH);
-        if (copyW < backW || copyH < backH)
+        if (!g_p.cpuImage || g_p.cpuImage.desc.width != imageW || g_p.cpuImage.desc.height != imageH)
         {
-            Transition(backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-            rtv.ptr += SIZE_T(i) * g_p.rtvStride;
-            const float black[4] = { 0, 0, 0, 1 };
-            g_p.list->ClearRenderTargetView(rtv, black, 0, nullptr);
-            Transition(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+            vk::WaitFor(d, d.submitted.load()); // (rare: the image changed size)
+            vk::Destroy(d, g_p.cpuImage);
+            vk::ImageDesc desc;
+            desc.width = imageW;
+            desc.height = imageH;
+            desc.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            desc.name = "presenter image";
+            g_p.cpuImage = vk::CreateImage(d, desc);
         }
-        else
-            Transition(backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
-        D3D12_TEXTURE_COPY_LOCATION dst{};
-        dst.pResource = backBuffer;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        D3D12_TEXTURE_COPY_LOCATION src{};
-        src.pResource = g_p.upload[i].Get();
-        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, imageW, imageH, 1, (imageW * 4 + 255) & ~255u };
-        const D3D12_BOX box{ (imageW - copyW) / 2, (imageH - copyH) / 2, 0, (imageW - copyW) / 2 + copyW, (imageH - copyH) / 2 + copyH, 1 };
-        g_p.list->CopyTextureRegion(&dst, (backW - copyW) / 2, (backH - copyH) / 2, 0, &src, &box);
-        Transition(backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+        ImageBarrier(cb, g_p.cpuImage.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy c{};
+        c.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        c.imageExtent = { imageW, imageH, 1 };
+        vkCmdCopyBufferToImage(cb, g_p.upload[i].buffer, g_p.cpuImage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        ImageBarrier(cb, g_p.cpuImage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        // Centred and cropped to the back buffer.
+        const uint32_t w = std::min(imageW, g_p.extent.width), h = std::min(imageH, g_p.extent.height);
+        const int32_t sx = int32_t(imageW - w) / 2, sy = int32_t(imageH - h) / 2, dx = int32_t(g_p.extent.width - w) / 2,
+                      dy = int32_t(g_p.extent.height - h) / 2;
+        Blit(cb, g_p.cpuImage.image, back, sx, sy, sx + int32_t(w), sy + int32_t(h), dx, dy, dx + int32_t(w), dy + int32_t(h));
     }
-    else
-    {
-        Transition(backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        rtv.ptr += SIZE_T(i) * g_p.rtvStride;
-        const float pulse = 0.15f + 0.1f * float((frame % 120) < 60 ? frame % 60 : 60 - frame % 60) / 60.0f;
-        const float color[4] = { 0.05f, pulse, 0.12f, 1.0f };
-        g_p.list->ClearRenderTargetView(rtv, color, 0, nullptr);
-        Transition(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
-    }
-
-    g_p.list->Close();
-    ID3D12CommandList* lists[] = { g_p.list.Get() };
-    g_p.queue->ExecuteCommandLists(1, lists);
-    g_p.swapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
-    g_p.fenceValues[i] = g_p.nextFence++;
-    g_p.queue->Signal(g_p.fence.Get(), g_p.fenceValues[i]);
+    ImageBarrier(cb, back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+        VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, 0);
+    vkEndCommandBuffer(cb);
+    g_p.cbDone[i] = PresenterSubmitValue(cb);
+    PresentAcquired();
 }
 
 void RenderThread()
@@ -603,7 +756,7 @@ void RenderThread()
     SetThreadDescription(GetCurrentThread(), L"presenter");
     CreateWindowAndDevice();
     g_p.ready = true;
-    Log("presenter: window and D3D12 swap chain ready");
+    Log("presenter: window and Vulkan swap chain ready");
     for (;;)
     {
         MSG msg;
@@ -630,12 +783,10 @@ void RenderThread()
 
 void PresenterInit()
 {
-    // ReGPU's own references to the host's device and queue (Config::hostDevice, hostQueue), taken
-    // now, with or without a host presenter and headless too: the host need keep them alive only until
-    // Start has returned. A pair set by half stops here. Without a host device nothing happens here
-    // (ReGPU's own device is created on first use, as before).
+    // A host's device (Config::hostInstance ... hostQueue) is taken now, with or without a host presenter and headless
+    // too. Without one, ReGPU's own device is made on first use.
     if (GetSettings().hostDevice || GetSettings().hostQueue)
-        EnsureDevice();
+        RenderVkDevice();
     if (getenv("REGPU_HEADLESS"))
         return;
     // Host::presentImage: the host presents, so no thread, window or swap chain here. Its window
@@ -646,10 +797,10 @@ void PresenterInit()
         static LiveSwitch off("REGPU_NO_HOST_PRESENT");
         if (!off)
         {
-            // The host's present is ordered against ReGPU's writes only by going on the queue ReGPU
-            // renders on (no fence is handed over), so that queue must be the host's.
+            // The host's present is ordered against ReGPU's writes by going on the queue ReGPU renders on, so that
+            // queue (and device) must be the host's.
             if (!GetSettings().hostDevice || !GetSettings().hostQueue)
-                Fatal("presenter: Host::presentImage needs Config::hostDevice and Config::hostQueue (the host presents on the queue ReGPU renders on)");
+                Fatal("presenter: Host::presentImage needs the host's Vulkan device (Config::hostInstance, hostPhysicalDevice, hostDevice, hostQueue)");
             g_hostPresents = true;
             g_p.window = HWND(GetSettings().hostWindow);
             Log("presenter: the host presents (no swap chain)");
@@ -678,26 +829,14 @@ bool PresenterHasFocus()
     return !g_p.window || GetForegroundWindow() == g_p.window;
 }
 
-// The swap chain to a new output size (the renderer's ApplyOutputSize, the host GPU idle).
+// The swap chain to a new output size (the renderer's ApplyOutputSize, the host GPU idle): made again at the next
+// frame (it follows the window's size; the picture is scaled to it).
 void PresenterResize(uint32_t width, uint32_t height)
 {
-    if (!g_p.swapChain)
+    if (!g_p.swapchain)
         return;
-    for (auto& b : g_p.backBuffers)
-        b.Reset();
-    if (FAILED(g_p.swapChain->ResizeBuffers(kBuffers, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)))
-    {
-        Log("presenter: swap chain resize to %ux%u failed", width, height);
-        return;
-    }
-    for (UINT i = 0; i < kBuffers; i++)
-    {
-        Check(g_p.swapChain->GetBuffer(i, IID_PPV_ARGS(&g_p.backBuffers[i])), "GetBuffer");
-        D3D12_CPU_DESCRIPTOR_HANDLE h = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        h.ptr += SIZE_T(i) * g_p.rtvStride;
-        g_p.device->CreateRenderTargetView(g_p.backBuffers[i].Get(), nullptr, h);
-    }
-    Log("presenter: swap chain %ux%u", width, height);
+    g_p.recreate = true;
+    Log("presenter: output %ux%u", width, height);
     LayoutSurface(); // (fullscreen: the bars follow the new aspect ratio)
 }
 
@@ -769,7 +908,7 @@ void* PresenterClaimWindow()
         return nullptr;
     for (int i = 0; i < 2000 && !g_p.ready; i++) // the window is made on the presenter's thread
         Sleep(5);
-    if (!g_p.ready || g_p.swapChain)
+    if (!g_p.ready || g_p.swapchain)
         return nullptr;
     g_p.claimed = true;
     return g_p.surface ? g_p.surface : g_p.window;
@@ -791,7 +930,24 @@ vk::Device& RenderVkDevice()
 {
     static vk::Device device;
     static std::once_flag once;
-    std::call_once(once, [] { vk::CreateDevice(device, regpu::GetConfig().userDir); });
+    std::call_once(once, [] {
+        const Settings& st = GetSettings();
+        if (st.hostInstance || st.hostPhysicalDevice || st.hostDevice || st.hostQueue)
+        {
+            if (!st.hostInstance || !st.hostPhysicalDevice || !st.hostDevice || !st.hostQueue)
+                Fatal("presenter: Config::hostInstance, hostPhysicalDevice, hostDevice and hostQueue are set together or not at all");
+            vk::HostDevice host;
+            host.instance = VkInstance(st.hostInstance);
+            host.physical = VkPhysicalDevice(st.hostPhysicalDevice);
+            host.device = VkDevice(st.hostDevice);
+            host.queue = VkQueue(st.hostQueue);
+            host.queueFamily = st.hostQueueFamily;
+            host.extensions = st.hostDeviceExtensions;
+            vk::CreateDevice(device, regpu::GetConfig().userDir, &host);
+        }
+        else
+            vk::CreateDevice(device, regpu::GetConfig().userDir);
+    });
     return device;
 }
 
@@ -812,99 +968,111 @@ void PresenterUseRenderer()
     g_rendererActive = true;
 }
 
-bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, ID3D12Resource* overlay, uint32_t overlayW, uint32_t overlayH,
-    ID3D12Resource* timer, uint32_t timerW, uint32_t timerH, ID3D12Resource* fps, uint32_t fpsW, uint32_t fpsH, PresenterGrade grade, void* gradeCtx)
+uint64_t PresenterSubmitValue(VkCommandBuffer cb)
 {
-    if (!g_p.ready)
+    std::lock_guard swap(g_p.swapMutex);
+    vk::Device& d = *g_p.d;
+    if (g_p.pendingAcquire < 0)
+        return vk::Submit(d, &cb, 1);
+    // The copy waits for the image to be free (the acquire) and signals the present's semaphore.
+    const vk::SemaphoreUse wait{ g_p.acquired[g_p.pendingAcquire], 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT };
+    const vk::SemaphoreUse signal{ g_p.rendered[g_p.imageIndex], 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT };
+    const uint64_t value = vk::Submit(d, &cb, 1, &wait, 1, &signal, 1);
+    g_p.acquiredUse[g_p.pendingAcquire] = value;
+    g_p.pendingAcquire = -1;
+    g_p.submitted = true;
+    return value;
+}
+
+void PresenterSubmit(VkCommandBuffer cb)
+{
+    PresenterSubmitValue(cb);
+}
+
+bool PresenterRecordCopy(VkCommandBuffer cb, const vk::Image* src, const vk::Image* overlay, uint32_t overlayW, uint32_t overlayH, const vk::Image* timer,
+    uint32_t timerW, uint32_t timerH, const vk::Image* fps, uint32_t fpsW, uint32_t fpsH, PresenterGrade grade, void* gradeCtx)
+{
+    if (!g_p.ready || !src)
         return false;
-    const UINT i = g_p.swapChain->GetCurrentBackBufferIndex();
-    ID3D12Resource* backBuffer = g_p.backBuffers[i].Get();
-    D3D12_RESOURCE_BARRIER b{};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = backBuffer;
-    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    // The image is the render size; with a forced aspect ratio it is smaller than the back
-    // buffer and goes in the middle, on black.
-    const D3D12_RESOURCE_DESC sd = src->GetDesc(), bd = backBuffer->GetDesc();
-    const UINT offsetX = UINT((bd.Width - std::min(sd.Width, bd.Width)) / 2), offsetY = (bd.Height - std::min(sd.Height, bd.Height)) / 2;
+    std::lock_guard swap(g_p.swapMutex);
+    if (!Acquire())
+        return false;
+    vk::Device& d = *g_p.d;
+    const VkImage back = g_p.images[g_p.imageIndex];
+    const uint32_t bw = g_p.extent.width, bh = g_p.extent.height;
+    // The picture on the output-size canvas (the image is the render size; with a forced aspect ratio it is smaller and
+    // goes in the middle, on black); the canvas is stretched to the back buffer (the window's size), as D3D12's swap
+    // chain was stretched to its window.
+    const uint32_t cw = GetSettings().width ? GetSettings().width : bw, ch = GetSettings().height ? GetSettings().height : bh;
+    const uint32_t sw = src->desc.width, sh = src->desc.height;
+    const uint32_t shownW = std::min(sw, cw), shownH = std::min(sh, ch);
+    const uint32_t offsetX = (cw - shownW) / 2, offsetY = (ch - shownH) / 2;
+    auto X = [&](uint32_t x) { return int32_t(uint64_t(x) * bw / cw); };
+    auto Y = [&](uint32_t y) { return int32_t(uint64_t(y) * bh / ch); };
+    ImageBarrier(cb, back, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+        VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     if (offsetX || offsetY)
     {
-        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        list->ResourceBarrier(1, &b);
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        rtv.ptr += SIZE_T(i) * g_p.rtvStride;
-        const float black[4] = { 0, 0, 0, 1 };
-        list->ClearRenderTargetView(rtv, black, 0, nullptr);
-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        VkClearColorValue black{};
+        black.float32[3] = 1.0f;
+        const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdClearColorImage(cb, back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
     }
-    const bool sameSize = !offsetX && !offsetY && sd.Width == bd.Width && sd.Height == bd.Height;
-    if (grade && sameSize)
+    const bool canvasSize = !offsetX && !offsetY && sw == cw && sh == ch;
+    if (grade && canvasSize && bw == cw && bh == ch)
     {
         // The gamma pass writes the back buffer itself: one full-size write and read less than grading into an image
         // and copying that (session 33: ~4% at 4K 4x).
-        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        list->ResourceBarrier(1, &b);
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        rtv.ptr += SIZE_T(i) * g_p.rtvStride;
-        grade(list, size_t(rtv.ptr), UINT(bd.Width), bd.Height, gradeCtx);
-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        list->ResourceBarrier(1, &b);
+        ImageBarrier(cb, back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        grade(cb, g_p.views[g_p.imageIndex], g_p.format, bw, bh, gradeCtx);
+        ImageBarrier(cb, back, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    }
+    else if (grade && canvasSize)
+    {
+        // Graded at the picture's size, then scaled to the back buffer.
+        if (!g_p.gradeTarget || g_p.gradeTarget.desc.width != sw || g_p.gradeTarget.desc.height != sh)
+        {
+            {
+                std::lock_guard lock(d.queueLock);
+                vkQueueWaitIdle(d.queue); // (rare: the size changed; the old one may be in flight)
+            }
+            vk::Destroy(d, g_p.gradeTarget);
+            vk::ImageDesc desc;
+            desc.width = sw;
+            desc.height = sh;
+            desc.format = VK_FORMAT_R8G8B8A8_UNORM;
+            desc.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            desc.name = "graded picture";
+            g_p.gradeTarget = vk::CreateImage(d, desc);
+        }
+        ImageBarrier(cb, g_p.gradeTarget.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        grade(cb, g_p.gradeTarget.target, VK_FORMAT_R8G8B8A8_UNORM, sw, sh, gradeCtx);
+        ImageBarrier(cb, g_p.gradeTarget.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT);
+        Blit(cb, g_p.gradeTarget.image, back, 0, 0, int32_t(sw), int32_t(sh), 0, 0, int32_t(bw), int32_t(bh));
     }
     else
-        list->ResourceBarrier(1, &b);
-    if (sameSize)
-    {
-        if (!grade)
-            list->CopyResource(backBuffer, src);
-    }
-    else
-    {
-        D3D12_TEXTURE_COPY_LOCATION dst{}, from{};
-        dst.pResource = backBuffer;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        from.pResource = src;
-        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        const D3D12_BOX box{ 0, 0, 0, UINT(std::min(sd.Width, bd.Width)), std::min(sd.Height, bd.Height), 1 };
-        list->CopyTextureRegion(&dst, offsetX, offsetY, 0, &from, &box);
-    }
+        Blit(cb, src->image, back, 0, 0, int32_t(shownW), int32_t(shownH), X(offsetX), Y(offsetY), X(offsetX + shownW), Y(offsetY + shownH));
     if (overlay)
     {
-        D3D12_TEXTURE_COPY_LOCATION dst{}, from{};
-        dst.pResource = backBuffer;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        from.pResource = overlay;
-        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        list->CopyTextureRegion(&dst, offsetX + 24, offsetY + 24 + (timer ? timerH : 0), 0, &from, nullptr);
+        const uint32_t x = offsetX + 24, y = offsetY + 24 + (timer ? timerH : 0);
+        Blit(cb, overlay->image, back, 0, 0, int32_t(overlayW), int32_t(overlayH), X(x), Y(y), X(x + overlayW), Y(y + overlayH));
     }
-    if (timer && timerW <= bd.Width && timerH <= bd.Height)
-    {
-        D3D12_TEXTURE_COPY_LOCATION dst{}, from{};
-        dst.pResource = backBuffer;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        from.pResource = timer;
-        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        list->CopyTextureRegion(&dst, offsetX, offsetY, 0, &from, nullptr);
-    }
-    if (fps && fpsW <= std::min<UINT64>(sd.Width, bd.Width) && fpsH + 12 <= bd.Height)
+    if (timer && timerW <= cw && timerH <= ch)
+        Blit(cb, timer->image, back, 0, 0, int32_t(timerW), int32_t(timerH), X(offsetX), Y(offsetY), X(offsetX + timerW), Y(offsetY + timerH));
+    if (fps && fpsW <= shownW && fpsH + 12 <= ch)
     {
         // Top centre of the picture.
-        D3D12_TEXTURE_COPY_LOCATION dst{}, from{};
-        dst.pResource = backBuffer;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        from.pResource = fps;
-        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        const UINT shownW = UINT(std::min(sd.Width, bd.Width));
-        list->CopyTextureRegion(&dst, offsetX + (shownW - fpsW) / 2, offsetY + 12, 0, &from, nullptr);
+        const uint32_t x = offsetX + (shownW - fpsW) / 2, y = offsetY + 12;
+        Blit(cb, fps->image, back, 0, 0, int32_t(fpsW), int32_t(fpsH), X(x), Y(y), X(x + fpsW), Y(y + fpsH));
     }
-    regpu::xr::CaptureFrame(list, backBuffer); // (REGPU_VR: the finished frame for the headset's virtual screen)
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-    list->ResourceBarrier(1, &b);
+    regpu::xr::CaptureFrame(cb, back, bw, bh, g_p.format); // (REGPU_VR: the finished frame for the headset's virtual screen)
+    ImageBarrier(cb, back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+        VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_2_NONE, 0);
     return true;
 }
 
@@ -917,18 +1085,17 @@ void LogWindowSizes()
 {
     static RECT lastWin{}, lastSurf{};
     static UINT lastW = 0, lastH = 0;
-    if (!g_p.window || !g_p.swapChain)
+    if (!g_p.window || !g_p.swapchain)
         return;
     RECT win{}, surf{};
     GetWindowRect(g_p.window, &win);
     GetWindowRect(g_p.surface ? g_p.surface : g_p.window, &surf);
-    DXGI_SWAP_CHAIN_DESC1 d{};
-    g_p.swapChain->GetDesc1(&d);
-    if (memcmp(&win, &lastWin, sizeof(win)) == 0 && memcmp(&surf, &lastSurf, sizeof(surf)) == 0 && d.Width == lastW && d.Height == lastH)
+    const UINT w = g_p.extent.width, h = g_p.extent.height;
+    if (memcmp(&win, &lastWin, sizeof(win)) == 0 && memcmp(&surf, &lastSurf, sizeof(surf)) == 0 && w == lastW && h == lastH)
         return;
-    lastWin = win, lastSurf = surf, lastW = d.Width, lastH = d.Height;
+    lastWin = win, lastSurf = surf, lastW = w, lastH = h;
     Log("presenter: window %ld,%ld %ldx%ld, picture %ld,%ld %ldx%ld, swap chain %ux%u, DPI %u", win.left, win.top, win.right - win.left, win.bottom - win.top,
-        surf.left, surf.top, surf.right - surf.left, surf.bottom - surf.top, d.Width, d.Height, GetDpiForWindow(g_p.window));
+        surf.left, surf.top, surf.right - surf.left, surf.bottom - surf.top, w, h, GetDpiForWindow(g_p.window));
 }
 
 void PresenterPresent()
@@ -982,14 +1149,10 @@ void PresenterPresent()
             windowStart = now;
         }
     }
-    // Vsync: wait for the display's refresh; off: present at once (tearing allowed).
+    // Vsync (FIFO) or not (immediate: tearing allowed) is the swap chain's present mode: Acquire makes it again when
+    // the setting changes.
     if (g_p.ready)
-    {
-        if (GetSettings().vsync)
-            g_p.swapChain->Present(1, 0);
-        else
-            g_p.swapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
-    }
+        PresentAcquired();
 }
 
 uint32_t DisplayRefreshHz()

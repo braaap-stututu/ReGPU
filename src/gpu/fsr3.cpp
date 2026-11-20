@@ -1,7 +1,7 @@
-// AMD FSR 3 / FSR 4 upscaling (FidelityFX API, MIT): the same inputs as DLSS (see dlss.h). Needs
-// amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll next to the executable (copied there by the build).
-// The upscaler DLL (4.0.x in SDK 2.1) holds several versions: FSR 4 (machine-learned, RDNA 4 GPUs) and FSR 3.1 (any
-// D3D12 GPU). DlssSetup::fsr4 picks the newest 4.x the device offers, else the newest 3.x (FM3 port, session 36).
+// AMD FSR 3 / FSR 4 upscaling (FidelityFX API, MIT) on Vulkan: the same inputs as DLSS (see dlss.h). Needs
+// amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll next to the executable (copied there by the build;
+// FidelityFX SDK 2.4's signed Vulkan DLLs). The upscaler DLL holds several versions: FSR 4 (machine-learned, RDNA 4
+// GPUs, and RDNA 3 with recent drivers) and FSR 3.1 (any Vulkan GPU). DlssSetup::fsr4 picks the newest 4.x the device offers, else the newest 3.x (FM3 port, session 36).
 //
 // Contexts are kept, one per setup (FM3 port, session 36): a setup change (the scene image switching between 8-bit and
 // HDR formats while a track loads) used to destroy the context at once and create another, while the GPU had not yet
@@ -16,7 +16,7 @@
 
 #include <ffx_api.h>
 #include <ffx_upscale.h>
-#include <dx12/ffx_api_dx12.h>
+#include <vk/ffx_api_vk.h>
 
 #include "log.h"
 
@@ -49,7 +49,12 @@ int MajorOf(const char* name)
 
 // The upscaler versions this device offers, listed once: the newest 4.x and 3.x by their order (the API lists the
 // default, newest, first).
-void ListVersions(ID3D12Device* device)
+VkDeviceContext DeviceContext(vk::Device& d)
+{
+    return { d.device, d.physical, vkGetDeviceProcAddr };
+}
+
+void ListVersions(vk::Device& device)
 {
     if (g_fsr3.listed)
         return;
@@ -58,7 +63,8 @@ void ListVersions(ID3D12Device* device)
     ffxQueryDescGetVersions q{};
     q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
     q.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    q.device = device;
+    VkDeviceContext context = DeviceContext(device);
+    q.device = &context;
     q.outputCount = &count;
     if (ffxQuery(nullptr, &q.header) != FFX_API_RETURN_OK || !count)
     {
@@ -85,7 +91,7 @@ void ListVersions(ID3D12Device* device)
     Log("fsr: upscaler versions on this GPU: %s", all.c_str());
 }
 
-Fsr3Context* ContextFor(ID3D12Device* device, const DlssSetup& setup)
+Fsr3Context* ContextFor(vk::Device& device, const DlssSetup& setup)
 {
     for (Fsr3Context& c : g_fsr3.contexts)
         if (c.setup == setup)
@@ -111,9 +117,9 @@ Fsr3Context* ContextFor(ID3D12Device* device, const DlssSetup& setup)
         version = g_fsr3.fsr3Version;
         versionName = g_fsr3.fsr3Name.c_str();
     }
-    ffxCreateBackendDX12Desc backend{};
-    backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
-    backend.device = device;
+    ffxCreateBackendVKDesc backend{};
+    backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+    backend.deviceContext = DeviceContext(device);
     // SDK 2.1: the API version the program was built against must be chained (super-resolution-ml.md, "New APIs").
     ffxCreateContextDescUpscaleVersion apiVersion{};
     apiVersion.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
@@ -145,7 +151,7 @@ Fsr3Context* ContextFor(ID3D12Device* device, const DlssSetup& setup)
     }
     if (r != FFX_API_RETURN_OK)
     {
-        Log("fsr: create failed (%d): amd_fidelityfx_*_dx12.dll missing?", int(r));
+        Log("fsr: create failed (%d): amd_fidelityfx_*_vk.dll missing?", int(r));
         if (g_fsr3.contexts.empty())
             g_fsr3.failed = true;
         return nullptr;
@@ -159,7 +165,7 @@ Fsr3Context* ContextFor(ID3D12Device* device, const DlssSetup& setup)
 
 // On the draw thread (FM3 port, session 36): the context for `setup`, made on first use; *handle and *switched (a
 // different context than the last dispatch's: no history) go to Fsr3Dispatch, which runs where the list replays.
-bool Fsr3Prepare(ID3D12Device* device, const DlssSetup& setup, void** handle, bool* switched)
+bool Fsr3Prepare(vk::Device& device, const DlssSetup& setup, void** handle, bool* switched)
 {
     if (g_fsr3.failed)
         return false;
@@ -172,18 +178,31 @@ bool Fsr3Prepare(ID3D12Device* device, const DlssSetup& setup, void** handle, bo
     return true;
 }
 
-bool Fsr3Dispatch(ID3D12GraphicsCommandList* list, void* handle, bool switched, const DlssSetup& setup, const DlssFrame& frame, float sharpness)
+// A ReGPU image as FidelityFX's resource (its description from the image's own).
+FfxApiResource Resource(const vk::Image& image, uint32_t state)
+{
+    VkImageCreateInfo ci{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ci.imageType = image.desc.type;
+    ci.format = image.desc.format;
+    ci.extent = { image.desc.width, image.desc.height, image.desc.depth };
+    ci.mipLevels = image.desc.mips;
+    ci.arrayLayers = image.desc.layers;
+    ci.usage = image.desc.usage;
+    return ffxApiGetResourceVK(reinterpret_cast<void*>(image.image), ffxApiGetImageResourceDescriptionVK(image.image, ci, 0), state);
+}
+
+bool Fsr3Dispatch(VkCommandBuffer cb, void* handle, bool switched, const DlssSetup& setup, const DlssFrame& frame, float sharpness)
 {
     ffxContext context = handle;
     ffxDispatchDescUpscale d{};
     d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
-    d.commandList = list;
-    d.color = ffxApiGetResourceDX12(frame.color, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    d.depth = ffxApiGetResourceDX12(frame.depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    d.motionVectors = ffxApiGetResourceDX12(frame.motion, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    d.commandList = cb;
+    d.color = Resource(*frame.color, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    d.depth = Resource(*frame.depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    d.motionVectors = Resource(*frame.motion, FFX_API_RESOURCE_STATE_COMPUTE_READ);
     if (frame.reactive)
-        d.reactive = ffxApiGetResourceDX12(frame.reactive, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    d.output = ffxApiGetResourceDX12(frame.output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+        d.reactive = Resource(*frame.reactive, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    d.output = Resource(*frame.output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     d.jitterOffset = { frame.jitterX, frame.jitterY };
     d.motionVectorScale = { frame.motionScaleX, frame.motionScaleY };
     d.renderSize = { setup.renderWidth, setup.renderHeight };
@@ -218,17 +237,17 @@ bool Fsr3Dispatch(ID3D12GraphicsCommandList* list, void* handle, bool switched, 
     return true;
 }
 
-bool Fsr3Evaluate(ID3D12Device* device, ID3D12GraphicsCommandList* list, const DlssSetup& setup, const DlssFrame& frame, float sharpness)
+bool Fsr3Evaluate(vk::Device& device, VkCommandBuffer cb, const DlssSetup& setup, const DlssFrame& frame, float sharpness)
 {
     void* handle = nullptr;
     bool switched = false;
-    return Fsr3Prepare(device, setup, &handle, &switched) && Fsr3Dispatch(list, handle, switched, setup, frame, sharpness);
+    return Fsr3Prepare(device, setup, &handle, &switched) && Fsr3Dispatch(cb, handle, switched, setup, frame, sharpness);
 }
 
 // Upscaler::Fsr4 through the one-step path (from the FM2 port): FSR 4 where the device offers it, else FSR 3.
-bool Fsr4Evaluate(ID3D12Device* device, ID3D12GraphicsCommandList* list, const DlssSetup& setup, const DlssFrame& frame, float sharpness)
+bool Fsr4Evaluate(vk::Device& device, VkCommandBuffer cb, const DlssSetup& setup, const DlssFrame& frame, float sharpness)
 {
     DlssSetup s = setup;
     s.fsr4 = true;
-    return Fsr3Evaluate(device, list, s, frame, sharpness);
+    return Fsr3Evaluate(device, cb, s, frame, sharpness);
 }

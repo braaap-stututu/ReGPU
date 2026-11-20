@@ -87,9 +87,10 @@ struct Image
 
 Image CreateImage(Device& d, const ImageDesc& desc);
 void Destroy(Device& d, Image& image);
-// A view of other mips, layers, format or aspect (the renderer's per-mip resolve targets, R32 views of depth).
+// A view of other mips, layers, format or aspect (the renderer's per-mip resolve targets, R32 views of depth), with a
+// component swizzle (D3D12's Shader4ComponentMapping: BC4 as rrrr, R8 as rrr1; {} is the identity).
 VkImageView CreateView(Device& d, const Image& image, VkImageViewType type, VkFormat format, VkImageAspectFlags aspects, uint32_t baseMip,
-    uint32_t mips, uint32_t baseLayer, uint32_t layers);
+    uint32_t mips, uint32_t baseLayer, uint32_t layers, VkComponentMapping components = {});
 
 // Typical uses: the layout, stages and accesses that go with them.
 enum class Use

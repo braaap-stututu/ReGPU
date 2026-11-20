@@ -267,7 +267,7 @@ void SetName(const Device& d, VkObjectType type, uint64_t handle, const char* na
     vkSetDebugUtilsObjectNameEXT(d.device, &info);
 }
 
-void CreateDevice(Device& d, const std::filesystem::path& cacheDir)
+void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDevice* host)
 {
     if (!vkldr::Load())
         Fatal("presenter: no Vulkan loader (vulkan-1.dll): install or update the graphics driver");
@@ -329,7 +329,15 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir)
         ici.pNext = &features;
         Log("presenter: REGPU_VK_VALIDATION=2: synchronization validation on");
     }
-    Check(vkCreateInstance(&ici, nullptr, &d.instance), "vkCreateInstance");
+    if (host)
+    {
+        // The host's instance (Config::hostInstance): its extensions and layers are the host's choice.
+        d.instance = host->instance;
+        d.validation = false;
+        Log("presenter: using the host's Vulkan instance and device");
+    }
+    else
+        Check(vkCreateInstance(&ici, nullptr, &d.instance), "vkCreateInstance");
     vkldr::ResolveInstance(d.instance);
     if (d.validation && debugUtils)
     {
@@ -341,7 +349,7 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir)
     }
 
     // The physical device.
-    d.physical = PickPhysicalDevice(d.instance);
+    d.physical = host ? host->physical : PickPhysicalDevice(d.instance);
     VkPhysicalDeviceIDProperties ids{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostProps{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT };
     d.driver.pNext = &ids;
@@ -373,6 +381,8 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir)
     std::vector<VkQueueFamilyProperties> families(count);
     vkGetPhysicalDeviceQueueFamilyProperties(d.physical, &count, families.data());
     d.queueFamily = UINT32_MAX;
+    if (host)
+        d.queueFamily = host->queueFamily;
     for (uint32_t i = 0; i < count && d.queueFamily == UINT32_MAX; i++)
         if ((families[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
             d.queueFamily = i;
@@ -387,6 +397,9 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir)
     auto optional = [&](const char* name) {
         if (!HasExtension(deviceExt, name))
             return false;
+        // (A host's device: only what the host enabled.)
+        if (host && std::find(host->extensions.begin(), host->extensions.end(), std::string(name)) == host->extensions.end())
+            return false;
         enabled.push_back(name);
         return true;
     };
@@ -396,6 +409,8 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir)
     d.hostPointerAlignment = d.externalMemoryHost ? uint32_t(hostProps.minImportedHostPointerAlignment) : 0;
     d.pushDescriptor = optional(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     d.memoryBudget = optional(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    // NVIDIA's NGX (DLSS on Vulkan, dlss.cpp) needs these two where the driver has them.
+    d.ngx = optional("VK_NVX_binary_import") && optional("VK_NVX_image_view_handle");
 
     // Features: the baseline (checked by MissingBaseline), plus what the translated shaders and the renderer use when
     // the GPU has it.
@@ -433,6 +448,8 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir)
     w.drawIndirectFirstInstance = h.drawIndirectFirstInstance;
     w.shaderStorageImageExtendedFormats = h.shaderStorageImageExtendedFormats;
     w.shaderStorageImageWriteWithoutFormat = h.shaderStorageImageWriteWithoutFormat;
+    w.shaderStorageImageReadWithoutFormat = h.shaderStorageImageReadWithoutFormat; // (post filters read their storage images: FinishMain)
+    d.storageReadWithoutFormat = h.shaderStorageImageReadWithoutFormat;
     w.shaderImageGatherExtended = h.shaderImageGatherExtended;
     w.largePoints = h.largePoints;
     w.wideLines = h.wideLines;
@@ -484,9 +501,20 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir)
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = uint32_t(enabled.size());
     dci.ppEnabledExtensionNames = enabled.data();
-    Check(vkCreateDevice(d.physical, &dci, nullptr, &d.device), "vkCreateDevice");
-    vkldr::ResolveDevice(d.device);
-    vkGetDeviceQueue(d.device, d.queueFamily, 0, &d.queue);
+    if (host)
+    {
+        // The host's device and queue: it enabled ReGPU's baseline (regpu.h, Config::hostDevice); the optional
+        // extensions are the ones it lists, its features are taken as the GPU's.
+        d.device = host->device;
+        vkldr::ResolveDevice(d.device);
+        d.queue = host->queue;
+    }
+    else
+    {
+        Check(vkCreateDevice(d.physical, &dci, nullptr, &d.device), "vkCreateDevice");
+        vkldr::ResolveDevice(d.device);
+        vkGetDeviceQueue(d.device, d.queueFamily, 0, &d.queue);
+    }
 
     // The allocator.
     VmaVulkanFunctions functions{};

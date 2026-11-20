@@ -23,10 +23,6 @@ struct Config
     uint32_t maxFps = 60;                // frame cap
     bool enhance = false;                // enhanced lighting post pass (experimental)
     uint32_t msaa = 1;                   // samples per pixel: 1 (off), 2, 4 or 8
-    // The backend that draws: Direct3D 12 (the default), or Vulkan (experimental, the FM2 port's renderer, in builds
-    // with REGPU_VULKAN; otherwise Direct3D 12 anyway). REGPU_RENDERER=vulkan or d3d12 overrides it.
-    enum class Renderer : uint32_t { D3D12, Vulkan };
-    Renderer renderer = Renderer::D3D12;
     // Upscaling: the 3D scene renders smaller and is upscaled before post-processing and the
     // HUD, which stay at full resolution. Fsr3, Fsr4 and Dlss need REGPU_FSR3 / REGPU_DLSS builds. The temporal ones
     // (Fsr3, Fsr4, Dlss) run only on frames with a 3D scene of their own, and need MSAA off: with one chosen the scene
@@ -50,12 +46,22 @@ struct Config
     // A window the host already owns (an HWND): ReGPU presents into it instead of opening its own.
     // The host then handles closing, resizing and fullscreen; windowTitle and fullscreen are unused.
     void* hostWindow = nullptr;
-    // A Direct3D 12 device and its direct command queue the host already has (ID3D12Device*,
-    // ID3D12CommandQueue*): ReGPU renders on them instead of creating its own, and chooses no adapter.
-    // Both or neither (one alone ends the process at Start with a FATAL line in regpu.log). ReGPU takes
-    // its own reference to each in Start: the host keeps both alive until Start has returned.
+    // A Vulkan device the host already has: ReGPU renders on it instead of creating its own, and chooses no GPU.
+    // hostInstance (VkInstance), hostPhysicalDevice (VkPhysicalDevice), hostDevice (VkDevice) and hostQueue (VkQueue,
+    // of hostQueueFamily, with graphics and compute) all, or none (some alone end the process at Start with a FATAL
+    // line in regpu.log). The device must be Vulkan 1.3 with dynamic rendering, synchronization2, maintenance4,
+    // timeline semaphores, descriptor indexing (update-after-bind, partially bound, runtime arrays), robustness2's
+    // null descriptors and VK_EXT_robustness2, and the instance VK_KHR_surface (+ the platform's) when ReGPU presents.
+    // hostDeviceExtensions lists the device extensions the host enabled: ReGPU uses the optional ones it finds there
+    // (VK_KHR_swapchain, VK_EXT_conditional_rendering, VK_EXT_external_memory_host, VK_EXT_memory_budget, ...).
+    // ReGPU submits on hostQueue under its own lock: the host must not use that queue from another thread at the same
+    // time. The host keeps all of it alive while ReGPU runs.
+    void* hostInstance = nullptr;
+    void* hostPhysicalDevice = nullptr;
     void* hostDevice = nullptr;
     void* hostQueue = nullptr;
+    uint32_t hostQueueFamily = 0;
+    std::vector<std::string> hostDeviceExtensions;
     // Upload ring per frame (constants, vertices, textures), in MB; 0 is ReGPU's default (64 with
     // direct fetch). About 11 KB a draw goes to constants alone: titles with thousands of draws need
     // more, or their last draws are dropped. REGPU_RING_MB overrides it.
@@ -109,13 +115,13 @@ struct PresentImage
     enum class Kind : uint32_t { Frame, Hold, Boot };
     Kind kind;              // Frame: a guest swap. Hold: the last picture again, while ReGPU waits. Boot: the first-boot screen.
     uint64_t frame;         // ReGPU's frame number
-    void* image;            // ID3D12Resource*, R8G8B8A8_UNORM, already encoded for display; null: a Frame with nothing presentable
+    uint64_t image;         // a VkImage, R8G8B8A8_UNORM, already encoded for display; 0: a Frame with nothing presentable
     uint32_t width, height; // the image's size
-    uint32_t imageState;    // the D3D12_RESOURCE_STATES it is in
-    void* overlay;          // optional ID3D12Resource*, R8G8B8A8_UNORM: ReGPU's progress text
+    uint32_t imageLayout;   // the VkImageLayout it is in
+    uint64_t overlay;       // optional VkImage, R8G8B8A8_UNORM: ReGPU's progress text
     uint32_t overlayWidth, overlayHeight;
     uint32_t overlayX, overlayY; // where it goes on the image (its top left)
-    uint32_t overlayState;
+    uint32_t overlayLayout;
 };
 
 // What ReGPU needs from the game's runtime. Required unless marked optional.
@@ -124,7 +130,7 @@ struct Host
     // The guest's 4 GB address space: guest address A is at base + A.
     uint8_t* base = nullptr;
     // Optional: the file mapping of the 512 MB physical memory, if the game maps it from one
-    // (D3D12 then reads vertex buffers in place instead of copying them).
+    // (on Windows, not used by the Vulkan renderer: it imports the view's memory, VK_EXT_external_memory_host).
     void* physicalSection = nullptr;
     // Guest memory: physical (GPU-visible) or virtual, at least `align` aligned. Returns the guest address.
     uint32_t (*alloc)(bool physical, uint32_t size, uint32_t align) = nullptr;
@@ -174,18 +180,19 @@ struct Host
     void (*onSwap)(uint64_t frame) = nullptr;
     // Optional: the host presents. ReGPU then opens no window and no swap chain, and calls this instead of
     // presenting: once for every guest swap once the renderer has started (from the first draw on; not
-    // with the REGPU_TEXVIEW debug view; Kind::Frame), after the swap's command list was submitted to
-    // the queue (ExecuteCommandLists; not waited for), and for each hold or boot screen. Frames and boot
+    // with the REGPU_TEXVIEW debug view; Kind::Frame), after the swap's command buffer was submitted to
+    // the queue (vkQueueSubmit2; not waited for), and for each hold or boot screen. Frames and boot
     // screens come on the renderer's thread
     // (the command processor's, or the draw thread's with REGPU_DRAW_THREAD); a hold comes on whichever
     // thread waits for a shader or pipeline, which with REGPU_DRAW_WORKERS can be a draw piece worker.
-    // The host may transition image and overlay on its own command list and must return them to the
-    // states given before it returns.
+    // The host may transition image and overlay on its own command buffer and must return them to the
+    // layouts given before it returns.
     // That work on image and overlay is submitted on Config::hostQueue (the queue ReGPU renders on) before
-    // this returns: ReGPU hands over no fence, so that queue is what orders the host's reads after ReGPU's
-    // writes and ReGPU's next writes after the host's reads. The host keeps neither pointer past the
-    // call: ReGPU writes both again for the next picture. presentImage therefore needs
-    // Config::hostDevice and hostQueue; without them the process ends at Start with a FATAL line in
+    // this returns: ReGPU hands over no semaphore, so that queue (with the host's barriers, from all commands
+    // and all memory writes) is what orders the host's reads after ReGPU's writes and ReGPU's next writes
+    // after the host's reads. The host keeps neither image past the call: ReGPU writes both again for the
+    // next picture. presentImage therefore needs Config::hostDevice and the rest; without them the process
+    // ends at Start with a FATAL line in
     // regpu.log (not with REGPU_HEADLESS or REGPU_NO_HOST_PRESENT=1, which never call it). The pointer
     // is read at each call: a host that clears it (at its shutdown) is not called again. SetFullscreen
     // does nothing then (the window and its presentation are the host's), and the picture's size follows
@@ -213,7 +220,7 @@ struct Host
 Config& GetConfig();
 Host& GetHost();
 
-// Opens the window and the D3D12 device, and starts the command processor. Call once, after filling
+// Opens the window and the Vulkan device, and starts the command processor. Call once, after filling
 // in Config and Host, before the game calls VdInitializeRingBuffer.
 void Start();
 // The debug server's controller (REGPU_DEBUG=1; tools/regpuctl.py press/hold/stick/trigger): the game

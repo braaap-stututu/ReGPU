@@ -1,19 +1,19 @@
-// Builds without the DLSS or FidelityFX SDK (REGPU_DLSS / REGPU_FSR3 off): those upscalers report
+// Builds without the DLSS, XeSS or FidelityFX SDK (REGPU_DLSS / REGPU_XESS_DIR / REGPU_FSR3 off): those upscalers report
 // unavailable and the renderer falls back as it does on hardware without them.
 #include "gpu/fsr3.h"
 
 #include "gpu/xess.h"
 #ifndef REGPU_XESS
-bool XessInit(ID3D12Device*) { return false; }
-bool XessEvaluate(ID3D12GraphicsCommandList*, const DlssSetup&, const DlssFrame&) { return false; }
+bool XessInit(vk::Device&) { return false; }
+bool XessEvaluate(VkCommandBuffer, const DlssSetup&, const DlssFrame&) { return false; }
 #endif
 #ifndef REGPU_DLSS
-bool DlssInit(ID3D12Device*) { return false; }
-bool DlssEvaluate(ID3D12GraphicsCommandList*, const DlssSetup&, const DlssFrame&) { return false; }
+bool DlssInit(vk::Device&) { return false; }
+bool DlssEvaluate(VkCommandBuffer, const DlssSetup&, const DlssFrame&) { return false; }
 #endif
 #ifndef REGPU_FSR3
-bool Fsr3Evaluate(ID3D12Device*, ID3D12GraphicsCommandList*, const DlssSetup&, const DlssFrame&, float) { return false; }
-bool Fsr4Evaluate(ID3D12Device*, ID3D12GraphicsCommandList*, const DlssSetup&, const DlssFrame&, float) { return false; }
-bool Fsr3Prepare(ID3D12Device*, const DlssSetup&, void**, bool*) { return false; }
-bool Fsr3Dispatch(ID3D12GraphicsCommandList*, void*, bool, const DlssSetup&, const DlssFrame&, float) { return false; }
+bool Fsr3Evaluate(vk::Device&, VkCommandBuffer, const DlssSetup&, const DlssFrame&, float) { return false; }
+bool Fsr4Evaluate(vk::Device&, VkCommandBuffer, const DlssSetup&, const DlssFrame&, float) { return false; }
+bool Fsr3Prepare(vk::Device&, const DlssSetup&, void**, bool*) { return false; }
+bool Fsr3Dispatch(VkCommandBuffer, void*, bool, const DlssSetup&, const DlssFrame&, float) { return false; }
 #endif

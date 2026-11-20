@@ -10,7 +10,12 @@
 #include "log.h"
 #include "regpu/regpu.h"
 
-#if !REGPU_OPENXR
+// The OpenXR session below is still the D3D12 one (XR_KHR_D3D12_enable): on Vulkan (XR_KHR_vulkan_enable2) it is to be
+// ported. Until then every build takes the stub, and REGPU_VR says so in the log.
+#ifndef REGPU_OPENXR_VULKAN
+#define REGPU_OPENXR_VULKAN 0
+#endif
+#if !REGPU_OPENXR || !REGPU_OPENXR_VULKAN
 
 namespace regpu::xr
 {
@@ -20,19 +25,19 @@ bool Wanted()
     if (getenv("REGPU_VR") && !logged)
     {
         logged = true;
-        Log("vr: REGPU_VR is set but this build has no OpenXR (REGPU_OPENXR_DIR)");
+        Log("vr: REGPU_VR is set but VR is not available in this build (no OpenXR, or its Vulkan session is not ported yet)");
     }
     return false;
 }
-void Start(ID3D12Device*, ID3D12CommandQueue*) {}
-void CaptureFrame(ID3D12GraphicsCommandList*, ID3D12Resource*) {}
+void Start(vk::Device&) {}
+void CaptureFrame(VkCommandBuffer, VkImage, uint32_t, uint32_t, VkFormat) {}
 bool StereoFrame(float&, float&) { return false; }
 bool MonoHudPanel() { return false; }
 uint32_t PaceCap() { return 0; }
 void SetCaptureTag(uint32_t) {}
 uint32_t TakeFrameFlags() { return 0; }
 bool TagKnown(uint32_t) { return false; }
-ID3D12Resource* StereoTarget(int, uint32_t, uint32_t) { return nullptr; }
+vk::Image* StereoTarget(int, uint32_t, uint32_t) { return nullptr; }
 void StereoHudCaptured() {}
 }
 namespace regpu::vr

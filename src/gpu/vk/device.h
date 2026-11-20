@@ -9,6 +9,8 @@
 // rendering (SetPredication), external host memory (guest memory read in place), push descriptors, the swap chain
 // and the memory budget.
 #include <atomic>
+#include <string>
+#include <vector>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
@@ -52,6 +54,8 @@ struct Device
     bool pushDescriptor = false;       // VK_KHR_push_descriptor
     bool swapchain = false;            // VK_KHR_swapchain (+ the instance's surface extensions)
     bool memoryBudget = false;         // VK_EXT_memory_budget
+    bool ngx = false;                  // VK_NVX_binary_import and VK_NVX_image_view_handle (DLSS through NGX)
+    bool storageReadWithoutFormat = false; // shaderStorageImageReadWithoutFormat (the post filters read storage images)
     bool updateUnusedWhilePending = false; // descriptorBindingUpdateUnusedWhilePending (bindless writes while in flight)
     bool validation = false;           // REGPU_VK_VALIDATION: VK_LAYER_KHRONOS_validation is on
     float maxAnisotropy = 1.0f;
@@ -66,10 +70,21 @@ struct Device
     std::mutex queueLock;
 };
 
-// Creates the device. cacheDir: where the pipeline cache is kept (Config::userDir). Ends the process with a FATAL
-// line when no GPU meets the baseline. REGPU_ADAPTER picks the GPU, as it did for D3D12: part of its name ("7900"),
-// an index in Vulkan's enumeration order ("1"), or "high" / "low" (a discrete / an integrated GPU).
-void CreateDevice(Device& d, const std::filesystem::path& cacheDir);
+// A device the host made (Config::hostInstance ... hostQueue): ReGPU renders on it instead of making its own.
+struct HostDevice
+{
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    uint32_t queueFamily = 0;
+    VkQueue queue = VK_NULL_HANDLE;
+    std::vector<std::string> extensions; // the device extensions it enabled
+};
+
+// Creates the device (or takes the host's). cacheDir: where the pipeline cache is kept (Config::userDir). Ends the
+// process with a FATAL line when no GPU meets the baseline. REGPU_ADAPTER picks the GPU, as it did for D3D12: part of
+// its name ("7900"), an index in Vulkan's enumeration order ("1"), or "high" / "low" (a discrete / an integrated GPU).
+void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDevice* host = nullptr);
 // Writes the pipeline cache to disk. Safe while other threads create pipelines with it. Returns the bytes written.
 size_t SavePipelineCache(Device& d);
 

@@ -17,6 +17,10 @@ std::string AdaptHlsl(const std::string& hlsl);
 // pixel selects ps_6_0/vs_6_0. cacheDir may be empty to skip the disk cache.
 bool CompileHlsl(const std::string& hlsl, bool pixel, uint64_t key, const std::filesystem::path& cacheDir,
     std::vector<uint32_t>& spirv, std::string* error = nullptr, bool disableOptimizations = false);
+// Any stage and entry point (profile "vs_6_0", "ps_6_0", "cs_6_0"...): ReGPU's own passes (blits, resolves, post
+// filters, upscalers). Registers are shifted as for the translated shaders (b 0, t 100, s 200, u 300; set 0).
+bool CompileHlslStage(const std::string& hlsl, const char* profile, const char* entry, const std::filesystem::path& cacheDir,
+    std::vector<uint32_t>& spirv, std::string* error = nullptr);
 // Whether CompileHlsl would find this shader in the disk cache (no read, no compile).
 bool SpirvCached(const std::string& hlsl, uint64_t key, const std::filesystem::path& cacheDir);
 
