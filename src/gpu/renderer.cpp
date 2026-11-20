@@ -409,6 +409,7 @@ struct ResolvedTexture
     bool stale = false;
     uint32_t guestBpp = 4; // bytes per pixel of the guest image: the hash covers only its memory
     uint32_t guestFormat = 0; // the copy's destination format (RB_COPY_DEST_INFO bits 7-12)
+    uint32_t guestNumber = 0; // the copy's destination number format (bits 13-15: 0 unsigned fraction, 1 signed, 2 uint, 3 sint)
     // The title resolves differently sized images (bloom chain) to one address within a
     // frame: keep earlier sizes here and swap them in rather than recreating them.
     std::vector<ResolvedTexture> spares;
@@ -6985,6 +6986,7 @@ void Resolve()
             UpscaleScene(base);
         g_r.resolved[base].swapped = swapRB;
         g_r.resolved[base].guestFormat = depth ? 0u : destFormat;
+        g_r.resolved[base].guestNumber = depth ? 0u : numberFormat;
         // Images the game reads on the CPU are also written to memory (regpu.h Host::resolveWriteback;
         // without it, REGPU_RESOLVE_WRITEBACK's "WxH,WxH" sizes of 8888 colour, at once).
         regpu::Writeback request;
@@ -9986,6 +9988,33 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // outside the image (dword 5 bits 0-1: 1 white, else black).
         if (clampX >= 6 && clampY >= 6)
             ti[0] |= (1u << 16) | ((fetch.dwords[5] & 3) == 1 ? 1u << 17 : 0u);
+        // A resolved 16-bit fixed image (copy destination k_16, k_16_16, k_16_16_16_16: formats 24-26) keeps each
+        // value as a float in the copy's own number format (the resolve): a fraction destination holds the
+        // fraction (the console stores fraction * 65535, or * 32767 signed), an integer destination the integer
+        // (the exponent bias applied, saturated to 16 bits). On the console a fetch reads those 16 bits with
+        // the fetch constant's number format (dword 3 bit 0: integer) and sign (dword 0 bits 2-3: 1 signed):
+        // an unsigned fraction is bits / 65535 (a negative integer's bits are value + 65536), a signed one
+        // value / 32767, an integer the bits themselves. So: back to the stored bits, then read as the fetch
+        // asks; a fetch that matches the copy (fraction read as the same fraction) is unchanged. Unconverted, a
+        // fraction fetch of an integer copy read values up to 65535 times too large (FM3's variance shadow
+        // map: resolved as signed integers with exponent bias 10, fetched as unsigned fractions by its blur).
+        // tinfo.x bit 6 on, bits 14-15 the fetch's mode (0 signed integer, 1 unsigned fraction, 2 signed
+        // fraction, 3 unsigned integer), bits 4-5 the copy's (0 integer, 1 unsigned fraction, 2 signed
+        // fraction), bits 2-3 the components (0 one, 1 two, 2 four); applied before the exponent adjust and not
+        // to the border colour (hlsl.cpp Fixed16Fetch). REGPU_NO_FIXED16_FETCH=1: unconverted (A/B; read with
+        // the fetch constant, so set it before the start).
+        static const bool noFixed16Fetch = getenv("REGPU_NO_FIXED16_FETCH") != nullptr;
+        if (onGpu && resolvedPtr && resolvedPtr->guestFormat >= 24 && resolvedPtr->guestFormat <= 26 && !noFixed16Fetch)
+        {
+            const bool isSigned = ((fetch.dwords[0] >> 2) & 3) == 1;
+            const bool integer = (fetch.dwords[3] & 1) != 0;
+            const uint32_t mode = integer ? (isSigned ? 0u : 3u) : (isSigned ? 2u : 1u);
+            const uint32_t copy = resolvedPtr->guestNumber == 0 ? 1u : resolvedPtr->guestNumber == 1 ? 2u : 0u;
+            const uint32_t comps = resolvedPtr->guestFormat == 24 ? 0u : resolvedPtr->guestFormat == 25 ? 1u : 2u;
+            // The same number format on both sides is the stored value itself: nothing to do.
+            if (!(mode == 1u && copy == 1u) && !(mode == 2u && copy == 2u))
+                ti[0] |= (1u << 6) | (mode << 14) | (copy << 4) | (comps << 2);
+        }
         // Below the output resolution (a temporal upscaler's scene) the mips are biased sharper by log2 of the
         // scale (-0.58 at 67%), as upscalers ask, so the upscaled image keeps the output's texture detail
         // (from the FM4 port). REGPU_NO_LOD_BIAS=1 (live): the fetch's bias alone.
