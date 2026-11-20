@@ -65,6 +65,7 @@ struct ScannedShader
 {
     bool pixel;
     std::vector<uint32_t> code;
+    uint32_t address = 0; // guest address of the microcode (0: not from guest memory)
 };
 
 // A resolve (an EDRAM copy to memory), as offered to Host::resolveWriteback.
