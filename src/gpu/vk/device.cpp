@@ -439,6 +439,9 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     w.geometryShader = h.geometryShader;
     w.sampleRateShading = h.sampleRateShading;
     w.occlusionQueryPrecise = h.occlusionQueryPrecise;
+    d.occlusionPrecise = h.occlusionQueryPrecise;
+    w.pipelineStatisticsQuery = h.pipelineStatisticsQuery;
+    d.pipelineStatistics = h.pipelineStatisticsQuery;
     w.fragmentStoresAndAtomics = h.fragmentStoresAndAtomics;
     w.vertexPipelineStoresAndAtomics = h.vertexPipelineStoresAndAtomics;
     w.shaderClipDistance = h.shaderClipDistance;

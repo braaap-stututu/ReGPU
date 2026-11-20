@@ -1439,8 +1439,55 @@ const char* g_waitWhat = "?";
 // The current draw samples the full-screen image the title resolved this frame (the
 // post-processing composite): its flat geometry is a screen layer, not HUD (see vwide.w).
 thread_local bool g_drawSamplesResolve = false;
+const uint8_t* ReadbackData(const vk::Buffer& b); // (below)
+// A query pool and the host-readable buffer its results are copied into (D3D12's query heap and readback buffer):
+// perSlot queries for each frame slot (or one range for all, slots 1), reset at the slot's frame start
+// (ResetSlotQueries) and when made.
+struct GpuQueries
+{
+    VkQueryPool pool = VK_NULL_HANDLE;
+    BufferRef readback;
+    uint32_t perSlot = 0, slots = 0;
+    uint32_t resultBytes = 8; // per query (pipeline statistics: 8 per counter)
+    explicit operator bool() const { return pool != VK_NULL_HANDLE; }
+};
+GpuQueries MakeQueries(VkQueryType type, uint32_t perSlot, uint32_t slots, VkQueryPipelineStatisticFlags stats, uint32_t counters, bool readback,
+    const char* name)
+{
+    GpuQueries q;
+    VkQueryPoolCreateInfo ci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+    ci.queryType = type;
+    ci.queryCount = perSlot * slots;
+    ci.pipelineStatistics = stats;
+    if (vkCreateQueryPool(g_r.vkd->device, &ci, nullptr, &q.pool) != VK_SUCCESS)
+        return {};
+    vk::SetName(*g_r.vkd, VK_OBJECT_TYPE_QUERY_POOL, uint64_t(q.pool), name);
+    q.perSlot = perSlot;
+    q.slots = slots;
+    q.resultBytes = 8 * counters;
+    if (readback && !(q.readback = MakeBuffer(VkDeviceSize(q.resultBytes) * ci.queryCount, VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::Memory::Readback, name)))
+    {
+        vkDestroyQueryPool(g_r.vkd->device, q.pool, nullptr);
+        return {};
+    }
+    C().vkList->ResetQueries(q.pool, 0, ci.queryCount);
+    return q;
+}
+// A slot's queries, ready to be used again (its last frame has completed and its results were read).
+void ResetSlotQueries(const GpuQueries& q, UINT slot)
+{
+    if (q)
+        C().vkList->ResetQueries(q.pool, q.slots > 1 ? slot * q.perSlot : 0, q.perSlot);
+}
+// A slot's results as the GPU left them (after its frame has completed).
+const uint8_t* QueryResults(const GpuQueries& q, UINT slot)
+{
+    const uint8_t* data = q.readback ? ReadbackData(*q.readback) : nullptr;
+    return data ? data + size_t(slot) * q.perSlot * q.resultBytes : nullptr;
+}
+
 // REGPU_PERF: GPU time per frame from timestamps at the start and end of each frame's list.
-ComPtr<ID3D12QueryHeap> g_timestamps;
+GpuQueries g_timestamps;
 // REGPU_PERF_LITE=1 (start-time): the light performance log (PerfLite below). No per-draw work: the draw thread
 // pushes one record a frame into a lock-free queue and a log thread does the sums and the writing. It uses the same
 // two GPU timestamps a frame as REGPU_PERF for the GPU time.
@@ -1460,8 +1507,7 @@ uint64_t g_perfDrawsLogged = 0; // draws counted in g_perf windows already reset
 const bool g_gpuShaders = getenv("REGPU_GPU_SHADERS") != nullptr;
 const bool g_gpuPasses = getenv("REGPU_GPU_PASSES") != nullptr || g_gpuShaders;
 constexpr UINT kPassMarks = 4096;
-ComPtr<ID3D12QueryHeap> g_passQueries;
-ComPtr<ID3D12Resource> g_passReadback;
+GpuQueries g_passQueries;
 struct PassMarkInfo
 {
     char label[48];
@@ -1479,8 +1525,15 @@ const bool g_gpuStats = [] {
     return v && atoi(v) >= 2;
 }();
 constexpr UINT kStatDraws = 8192;
-ComPtr<ID3D12QueryHeap> g_statQueries;
-ComPtr<ID3D12Resource> g_statReadback;
+GpuQueries g_statQueries;
+// A draw's counters, in the order Vulkan writes the ones asked for: vertex shader invocations, primitives out of
+// clipping, fragment shader invocations (D3D12's VSInvocations, CPrimitives, PSInvocations).
+struct PipelineStats
+{
+    uint64_t vsInvocations, primitives, psInvocations;
+};
+constexpr VkQueryPipelineStatisticFlags kStatFlags = VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT |
+    VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT | VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
 struct StatDraw
 {
     uint32_t ps;   // pixel shader hash (low 32 bits)
@@ -1500,9 +1553,8 @@ uint64_t g_statFrames = 0;
 // Occlusion queries (EVENT_WRITE_ZPD: the sun flare's visibility). Each guest query becomes a
 // D3D12 one; the guest gets the result of the same query (by order in the frame) from the
 // last frame that has completed, so the command processor never waits for the GPU.
-constexpr UINT kOcclusionPerFrame = 512; // D3D queries per frame slot (a guest query is one or more)
-ComPtr<ID3D12QueryHeap> g_occlusionHeap;
-ComPtr<ID3D12Resource> g_occlusionReadback;
+constexpr UINT kOcclusionPerFrame = 512; // host queries per frame slot (a guest query is one or more)
+GpuQueries g_occlusion;
 // A guest query's D3D queries: its depth-tested samples (main) and, for each draw in it, the same draw
 // with the depth test always passing (coverage: the console's Total).
 struct OcclusionParts
@@ -1532,7 +1584,6 @@ bool g_occlusionOpen = false;
 bool g_occlusionPaused = false; // a guest query between its counting spans (RendererOcclusionBegin: predicated tiles)
 std::map<std::string, std::pair<double, uint64_t>> g_passTotals; // ms, draws
 uint64_t g_passFrames = 0;
-ComPtr<ID3D12Resource> g_timestampReadback;
 double g_gpuFrameMs = 0, g_gpuFrameMaxMs = 0;
 uint32_t g_gpuFrames = 0;
 uint32_t g_waitBlend = 0;
@@ -3307,7 +3358,7 @@ FrameResources& Frame();
 
 void PassMark(const char* fmt, uint32_t a, uint32_t b)
 {
-    if (!g_gpuPasses || !g_passQueries || !C().list)
+    if (!g_gpuPasses || !g_passQueries || !C().vkList)
         return;
     const UINT frameIndex = UINT(&Frame() - g_r.frames);
     auto& marks = g_passMarks[frameIndex];
@@ -3325,7 +3376,7 @@ void PassMark(const char* fmt, uint32_t a, uint32_t b)
             g_statPassNames.push_back(m.label);
         g_statPass = it->second;
     }
-    C().list->EndQuery(g_passQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * kPassMarks + UINT(marks.size()));
+    C().vkList->WriteTimestamp(g_passQueries.pool, frameIndex * kPassMarks + UINT(marks.size()));
     marks.push_back(m);
 }
 
@@ -3682,9 +3733,7 @@ void BeginFrameIfNeeded()
     if (!g_occlusionPending[frameIndex].empty())
     {
         // This slot's previous frame has completed: keep its occlusion results.
-        uint64_t* counts = nullptr;
-        const D3D12_RANGE range{ size_t(frameIndex) * kOcclusionPerFrame * 8, size_t(frameIndex + 1) * kOcclusionPerFrame * 8 };
-        if (SUCCEEDED(g_occlusionReadback->Map(0, &range, reinterpret_cast<void**>(&counts))))
+        if (const uint64_t* counts = reinterpret_cast<const uint64_t*>(ReadbackData(*g_occlusion.readback)))
         {
             std::lock_guard resultLock(g_occlusionResultLock);
             for (const OcclusionParts& q : g_occlusionPending[frameIndex])
@@ -3703,59 +3752,26 @@ void BeginFrameIfNeeded()
                 g_occlusionCoverage[q.order] = q.coverage.empty() ? -1 : covered;
                 g_occlusionByKind[{ q.kind, q.kindOrder }] = { passed, q.coverage.empty() ? -1 : covered };
             }
-            const D3D12_RANGE none{ 0, 0 };
-            g_occlusionReadback->Unmap(0, &none);
         }
         g_occlusionPending[frameIndex].clear();
     }
     void HyperCullCollect(UINT frameIndex);
     HyperCullCollect(frameIndex);
-    if ((perf || PerfLiteOn()) && !g_timestamps)
-    {
-        D3D12_QUERY_HEAP_DESC qd{};
-        qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        qd.Count = 2 * kFrames;
-        g_r.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_timestamps));
-        g_timestampReadback = CreateBuffer(8 * 2 * kFrames, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    }
-    if (g_gpuPasses && !g_passQueries)
-    {
-        D3D12_QUERY_HEAP_DESC qd{};
-        qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        qd.Count = kPassMarks * kFrames;
-        g_r.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_passQueries));
-        g_passReadback = CreateBuffer(8ull * kPassMarks * kFrames, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (g_gpuStats)
-        {
-            D3D12_QUERY_HEAP_DESC sd{};
-            sd.Type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS;
-            sd.Count = kStatDraws * kFrames;
-            g_r.device->CreateQueryHeap(&sd, IID_PPV_ARGS(&g_statQueries));
-            g_statReadback = CreateBuffer(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) * kStatDraws * kFrames, D3D12_HEAP_TYPE_READBACK,
-                D3D12_RESOURCE_STATE_COPY_DEST);
-            Log("gpu stats: pipeline statistics per draw on (REGPU_GPU_PASSES=2)%s", g_statQueries ? "" : ": query heap failed");
-        }
-    }
-    if (g_gpuStats && g_statReadback && !g_statDraws[frameIndex].empty())
+    // (The query pools are made at the first frame that wants them, below, once this slot's list is begun.)
+    if (g_gpuStats && g_statQueries && !g_statDraws[frameIndex].empty())
     {
         // This slot's previous frame has completed (as for the pass times below): add up its draws.
         auto& draws = g_statDraws[frameIndex];
-        D3D12_QUERY_DATA_PIPELINE_STATISTICS* q = nullptr;
-        const size_t stride = sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS);
-        const D3D12_RANGE range{ size_t(frameIndex) * kStatDraws * stride, (size_t(frameIndex) * kStatDraws + draws.size()) * stride };
-        if (SUCCEEDED(g_statReadback->Map(0, &range, reinterpret_cast<void**>(&q))))
+        if (const auto* s = reinterpret_cast<const PipelineStats*>(QueryResults(g_statQueries, frameIndex)))
         {
-            const D3D12_QUERY_DATA_PIPELINE_STATISTICS* s = q + size_t(frameIndex) * kStatDraws;
             for (size_t i = 0; i < draws.size(); i++)
                 for (StatTotal* t : { &g_statByPass[draws[i].pass], &g_statByShader[draws[i].ps] })
                 {
-                    t->psInvocations += s[i].PSInvocations;
-                    t->vsInvocations += s[i].VSInvocations;
-                    t->primitives += s[i].CPrimitives;
+                    t->psInvocations += s[i].psInvocations;
+                    t->vsInvocations += s[i].vsInvocations;
+                    t->primitives += s[i].primitives;
                     t->draws++;
                 }
-            const D3D12_RANGE none{ 0, 0 };
-            g_statReadback->Unmap(0, &none);
             g_statFrames++;
         }
         draws.clear();
@@ -3799,23 +3815,17 @@ void BeginFrameIfNeeded()
     {
         // This slot's previous frame has completed: add up its passes.
         auto& marks = g_passMarks[frameIndex];
-        uint64_t* t = nullptr;
-        const D3D12_RANGE range{ size_t(frameIndex) * kPassMarks * 8, size_t(frameIndex + 1) * kPassMarks * 8 };
-        if (SUCCEEDED(g_passReadback->Map(0, &range, reinterpret_cast<void**>(&t))))
+        if (const uint64_t* ts = reinterpret_cast<const uint64_t*>(QueryResults(g_passQueries, frameIndex)))
         {
-            UINT64 frequency = 1;
-            g_r.queue->GetTimestampFrequency(&frequency);
-            const uint64_t* ts = t + size_t(frameIndex) * kPassMarks;
+            const double msPerTick = double(g_r.vkd->props.limits.timestampPeriod) / 1e6;
             for (size_t i = 0; i + 1 < marks.size(); i++)
             {
                 if (ts[i + 1] < ts[i])
                     continue; // marks from lists that ran out of order
                 auto& total = g_passTotals[marks[i].label];
-                total.first += double(ts[i + 1] - ts[i]) * 1000.0 / double(frequency);
+                total.first += double(ts[i + 1] - ts[i]) * msPerTick;
                 total.second += marks[i].draws;
             }
-            const D3D12_RANGE none{ 0, 0 };
-            g_passReadback->Unmap(0, &none);
             g_passFrames++;
         }
         marks.clear();
@@ -3840,18 +3850,12 @@ void BeginFrameIfNeeded()
         }
     }
     g_passMarks[frameIndex].clear();
-    if ((perf || PerfLiteOn()) && f.timed && g_timestampReadback)
+    if ((perf || PerfLiteOn()) && f.timed && g_timestamps)
     {
         // This slot's previous frame has completed (waited for above).
-        uint64_t* t = nullptr;
-        const D3D12_RANGE range{ size_t(frameIndex) * 16, size_t(frameIndex) * 16 + 16 };
-        if (SUCCEEDED(g_timestampReadback->Map(0, &range, reinterpret_cast<void**>(&t))))
+        if (const uint64_t* t = reinterpret_cast<const uint64_t*>(QueryResults(g_timestamps, frameIndex)))
         {
-            UINT64 frequency = 1;
-            g_r.queue->GetTimestampFrequency(&frequency);
-            const double ms = double(t[frameIndex * 2 + 1] - t[frameIndex * 2]) * 1000.0 / double(frequency);
-            const D3D12_RANGE none{ 0, 0 };
-            g_timestampReadback->Unmap(0, &none);
+            const double ms = double(t[1] - t[0]) * double(g_r.vkd->props.limits.timestampPeriod) / 1e6;
             if (ms > 0 && ms < 1000)
             {
                 g_gpuFrameMs += ms;
@@ -3881,6 +3885,23 @@ void BeginFrameIfNeeded()
     }
     else
         g_r.vkRecorder.Rebind(AcquireVkList(f, 0)); // (the last frame's buffer was ended and submitted at its end)
+    // The timing queries, made at the first frame that wants them; this slot's queries reset for this frame.
+    if ((perf || PerfLiteOn()) && !g_timestamps)
+        g_timestamps = MakeQueries(VK_QUERY_TYPE_TIMESTAMP, 2, kFrames, 0, 1, true, "frame timestamps");
+    if (g_gpuPasses && !g_passQueries)
+    {
+        g_passQueries = MakeQueries(VK_QUERY_TYPE_TIMESTAMP, kPassMarks, kFrames, 0, 1, true, "pass timestamps");
+        if (g_gpuStats)
+        {
+            if (g_r.vkd->pipelineStatistics)
+                g_statQueries = MakeQueries(VK_QUERY_TYPE_PIPELINE_STATISTICS, kStatDraws, kFrames, kStatFlags, 3, true, "pipeline statistics");
+            Log("gpu stats: pipeline statistics per draw on (REGPU_GPU_PASSES=2)%s", g_statQueries ? "" : ": not on this GPU");
+        }
+    }
+    for (const GpuQueries* q : { &g_timestamps, &g_passQueries, &g_statQueries, &g_occlusion })
+        ResetSlotQueries(*q, frameIndex);
+    void CullResetQueries(UINT frameIndex);
+    CullResetQueries(frameIndex);
     // This frame's scene phase and scale (see UpscaleScene).
     {
         const Settings& st = GetSettings();
@@ -3918,7 +3939,7 @@ void BeginFrameIfNeeded()
     }
     PassMark("frame start %u%u", 0, 0);
     if ((perf || PerfLiteOn()) && g_timestamps)
-        C().list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2);
+        C().vkList->WriteTimestamp(g_timestamps.pool, frameIndex * 2);
     // REGPU_TRACE_RING_KINDS: what fills the upload ring, KB a frame by kind (RingKind), every 120 frames.
     static LiveSwitch traceKinds("REGPU_TRACE_RING_KINDS");
     g_traceRingKinds = traceKinds;
@@ -12744,7 +12765,7 @@ void SplitMainList()
         {
             g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
             g_occlusionCurrent.main.push_back(g_occlusionIndex);
-            C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
+            C().vkList->BeginQuery(g_occlusion.pool, g_occlusionIndex, g_r.vkd->occlusionPrecise);
         }
         else
         {
@@ -12781,7 +12802,7 @@ void SplitMainListAsync(bool submit)
         {
             g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
             g_occlusionCurrent.main.push_back(g_occlusionIndex);
-            C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
+            C().vkList->BeginQuery(g_occlusion.pool, g_occlusionIndex, g_r.vkd->occlusionPrecise);
         }
         else
         {
@@ -12818,15 +12839,14 @@ void WaitForQueueIdle()
 // Ends the open query's current D3D part (the guest query stays open).
 void EndOcclusionPart()
 {
-    C().list->EndQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
-    C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex, 1, g_occlusionReadback.Get(), UINT64(g_occlusionIndex) * 8);
+    C().vkList->EndQuery(g_occlusion.pool, g_occlusionIndex);
+    C().vkList->CopyQueryResults(g_occlusion.pool, g_occlusionIndex, 1, g_occlusion.readback->buffer, UINT64(g_occlusionIndex) * 8);
 }
 
 void EndOcclusionQuery()
 {
     g_occlusionOpen = false;
-    C().list->EndQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
-    C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex, 1, g_occlusionReadback.Get(), UINT64(g_occlusionIndex) * 8);
+    EndOcclusionPart();
     g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent);
 }
 
@@ -13644,29 +13664,21 @@ void RendererOcclusionBegin()
             return; // out of D3D queries: what was counted so far is its result
         g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
         g_occlusionCurrent.main.push_back(g_occlusionIndex);
-        C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
+        C().vkList->BeginQuery(g_occlusion.pool, g_occlusionIndex, g_r.vkd->occlusionPrecise);
         g_occlusionOpen = true;
         g_occlusionPaused = false;
         return;
     }
     if (g_occlusionOpen || g_occlusionCount + 4 > kOcclusionPerFrame)
         return;
-    if (!g_occlusionHeap)
-    {
-        D3D12_QUERY_HEAP_DESC qd{};
-        qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
-        qd.Count = kOcclusionPerFrame * kFrames;
-        g_r.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_occlusionHeap));
-        g_occlusionReadback = CreateBuffer(8ull * kOcclusionPerFrame * kFrames, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!g_occlusionHeap || !g_occlusionReadback)
-            return;
-    }
+    if (!g_occlusion && !(g_occlusion = MakeQueries(VK_QUERY_TYPE_OCCLUSION, kOcclusionPerFrame, kFrames, 0, 1, true, "occlusion queries")))
+        return;
     g_occlusionOrder = g_occlusionOrders++;
     g_occlusionCurrent = {};
     g_occlusionCurrent.order = g_occlusionOrder;
     g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
     g_occlusionCurrent.main.push_back(g_occlusionIndex);
-    C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
+    C().vkList->BeginQuery(g_occlusion.pool, g_occlusionIndex, g_r.vkd->occlusionPrecise);
     g_occlusionOpen = true;
     if (const uint64_t t = TraceFrame(); t && g_r.frame + 1 == t)
         Log("occlusion query %u begins (draw #%u next)", g_occlusionOrder, g_r.drawsThisFrame.load() + 1);
@@ -14390,10 +14402,9 @@ std::unordered_map<uint64_t, uint32_t> g_occurrence; // this frame's draws of ea
 std::vector<UINT> g_freeSlots;
 std::vector<uint32_t> g_pending; // this frame's tested draws: slot, threshold (samples), in query order
 uint64_t g_frame = ~0ull;
-ComPtr<ID3D12QueryHeap> g_heap;
-ComPtr<ID3D12Resource> g_results, g_predicates;
-ComPtr<ID3D12RootSignature> g_root;
-ComPtr<ID3D12PipelineState> g_pso;
+GpuQueries g_queries;           // one range, reset each frame
+BufferRef g_results, g_predicates; // the counts (device), the predicates (conditional rendering reads them)
+vk::Pass g_pass;                // counts and thresholds into predicates
 bool g_failed = false;
 
 // (Read again each frame: Fm3 "env REGPU_DRAW_CULL <n>" changes it live; 0 or unset: off.)
@@ -14412,49 +14423,25 @@ uint32_t Threshold()
 
 bool Init()
 {
-    if (g_pso)
+    if (g_pass)
         return true;
     if (g_failed)
         return false;
     g_failed = true;
-    ID3D12Device* d = g_r.device;
-    D3D12_QUERY_HEAP_DESC qd{};
-    qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
-    qd.Count = kQueries;
-    if (FAILED(d->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_heap))))
-        return false;
-    g_results = CreateBuffer(UINT64(kQueries) * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+    // (Predicated draws need VK_EXT_conditional_rendering: without it nothing is culled.)
+    if (!g_r.vkd->conditionalRendering)
     {
-        D3D12_HEAP_PROPERTIES hp{};
-        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC bd{};
-        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width = UINT64(kSlots) * 8;
-        bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
-        bd.SampleDesc.Count = 1;
-        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        if (FAILED(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_PREDICATION, nullptr, IID_PPV_ARGS(&g_predicates))))
-            return false;
+        Log("draw cull: off (no VK_EXT_conditional_rendering on this GPU)");
+        return false;
     }
-    if (!g_results)
+    if (!(g_queries = MakeQueries(VK_QUERY_TYPE_OCCLUSION, kQueries, 1, 0, 1, false, "draw cull queries")))
         return false;
-    D3D12_ROOT_PARAMETER params[4]{};
-    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants.Num32BitValues = 1;
-    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-    params[1].Descriptor.ShaderRegister = 0;
-    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-    params[2].Descriptor.ShaderRegister = 1;
-    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-    params[3].Descriptor.ShaderRegister = 0;
-    D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 4;
-    rs.pParameters = params;
-    ComPtr<ID3DBlob> blob, error;
-    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) ||
-        FAILED(d->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_root))))
+    g_results = MakeBuffer(UINT64(kQueries) * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vk::Memory::Device, "draw cull counts");
+    g_predicates = MakeBuffer(UINT64(kSlots) * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        vk::Memory::Device, "draw cull predicates");
+    if (!g_results || !g_predicates)
         return false;
+    C().vkList->FillBuffer(g_predicates->buffer, 0, VK_WHOLE_SIZE, 1); // (drawn until tested)
     static const char kSource[] = R"(
 cbuffer C : register(b0) { uint count; };
 ByteAddressBuffer results : register(t0); // one 64-bit sample count per tested draw
@@ -14470,13 +14457,7 @@ void main(uint id : SV_DispatchThreadID)
     predicates.Store2(st.x * 8, uint2((c.y != 0u || c.x >= st.y) ? 1u : 0u, 0u));
 }
 )";
-    ComPtr<ID3DBlob> cs;
-    if (FAILED(D3DCompile(kSource, sizeof(kSource) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &error)))
-        return false;
-    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-    pd.pRootSignature = g_root.Get();
-    pd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
-    if (FAILED(d->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_pso))))
+    if (!(g_pass = vk::CreateComputePass(*g_r.vkd, kSource, "main", regpu::GetConfig().userDir / "shaders", "draw cull")))
         return false;
     g_freeSlots.reserve(kSlots);
     for (UINT s = kSlots; s-- > 0;)
@@ -14540,7 +14521,7 @@ Decision Decide(uint64_t key, uint32_t thresholdSamples)
 // At the frame's end, on the frame's list: this frame's counts into the predicates.
 void EndFrame()
 {
-    if (g_pending.empty() || !g_pso)
+    if (g_pending.empty() || !g_pass)
         return;
     const UINT n = UINT(g_pending.size() / 2);
     const UINT64 offset = RingAlloc(UINT64(n) * 8, 16);
@@ -14551,27 +14532,21 @@ void EndFrame()
     }
     memcpy(Frame().ringCpu + offset, g_pending.data(), size_t(n) * 8);
     g_pending.clear();
-    C().list->ResolveQueryData(g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, n, g_results.Get(), 0);
-    D3D12_RESOURCE_BARRIER b[2]{};
-    b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b[0].Transition.pResource = g_results.Get();
-    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    b[1].Transition.pResource = g_predicates.Get();
-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PREDICATION;
-    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    b[0].Transition.Subresource = b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    C().list->ResourceBarrier(2, b);
-    C().list->SetComputeRootSignature(g_root.Get());
-    C().list->SetPipelineState(g_pso.Get());
-    C().list->SetComputeRoot32BitConstants(0, 1, &n, 0);
-    C().list->SetComputeRootShaderResourceView(1, g_results->GetGPUVirtualAddress());
-    C().list->SetComputeRootShaderResourceView(2, Frame().ring->GetGPUVirtualAddress() + offset);
-    C().list->SetComputeRootUnorderedAccessView(3, g_predicates->GetGPUVirtualAddress());
-    C().list->Dispatch((n + 63) / 64, 1, 1);
-    std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
-    std::swap(b[1].Transition.StateBefore, b[1].Transition.StateAfter);
-    C().list->ResourceBarrier(2, b);
+    C().vkList->CopyQueryResults(g_queries.pool, 0, n, g_results->buffer, 0);
+    vk::Barriers before;
+    before.AddGlobal(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT,
+        VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    before.Record(*C().vkList);
+    vk::PassArgs args;
+    if (!PassConstants(args, 0, &n, sizeof(n)))
+        return;
+    args.Buffer(100, g_results->buffer).Buffer(101, Frame().vkRing.buffer, offset, UINT64(n) * 8).Buffer(300, g_predicates->buffer);
+    UsePass(g_pass, args);
+    C().vkList->Dispatch((n + 63) / 64, 1, 1);
+    vk::Barriers after;
+    after.AddGlobal(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT,
+        VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT);
+    after.Record(*C().vkList);
     // The graphics state the next draw sets again (the pipeline is cached per draw).
     g_drawState.Invalidate();
 }
@@ -14601,8 +14576,7 @@ struct State
 std::unordered_map<uint64_t, State> g_states;
 std::unordered_map<uint64_t, uint32_t> g_occurrence;
 uint64_t g_occurrenceFrame = ~0ull;
-ComPtr<ID3D12QueryHeap> g_heap;
-ComPtr<ID3D12Resource> g_readback;
+GpuQueries g_queries;
 struct Pending
 {
     uint64_t key;
@@ -14633,14 +14607,13 @@ bool On(const char* name, bool fallback)
 // The finished frame in this slot: its counts update the states.
 void Collect(UINT frameIndex)
 {
-    if (g_pending[frameIndex].empty() || !g_readback)
+    if (g_pending[frameIndex].empty() || !g_queries)
     {
         g_used[frameIndex] = 0;
         return;
     }
-    uint64_t* counts = nullptr;
-    const D3D12_RANGE range{ size_t(frameIndex) * kPerFrame * 8, size_t(frameIndex + 1) * kPerFrame * 8 };
-    if (SUCCEEDED(g_readback->Map(0, &range, reinterpret_cast<void**>(&counts))))
+    // (Indices are the pool's, slot included: the buffer's start.)
+    if (const uint64_t* counts = reinterpret_cast<const uint64_t*>(QueryResults(g_queries, 0)))
     {
         // Summed over every occurrence of the draw in that frame: culled only if all of them were tiny.
         std::unordered_map<uint64_t, uint64_t> sums;
@@ -14648,8 +14621,6 @@ void Collect(UINT frameIndex)
             sums[p.key] += counts[p.index];
         for (const auto& [key, samples] : sums)
             g_states[key].samples = samples;
-        const D3D12_RANGE none{ 0, 0 };
-        g_readback->Unmap(0, &none);
     }
     g_pending[frameIndex].clear();
     g_used[frameIndex] = 0;
@@ -14713,16 +14684,10 @@ UINT Begin()
 {
     if (g_failed)
         return ~0u;
-    if (!g_heap)
+    if (!g_queries)
     {
         g_failed = true;
-        D3D12_QUERY_HEAP_DESC qd{};
-        qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
-        qd.Count = kPerFrame * kFrames;
-        if (FAILED(g_r.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_heap))))
-            return ~0u;
-        g_readback = CreateBuffer(8ull * kPerFrame * kFrames, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!g_readback)
+        if (!(g_queries = MakeQueries(VK_QUERY_TYPE_OCCLUSION, kPerFrame, kFrames, 0, 1, true, "hyper cull queries")))
             return ~0u;
         g_failed = false;
         Log("hyper cull: on, draws of %d pixels or fewer skipped (probe %s, hysteresis %s%%, pin %s)", Threshold(),
@@ -14734,7 +14699,7 @@ UINT Begin()
         return ~0u;
     const UINT q = slot * kPerFrame + g_used[slot]++;
     g_pending[slot].push_back({ t_key, q });
-    C().list->BeginQuery(g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, q);
+    C().vkList->BeginQuery(g_queries.pool, q, g_r.vkd->occlusionPrecise, true);
     return q;
 }
 
@@ -14742,11 +14707,17 @@ UINT Begin()
 void EndFrame()
 {
     const UINT slot = UINT(&Frame() - g_r.frames);
-    if (g_heap && g_readback && g_used[slot])
-        C().list->ResolveQueryData(g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, slot * kPerFrame, g_used[slot], g_readback.Get(), UINT64(slot) * kPerFrame * 8);
+    if (g_queries && g_used[slot])
+        C().vkList->CopyQueryResults(g_queries.pool, slot * kPerFrame, g_used[slot], g_queries.readback->buffer, UINT64(slot) * kPerFrame * 8);
 }
 } // namespace HyperCull
 void HyperCullCollect(UINT frameIndex) { HyperCull::Collect(frameIndex); }
+// At a slot's frame start: the culling queries reset for it.
+void CullResetQueries(UINT frameIndex)
+{
+    ResetSlotQueries(HyperCull::g_queries, frameIndex);
+    ResetSlotQueries(DrawCull::g_queries, 0);
+}
 
 void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
@@ -16843,12 +16814,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         auto issue = [&] {
             // REGPU_GPU_PASSES=2: this draw's pipeline statistics (begun and ended in the same list).
             const UINT statFrame = UINT(&Frame() - g_r.frames);
-            const bool stat = g_gpuStats && g_statQueries && !C().worker && g_statDraws[statFrame].size() < kStatDraws;
+            const bool stat = g_gpuStats && bool(g_statQueries) && !C().worker && g_statDraws[statFrame].size() < kStatDraws;
             const UINT statQuery = statFrame * kStatDraws + UINT(stat ? g_statDraws[statFrame].size() : 0);
             if (stat)
             {
                 g_statDraws[statFrame].push_back({ uint32_t(C().psHash), g_statPass });
-                C().list->BeginQuery(g_statQueries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, statQuery);
+                C().vkList->BeginQuery(g_statQueries.pool, statQuery, false, true);
             }
             // REGPU_EXP_DRAW=N (live, FM3 port session 33, measuring what a draw costs on a small GPU; picture wrong):
             // 1 = no draw call (all its state still set), 2 = one triangle per draw (fixed per-draw cost),
@@ -16879,7 +16850,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             else
                 C().vkList->Draw(exp == 2 ? std::min<UINT>(directIndex ? directVertices : UINT(list.size()), 3) : (directIndex ? directVertices : UINT(list.size())), 1, 0, 0);
             if (stat)
-                C().list->EndQuery(g_statQueries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, statQuery);
+                C().vkList->EndQuery(g_statQueries.pool, statQuery, true);
         };
         // REGPU_DRAW_CULL (DrawCull above): drawn inside a query of its own, or predicated on last frame's.
         DrawCull::Decision cull;
@@ -16897,34 +16868,34 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             cull = DrawCull::Decide(key, uint32_t(std::min(samples, 4.0e9)));
         }
         if (cull.mode == 1)
-            C().list->BeginQuery(DrawCull::g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, cull.query);
+            C().vkList->BeginQuery(DrawCull::g_queries.pool, cull.query, g_r.vkd->occlusionPrecise, true);
         else if (cull.mode == 2)
-            C().list->SetPredication(DrawCull::g_predicates.Get(), UINT64(cull.slot) * 8, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            C().vkList->SetPredication(DrawCull::g_predicates->buffer, UINT64(cull.slot) * 8, false);
         if (coveragePso)
         {
             // The open query's part so far ends; the coverage draw gets a query of its own; the query
             // goes on in a new part (queries never overlap).
             EndOcclusionPart();
             const UINT covered = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
-            C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, covered);
+            C().vkList->BeginQuery(g_occlusion.pool, covered, g_r.vkd->occlusionPrecise, true);
             C().vkList->BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, coveragePso);
             issue();
-            C().list->EndQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, covered);
-            C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, covered, 1, g_occlusionReadback.Get(), UINT64(covered) * 8);
+            C().vkList->EndQuery(g_occlusion.pool, covered, true);
+            C().vkList->CopyQueryResults(g_occlusion.pool, covered, 1, g_occlusion.readback->buffer, UINT64(covered) * 8);
             g_occlusionCurrent.coverage.push_back(covered);
             C().vkList->BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
             g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
             g_occlusionCurrent.main.push_back(g_occlusionIndex);
-            C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
+            C().vkList->BeginQuery(g_occlusion.pool, g_occlusionIndex, g_r.vkd->occlusionPrecise);
         }
         const UINT hyperQuery = hyperCullMeasure && !coveragePso && cull.mode == 0 ? HyperCull::Begin() : ~0u;
         issue();
         if (hyperQuery != ~0u)
-            C().list->EndQuery(HyperCull::g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, hyperQuery);
+            C().vkList->EndQuery(HyperCull::g_queries.pool, hyperQuery, true);
         if (cull.mode == 1)
-            C().list->EndQuery(DrawCull::g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, cull.query);
+            C().vkList->EndQuery(DrawCull::g_queries.pool, cull.query, true);
         else if (cull.mode == 2)
-            C().list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            C().vkList->SetPredication(VK_NULL_HANDLE, 0, false);
         if (g_perfTiming)
         {
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -18376,20 +18347,19 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         const UINT frameIndex = UINT(&Frame() - g_r.frames);
         PassMark("frame end %u%u", 0, 0);
         const UINT n = UINT(g_passMarks[frameIndex].size());
-        C().list->ResolveQueryData(g_passQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * kPassMarks, n, g_passReadback.Get(),
-            UINT64(frameIndex) * kPassMarks * 8);
+        C().vkList->CopyQueryResults(g_passQueries.pool, frameIndex * kPassMarks, n, g_passQueries.readback->buffer, UINT64(frameIndex) * kPassMarks * 8);
     }
     if (g_gpuStats && g_statQueries && !g_statDraws[UINT(&Frame() - g_r.frames)].empty())
     {
         const UINT frameIndex = UINT(&Frame() - g_r.frames);
-        C().list->ResolveQueryData(g_statQueries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, frameIndex * kStatDraws,
-            UINT(g_statDraws[frameIndex].size()), g_statReadback.Get(), UINT64(frameIndex) * kStatDraws * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
+        C().vkList->CopyQueryResults(g_statQueries.pool, frameIndex * kStatDraws, UINT(g_statDraws[frameIndex].size()), g_statQueries.readback->buffer,
+            UINT64(frameIndex) * kStatDraws * sizeof(PipelineStats), sizeof(PipelineStats));
     }
     if (g_timestamps)
     {
         const UINT frameIndex = UINT(&Frame() - g_r.frames);
-        C().list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2 + 1);
-        C().list->ResolveQueryData(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2, 2, g_timestampReadback.Get(), UINT64(frameIndex) * 16);
+        C().vkList->WriteTimestamp(g_timestamps.pool, frameIndex * 2 + 1);
+        C().vkList->CopyQueryResults(g_timestamps.pool, frameIndex * 2, 2, g_timestamps.readback->buffer, UINT64(frameIndex) * 16);
         Frame().timed = true;
     }
     // A query must end in the list it began in: one still open at the swap (begun before it,
@@ -18399,6 +18369,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     else if (g_occlusionPaused)
         g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent);
     g_occlusionPaused = false;
+    ReadbackBarrier(*C().vkList); // (query results and readbacks, for the host once the frame has completed)
     // The frame's end where the replay reaches it: the copy into the swap chain, the end of the buffer, its submission
     // (after the lists queued before it) and, with REGPU_ASYNC_PRESENT, the present and the frame's fence.
     if (asyncPresent)

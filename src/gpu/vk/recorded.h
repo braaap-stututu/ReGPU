@@ -260,16 +260,24 @@ public:
         struct A { VkQueryPool pool; uint32_t first, count; } a{ pool, first, count };
         Put(kResetQueries, &a, sizeof(a));
     }
-    void BeginQuery(VkQueryPool pool, uint32_t index, bool precise = true)
+    // inPass: around one draw (or a few) with the same targets: begun and ended inside the render pass instance, so the
+    // query costs no render pass break. Otherwise begun and ended outside rendering (a query over many draws, target
+    // changes and barriers, as D3D12's could be).
+    void BeginQuery(VkQueryPool pool, uint32_t index, bool precise = true, bool inPass = false)
     {
-        struct A { VkQueryPool pool; uint32_t index, precise; } a{ pool, index, precise };
+        struct A { VkQueryPool pool; uint32_t index, precise, inPass; } a{ pool, index, precise, inPass };
         Put(kBeginQuery, &a, sizeof(a));
     }
-    void EndQuery(VkQueryPool pool, uint32_t index) { struct A { VkQueryPool pool; uint32_t index; } a{ pool, index }; Put(kEndQuery, &a, sizeof(a)); }
-    // D3D12's ResolveQueryData: 64-bit results, waiting for them on the GPU.
-    void CopyQueryResults(VkQueryPool pool, uint32_t first, uint32_t count, VkBuffer dst, VkDeviceSize offset)
+    void EndQuery(VkQueryPool pool, uint32_t index, bool inPass = false)
     {
-        struct A { VkQueryPool pool; uint32_t first, count; VkBuffer dst; VkDeviceSize offset; } a{ pool, first, count, dst, offset };
+        struct A { VkQueryPool pool; uint32_t index, inPass; } a{ pool, index, inPass };
+        Put(kEndQuery, &a, sizeof(a));
+    }
+    // D3D12's ResolveQueryData: 64-bit results, `stride` bytes apart (pipeline statistics: 8 per counter), waiting for
+    // them on the GPU.
+    void CopyQueryResults(VkQueryPool pool, uint32_t first, uint32_t count, VkBuffer dst, VkDeviceSize offset, VkDeviceSize stride = 8)
+    {
+        struct A { VkQueryPool pool; uint32_t first, count; VkBuffer dst; VkDeviceSize offset, stride; } a{ pool, first, count, dst, offset, stride };
         Put(kCopyQueries, &a, sizeof(a));
     }
     void WriteTimestamp(VkQueryPool pool, uint32_t index) { struct A { VkQueryPool pool; uint32_t index; } a{ pool, index }; Put(kTimestamp, &a, sizeof(a)); }
@@ -687,27 +695,30 @@ private:
             }
             case kBeginQuery:
             {
-                struct A { VkQueryPool pool; uint32_t index, precise; };
-                // Begun and ended outside rendering, so a query may span target changes and barriers as D3D12's did
-                // (a query begun inside a render pass instance must end inside it). Costs a render pass break per
-                // query; begin inside when the query's draws share one pass, once measured.
-                EndRendering(cb);
+                struct A { VkQueryPool pool; uint32_t index, precise, inPass; };
+                // Outside rendering, so a query may span target changes and barriers as D3D12's did (a query begun
+                // inside a render pass instance must end inside it); inPass (around a draw): inside, no break.
+                if (At<A>(a).inPass)
+                    EnsureRendering(cb);
+                else
+                    EndRendering(cb);
                 vkCmdBeginQuery(cb, At<A>(a).pool, At<A>(a).index, At<A>(a).precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
                 break;
             }
             case kEndQuery:
             {
-                struct A { VkQueryPool pool; uint32_t index; };
-                EndRendering(cb);
+                struct A { VkQueryPool pool; uint32_t index, inPass; };
+                if (!At<A>(a).inPass)
+                    EndRendering(cb);
                 vkCmdEndQuery(cb, At<A>(a).pool, At<A>(a).index);
                 break;
             }
             case kCopyQueries:
             {
-                struct A { VkQueryPool pool; uint32_t first, count; VkBuffer dst; VkDeviceSize offset; };
+                struct A { VkQueryPool pool; uint32_t first, count; VkBuffer dst; VkDeviceSize offset, stride; };
                 const A& c = At<A>(a);
                 EndRendering(cb);
-                vkCmdCopyQueryPoolResults(cb, c.pool, c.first, c.count, c.dst, c.offset, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                vkCmdCopyQueryPoolResults(cb, c.pool, c.first, c.count, c.dst, c.offset, c.stride, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
                 break;
             }
             case kTimestamp:

@@ -56,6 +56,8 @@ struct Device
     bool memoryBudget = false;         // VK_EXT_memory_budget
     bool ngx = false;                  // VK_NVX_binary_import and VK_NVX_image_view_handle (DLSS through NGX)
     bool storageReadWithoutFormat = false; // shaderStorageImageReadWithoutFormat (the post filters read storage images)
+    bool occlusionPrecise = false;     // occlusionQueryPrecise (sample counts, not just zero / non-zero)
+    bool pipelineStatistics = false;   // pipelineStatisticsQuery (REGPU_GPU_PASSES=2)
     bool updateUnusedWhilePending = false; // descriptorBindingUpdateUnusedWhilePending (bindless writes while in flight)
     bool validation = false;           // REGPU_VK_VALIDATION: VK_LAYER_KHRONOS_validation is on
     float maxAnisotropy = 1.0f;
