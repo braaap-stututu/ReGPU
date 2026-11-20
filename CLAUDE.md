@@ -18,6 +18,13 @@ builds for. Read [`README.md`](README.md) for the build and the API, and
 The tag `d3d12-reference` is the frozen D3D12 renderer to compare Vulkan frames against. Keep every `REGPU_*` switch
 and its behaviour through the conversion.
 
+**Where the conversion stands:** the plan's "Step 6 progress" section, kept current. The rules:
+- **Coexistence:** `renderer.cpp` holds Vulkan members next to D3D12 ones until each D3D12 one is unused. Every commit
+  builds.
+- **Progress:** `py -3 tools/d3d12_left.py src/gpu/renderer.cpp` counts the D3D12 left.
+- **Tests:** the GPU tests (`regpu_vkprobe`, `regpu_vkrecord`, `regpu_vkresources`, `regpu_vkdraw`) must pass with
+  `REGPU_VK_VALIDATION=2` and no messages.
+
 ## Ground rules
 
 - **Keep ReGPU game-neutral.** A fix for one game goes in that game's port, through the hooks in
