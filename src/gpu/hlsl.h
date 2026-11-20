@@ -74,3 +74,6 @@ bool LeanVertexFetch();
 bool PlainMulPixel();
 // 0 off, 1 every pixel shader, 2 pixel shaders without inf/NaN-making ops (session 33 of the FM3 port).
 int PlainMulPixelLevel();
+// REGPU_FETCH_SPECIALIZE (renderer.cpp SpecVariant): the lean TFetch2D as TFetch2DK(slot, coord, denorm, bias, texel,
+// filt, info, w), its fetch-constant words (tinfo.x, tinfo.w) as arguments: a variant passes them as literals.
+const std::string& SpecializedFetchFunction();

@@ -4117,7 +4117,7 @@ struct Manifest
             std::ofstream out(Path(), std::ios::app);
             out << "P " << std::hex << k.vs << ' ' << k.ps << ' ' << k.blend << ' ' << k.depth << ' ' << k.stencilMaskMode << ' ' << k.flags << ' '
                 << k.biasScale << ' ' << k.biasOffset;
-            if (k.fetchMask) // (a 9th field only when set: older readers stop at the 8th)
+            if (k.fetchMask && !(k.fetchMask >> 31)) // (a 9th field only when set: older readers stop at the 8th; specialisations not kept)
                 out << ' ' << k.fetchMask;
             out << '\n';
         });
@@ -5018,20 +5018,127 @@ std::unordered_map<uint64_t, uint32_t> g_fetchVariantCount;                  // 
 
 // The variant, made (and its compile queued, unless the shader cache has it) on first use; nullptr when the base
 // already has 16. Failed when there's nothing to replace. `base` must be ready (its HLSL).
+// REGPU_FETCH_SPECIALIZE (live; session 33, the iGPU work: the car paint's code was 117 KB): a pixel shader's
+// variant whose lean 2D fetches pass this draw's fetch-constant words (tinfo.x, tinfo.w) as literals to TFetch2DK,
+// so each fetch compiles to what its constant asks for (one sample for a plain texture; the clamp, exponent,
+// border, 16-bit fixed conversion or swizzle when there is one). The same results as TFetch2D. A variant id is the
+// specialisation's hash with bit 31 set (plain-fetch masks never set it); its slots and words live in g_specs.
+struct FetchSpec
+{
+    uint32_t slot, info, w;
+};
+std::mutex g_specMutex;
+std::unordered_map<uint32_t, std::vector<FetchSpec>> g_specs;
+
+// (Per draw: a hash, and the lock only the first time this thread sees the specialisation.)
+uint32_t RegisterSpec(const FetchSpec* spec, size_t n)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (size_t i = 0; i < n; i++)
+        for (uint32_t v : { spec[i].slot, spec[i].info, spec[i].w })
+            h = (h ^ v) * 0x100000001B3ull;
+    const uint32_t id = uint32_t(h ^ (h >> 32)) | 0x80000000u;
+    thread_local std::unordered_set<uint32_t> known;
+    if (known.insert(id).second)
+    {
+        std::lock_guard lock(g_specMutex);
+        g_specs.try_emplace(id, std::vector<FetchSpec>(spec, spec + n));
+    }
+    return id;
+}
+
+std::string SpecVariant(const std::string& hlsl, uint32_t id)
+{
+    std::vector<FetchSpec> spec;
+    {
+        std::lock_guard lock(g_specMutex);
+        auto it = g_specs.find(id);
+        if (it == g_specs.end())
+            return {};
+        spec = it->second;
+    }
+    const std::string& fn = SpecializedFetchFunction();
+    if (fn.empty())
+        return {};
+    std::string out;
+    out.reserve(hlsl.size() + fn.size() + 1024);
+    size_t pos = 0, replaced = 0;
+    for (;;)
+    {
+        const size_t at = hlsl.find("TFetch2D", pos);
+        if (at == std::string::npos)
+            break;
+        const bool v2 = hlsl.compare(at, 11, "TFetch2DV2(") == 0;
+        const size_t open = at + (v2 ? 10 : 8);
+        size_t end = open + 1;
+        while (end < hlsl.size() && isdigit(uint8_t(hlsl[end])))
+            end++;
+        const bool call = open < hlsl.size() && hlsl[open] == '(' && end > open + 1 && end < hlsl.size() && hlsl[end] == ',' &&
+            (at == 0 || !isalnum(uint8_t(hlsl[at - 1])));
+        const uint32_t slot = call ? uint32_t(atoi(hlsl.c_str() + open + 1)) : 32;
+        const FetchSpec* f = nullptr;
+        for (const FetchSpec& s : spec)
+            if (s.slot == slot)
+                f = &s;
+        if (!call || !f)
+        {
+            out.append(hlsl, pos, open + 1 - pos);
+            pos = open + 1;
+            continue;
+        }
+        size_t depth = 0, close = open;
+        for (; close < hlsl.size(); close++)
+        {
+            if (hlsl[close] == '(')
+                depth++;
+            else if (hlsl[close] == ')' && --depth == 0)
+                break;
+        }
+        if (close >= hlsl.size())
+            return {};
+        char words[64];
+        snprintf(words, sizeof(words), "%s, 0x%08Xu, 0x%08Xu)", v2 ? "" : ", -1", f->info, f->w);
+        out.append(hlsl, pos, at - pos);
+        out += "TFetch2DK(";
+        out.append(hlsl, open + 1, close - open - 1);
+        out += words;
+        pos = close + 1;
+        replaced++;
+    }
+    out.append(hlsl, pos, std::string::npos);
+    if (!replaced)
+        return {};
+    // The function goes before the entry point, above any attribute line (as FetchVariant's helper).
+    size_t mainAt = out.find("float4 main(");
+    if (mainAt == std::string::npos)
+        return {};
+    size_t lineStart = out.rfind('\n', mainAt);
+    lineStart = lineStart == std::string::npos ? 0 : lineStart + 1;
+    if (lineStart >= 2)
+    {
+        const size_t prev = out.rfind('\n', lineStart - 2);
+        const size_t prevStart = prev == std::string::npos ? 0 : prev + 1;
+        if (out[prevStart] == '[')
+            lineStart = prevStart;
+    }
+    out.insert(lineStart, fn + "\n");
+    return out;
+}
+
 const CompiledShader* FetchVariantOf(const CompiledShader& base, uint32_t mask)
 {
     const uint64_t id = base.cacheKey * 0x9E3779B97F4A7C15ull ^ mask;
     std::lock_guard lock(g_fetchVariantMutex);
     if (auto it = g_fetchShaders.find(id); it != g_fetchShaders.end())
         return it->second.get();
-    if (g_fetchVariantCount[base.cacheKey] >= 16)
+    if (g_fetchVariantCount[base.cacheKey] >= ((mask >> 31) ? 64u : 16u)) // (specialisations: one per material's textures)
         return nullptr;
     auto cs = std::make_unique<CompiledShader>();
     cs->hash = base.hash;
     cs->pixel = true;
     cs->ucodeBE = base.ucodeBE; // the pipeline manifest stores the base microcode
     cs->info = base.info;
-    cs->info.hlsl = FetchVariant(base.info.hlsl, mask);
+    cs->info.hlsl = (mask >> 31) ? SpecVariant(base.info.hlsl, mask) : FetchVariant(base.info.hlsl, mask);
     if (cs->info.hlsl.empty())
         cs->state = CompiledShader::Failed;
     else
@@ -12811,6 +12918,44 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             if ((ti[3] & 0xFFu) == 1 && !(ti[0] & 0xFF0F3F40u) && tb[2] == 1.0f && tb[3] == 1.0f && (!(ti[3] >> 31) || ((ti[3] >> 8) & 0xFFFu) == 0x688u))
                 plain |= 1u << slot;
         }
+        // REGPU_TRACE_FETCH_PLAIN=1 (live; session 33): once per pixel shader and mask, the slots it reads, those plain
+        // this draw, and per other slot the fetch constant words that kept it out (dimension, clamp/format bits...).
+        if (static LiveSwitch tracePlain("REGPU_TRACE_FETCH_PLAIN"); tracePlain)
+        {
+            static std::mutex m;
+            static std::set<std::pair<uint64_t, uint32_t>> seen;
+            std::lock_guard lock(m);
+            if (seen.insert({ C().psHash, plain }).second && seen.size() < 400)
+            {
+                std::string why;
+                for (uint32_t mm = psUsed->info.usedTextureSlots & ~plain; mm; mm &= mm - 1)
+                {
+                    const uint32_t slot = uint32_t(std::countr_zero(mm));
+                    const uint32_t* ti = pc->tinfo[slot];
+                    const float* tb = pc->tbias[slot];
+                    char b[160];
+                    snprintf(b, sizeof(b), " | slot %u: kind %u, info bits %08X, scale %g %g, swizzle/sign %08X", slot, ti[3] & 0xFFu, ti[0] & 0xFF0F3F40u,
+                        tb[2], tb[3], ti[3] >> 8);
+                    why += b;
+                }
+                Log("fetch plain: ps %016llX slots %X plain %X%s", (unsigned long long)C().psHash, psUsed->info.usedTextureSlots, plain, why.c_str());
+            }
+        }
+        // REGPU_FETCH_SPECIALIZE (SpecVariant): every 2D slot specialised by its words this draw, instead of the plain mask.
+        static LiveSwitch specialize("REGPU_FETCH_SPECIALIZE");
+        if (specialize)
+        {
+            FetchSpec spec[32];
+            size_t n = 0;
+            for (uint32_t m = psUsed->info.usedTextureSlots; m; m &= m - 1)
+            {
+                const uint32_t slot = uint32_t(std::countr_zero(m));
+                const uint32_t* ti = pc->tinfo[slot];
+                if ((ti[3] & 0xFFu) == 1)
+                    spec[n++] = { slot, ti[0], ti[3] };
+            }
+            plain = n ? RegisterSpec(spec, n) : 0u;
+        }
         if (plain)
             if (const CompiledShader* f = FetchShader(*psUsed, plain))
                 if (ID3D12PipelineState* fp = GetPipeline(vs, *f, edramMode == 5, cullable, false, stripCut && directIndex, false, psUsed != &ps, plain))
@@ -13320,10 +13465,33 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 g_statDraws[statFrame].push_back({ uint32_t(C().psHash), g_statPass });
                 C().list->BeginQuery(g_statQueries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, statQuery);
             }
-            if (indexedCount)
-                C().list->DrawIndexedInstanced(indexedCount, 1, 0, 0, 0);
+            // REGPU_EXP_DRAW=N (live, FM3 port session 33, measuring what a draw costs on a small GPU; picture wrong):
+            // 1 = no draw call (all its state still set), 2 = one triangle per draw (fixed per-draw cost),
+            // 3 = 1x1 scissor (vertex work, no pixels).
+            static const auto expDraw = [] {
+                thread_local uint64_t frame = ~0ull;
+                thread_local int v = 0;
+                if (frame != g_r.frame)
+                {
+                    frame = g_r.frame;
+                    const char* e = getenv("REGPU_EXP_DRAW");
+                    v = e ? atoi(e) : 0;
+                }
+                return v;
+            };
+            const int exp = expDraw();
+            if (exp == 3)
+            {
+                const D3D12_RECT one{ 0, 0, 1, 1 };
+                C().list->RSSetScissorRects(1, &one);
+                g_drawState.scissor = one;
+            }
+            if (exp == 1)
+                ;
+            else if (indexedCount)
+                C().list->DrawIndexedInstanced(exp == 2 ? std::min<UINT>(indexedCount, 3) : indexedCount, 1, 0, 0, 0);
             else
-                C().list->DrawInstanced(directIndex ? directVertices : UINT(list.size()), 1, 0, 0);
+                C().list->DrawInstanced(exp == 2 ? std::min<UINT>(directIndex ? directVertices : UINT(list.size()), 3) : (directIndex ? directVertices : UINT(list.size())), 1, 0, 0);
             if (stat)
                 C().list->EndQuery(g_statQueries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, statQuery);
         };
