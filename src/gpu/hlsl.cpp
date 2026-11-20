@@ -211,6 +211,7 @@ float3 CubeDirection(float3 stf)
 
 float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel);
 static int gFilterOverride = -1; // the fetch instruction's filter (0 point, 1 linear), -1 the constant's
+static bool gBorderHit = false;  // TFetchRaw returned the border colour (clamp to border, outside the image)
 // The sampler for a fetch: the constant's mode (0 linear wrap, 1 linear clamp, 2 point clamp, 3 point
 // wrap), its filter replaced by the instruction's when it has one.
 uint FetchMode(uint mode)
@@ -255,9 +256,32 @@ float PWLGammaToLinear(float g)
     return l / 1023.0;
 }
 
+// A resolved 16-bit fixed image read with another number format than it was copied in (renderer.cpp: tinfo.x
+// bit 6 on; bits 4-5 the copy's format, 0 integer, 1 unsigned fraction, 2 signed fraction; bits 14-15 the
+// fetch's, 0 signed integer, 1 unsigned fraction, 2 signed fraction, 3 unsigned integer; bits 2-3 the
+// components, 0 one, 1 two, 2 four). Back to the 16 bits the console stores, then read as the fetch asks.
+float4 Fixed16Fetch(float4 v, uint info)
+{
+    if (!((info >> 6) & 1u))
+        return v;
+    const uint copy = (info >> 4) & 3u, mode = (info >> 14) & 3u;
+    // Vector selects, no loop: fxc can't unroll a loop that writes v[c] (error X3500 / X3511).
+    const float4 stored = copy == 1u ? round(saturate(v) * 65535.0) : (copy == 2u ? round(clamp(v, -1.0, 1.0) * 32767.0) : v);
+    const float4 asSigned = stored - (stored >= 32768.0 ? 65536.0 : 0.0);
+    const float4 asUnsigned = stored + (stored < 0.0 ? 65536.0 : 0.0);
+    const float4 r = mode == 1u ? asUnsigned / 65535.0 : (mode == 2u ? max(asSigned / 32767.0, -1.0) : (mode == 3u ? asUnsigned : asSigned));
+    const uint comps = 1u << ((info >> 2) & 3u);
+    const bool4 use = bool4(true, comps >= 2u, comps >= 4u, comps >= 4u);
+    return use ? r : v;
+}
+
 float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)
 {
+    gBorderHit = false;
     float4 v = TFetchRaw(slot, coord, denorm, vertexStage, bias, texel);
+    // A texel of a resolved 16-bit fixed image, converted as the fetch reads it; the border colour is not.
+    if (!gBorderHit)
+        v = Fixed16Fetch(v, tinfo[slot].x);
     // Gamma-signed components (tinfo.x bits 24-27, in v's order): before the exponent adjust.
     uint gamma = (tinfo[slot].x >> 24) & 0xFu;
     if (gamma != 0u)
@@ -323,7 +347,10 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     // Clamp to border (tinfo.x bit 16; bit 17 white): outside the image the border colour, as
     // shadow maps rely on (white: nothing casts a shadow beyond the map).
     if (((tinfo[slot].x >> 16) & 1u) && any(uv < 0.0 || uv > 1.0))
+    {
+        gBorderHit = true; // the border colour is final: TFetch doesn't convert it (Fixed16Fetch)
         return ((tinfo[slot].x >> 17) & 1u) ? float4(1, 1, 1, 1) : float4(0, 0, 0, 0);
+    }
     // One axis clamped, the other wrapping (tinfo.x bits 18 U, 19 V): clamp that axis here to
     // the edge texels' centres; the sampler wraps.
     if ((tinfo[slot].x >> 18) & 1u) uv.x = clamp(uv.x, 0.5 / texelSize.x, 1.0 - 0.5 / texelSize.x);
@@ -1083,7 +1110,7 @@ float4 TFetch2D(uint slot, float3 coord, bool denorm, float bias, float2 texel)
     // Sampler index: the filter mode (1-3 its own sampler), else the anisotropy (s4-s7), else s0.
     const uint mode = info & 3u, aniso = (info >> 20) & 7u;
     const uint s = mode != 0u ? mode : (aniso >= 1u && aniso <= 4u ? aniso + 3u : 0u);
-    float4 v = gtex[asuint(tbias[slot].y)].SampleBias(gsamp[s], uv, bias);
+    float4 v = Fixed16Fetch(gtex[asuint(tbias[slot].y)].SampleBias(gsamp[s], uv, bias), info);
     uint gamma = (info >> 24) & 0xFu;
     if (gamma != 0u)
     {
