@@ -63,5 +63,8 @@ These are not done yet. They are the work list for the conversion:
   - Temporal upscalers (FSR 3/4, DLSS, XeSS), post AA, VR and triple screen.
   - Hyper mode.
   - The host device and presenter API (`Config::hostDevice`, `Host::presentImage`).
+- **Performance:** FM2's measurements and their author's advice (anisotropy cost on RADV, pipelines still built
+  on the render thread on NVIDIA, rebinding every descriptor set per draw) are in
+  [vulkan-conversion-plan.md](vulkan-conversion-plan.md#lessons-from-fm2s-vulkan-backend).
 - **Not tested with a game in ReGPU.** It builds, links, opens a device and compiles the shader preamble
   (`regpu_vkprobe`). FM2 ran it against its own copy of the renderer, before these merges.

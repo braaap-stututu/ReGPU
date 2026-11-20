@@ -86,6 +86,65 @@ FH1/Glue2GPU and the rest) described in the README.
   - Validation layers on behind `REGPU_VK_VALIDATION`.
   - RenderDoc and RGP for GPU work.
 
+## Lessons from FM2's Vulkan backend
+
+These are notes from Tankyx's agent, who wrote FM2's Vulkan backend (`src/gpu/vk`), received 20 Nov 2026. The
+measurements are FM2's, at 1080p. FM2's environment variable names are `FM2_*`; in ReGPU's copy they are `REGPU_*`.
+
+**What not to repeat**
+- **Async pipeline and shader compilation were tried and reverted.** Some frames skipped about 1,000 draws, and the
+  1% lows did not improve.
+- **The rule for us:** a draw never skips because its pipeline isn't ready. ReGPU's D3D12 path already works this
+  way, and the converted renderer keeps it:
+  - a plain-fetch variant builds in the background while the draw uses the base pipeline;
+  - everything else builds on the draw thread, or comes prebuilt from the manifest.
+
+**Integrated GPU (RADV APU): GPU-bound, 28-30 fps, GPU frame about 32 ms**
+- D3D12 through vkd3d-proton gets about 35 fps on the same driver. The gap is in what is asked of the driver, not
+  in CPU work.
+- **16x anisotropy:** it costs Vulkan about 10 ms against D3D12's 4.
+  - With anisotropy off, the two backends are level: 41.9 fps on Vulkan against 40.4 on D3D12.
+  - The road pixel shader `ff5c8bbf7b62e0f2` alone takes 12.8 ms. One 84-vertex draw takes 9.5 ms.
+  - **Test:** make that shader return a constant on both backends (FM2's `*_DEBUG_PS`). If the gap stays, the cause
+    is overdraw or lost early depth rejection. If it closes, it's the sampling.
+  - For ReGPU: compare the sampler setup in the bring-up (`MaxAnisotropy`, mip filtering, LOD bias) with D3D12's.
+    s0 is 16x unless `REGPU_ANISO_FROM_FETCH` is set.
+- **Alpha-test-free pixel shader variants:** every translated pixel shader ends in a discard switch, which can cost
+  early depth rejection.
+  - FM2's Vulkan backend never had these variants. ReGPU's renderer has them: pipeline flag 0x400 with
+    `NoKillShader`.
+  - The in-place conversion keeps them automatically. The gain on the APU has never been measured.
+- **Plain-fetch variants:** 2.5% less GPU time on a 4070 under D3D12.
+  - ReGPU has them as `REGPU_FETCH_VARIANTS` (`fetchMask`, `FetchVariantOf`), together with
+    `REGPU_FETCH_SPECIALIZE`.
+  - They carry over the same way.
+- **Default anisotropy on integrated GPUs:** going from 16x to off gains about 12 fps. 4x and 8x were not measured.
+  Phase 3 should pick a default for iGPUs from a measurement.
+- **FSR 1 in the present pass:** it needs no motion vectors, and `fsr1.hlsl` already exists. It is the cheapest
+  upscaler to bring up first in phase 4.
+
+**RTX 5090: CPU-bound, about 207 fps, GPU frame about 1.3 ms**
+- The render thread is the limit. FM2's Vulkan was already about three times D3D12 (about 70 fps) here.
+- **Prebuild pipelines at load.**
+  - On NVIDIA, about 38 pipelines are still built on the render thread on every warm run (none on the APU). The 1%
+    low is 108 fps against a 207 average.
+  - The model is ReGPU's `pipelines.manifest`, rebuilt at boot. Make sure the Vulkan side feeds
+    `VkPipelineCache` from it, and find out why NVIDIA still misses (likely a key or state not in the manifest).
+- **Profile before changing anything else.** Use `REGPU_VK_SAMPLE=1` here, or the converted renderer's own timers.
+  In FM2's last timed frame:
+
+  | Bucket | Time |
+  |---|---|
+  | Untimed work inside the draw function | 1.34 ms |
+  | Setup | 0.59 ms |
+  | Descriptor binds | 0.32 ms |
+  | Draw calls | 0.13 ms |
+
+- **Bind only set 0 per draw.** `vk_draw.cpp` rebinds all four sets (with the dynamic UBO offsets) on every draw.
+  - Sets 1-3 (the bindless textures) don't change between draws.
+  - Binding them once per command buffer and set 0 per draw is a small, safe saving.
+  - This should be the rule from the start of phase 2.
+
 ## Phases
 
 The work happens on the long-lived branch **`vulkan`**. `main` stays at the D3D12 renderer until the branch renders
