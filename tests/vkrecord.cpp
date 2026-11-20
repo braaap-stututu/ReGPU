@@ -105,9 +105,9 @@ int main()
 
     VkImageMemoryBarrier2 toTarget[2] = {
         Transition(a.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_NONE, 0,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT),
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, vk::kColorTargetAccess),
         Transition(b.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_NONE, 0,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT),
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, vk::kColorTargetAccess),
     };
     list.Barrier(2, toTarget);
     list.ResetQueries(queries, 0, 1);
@@ -171,5 +171,18 @@ int main()
     memcpy(&samples, px + W * H * 8, 8);
     printf("vkrecord: submitted %s; bound clear %s, rect clear %s, own-pass clear %s, empty query %llu samples %s\n", waited ? "ok" : "TIMED OUT",
         left ? "ok" : "WRONG", rightOk ? "ok" : "WRONG", other ? "ok" : "WRONG", (unsigned long long)samples, samples == 0 ? "ok" : "WRONG");
-    return waited && left && rightOk && other && samples == 0 ? 0 : 1;
+    // With REGPU_VK_VALIDATION: no messages from the layer, after one injected message proves they reach the log.
+    bool clean = true;
+    if (d.validation && d.messenger)
+    {
+        const uint64_t before = vk::g_validationMessages.load();
+        VkDebugUtilsMessengerCallbackDataEXT probe{ VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CALLBACK_DATA_EXT };
+        probe.pMessageIdName = "regpu-vkrecord-probe";
+        probe.pMessage = "injected by regpu_vkrecord: the validation messages reach regpu.log";
+        vkSubmitDebugUtilsMessageEXT(d.instance, VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT, VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT, &probe);
+        const bool reached = vk::g_validationMessages.load() == before + 1;
+        clean = reached && before == 0;
+        printf("vkrecord: validation messages %llu (the injected one %s)\n", (unsigned long long)before, reached ? "arrived" : "DID NOT ARRIVE");
+    }
+    return waited && left && rightOk && other && samples == 0 && clean ? 0 : 1;
 }

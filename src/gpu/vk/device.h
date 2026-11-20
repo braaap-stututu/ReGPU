@@ -87,6 +87,9 @@ uint64_t Completed(const Device& d);
 // Blocks until the GPU has finished `value` (true), or `timeoutNs` passed (false).
 bool WaitFor(const Device& d, uint64_t value, uint64_t timeoutNs = UINT64_MAX);
 
+// Validation warnings and errors reported so far (REGPU_VK_VALIDATION), for tests.
+extern std::atomic<uint64_t> g_validationMessages;
+
 // The result's name, for logs ("VK_ERROR_DEVICE_LOST").
 const char* ResultName(VkResult result);
 // Ends the process with a FATAL line if `result` is an error (the D3D12 renderer's Check).

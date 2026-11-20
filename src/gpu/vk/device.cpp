@@ -19,6 +19,7 @@
 
 namespace vk
 {
+std::atomic<uint64_t> g_validationMessages{ 0 };
 namespace
 {
 std::string Lower(std::string s)
@@ -40,6 +41,7 @@ VkBool32 VKAPI_PTR OnValidationMessage(VkDebugUtilsMessageSeverityFlagBitsEXT se
 {
     if (severity < VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
         return VK_FALSE;
+    g_validationMessages.fetch_add(1, std::memory_order_relaxed);
     // The first 3 of each message id, with the stack of the call that made it (as REGPU_D3D12_STACKS did).
     static std::mutex m;
     static std::unordered_map<int32_t, int> seen;
@@ -295,6 +297,7 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir)
     if (debugUtils)
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     // REGPU_VK_VALIDATION=1: the Khronos validation layer (installed with the Vulkan SDK), its messages in regpu.log.
+    // 2: also synchronization validation (missing or wrong barriers; slower).
     std::vector<const char*> layers;
     if (const char* v = getenv("REGPU_VK_VALIDATION"); v && atoi(v) != 0)
     {
@@ -317,6 +320,15 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir)
     ici.ppEnabledExtensionNames = extensions.data();
     ici.enabledLayerCount = uint32_t(layers.size());
     ici.ppEnabledLayerNames = layers.data();
+    const VkValidationFeatureEnableEXT syncValidation = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+    VkValidationFeaturesEXT features{ VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT };
+    features.enabledValidationFeatureCount = 1;
+    features.pEnabledValidationFeatures = &syncValidation;
+    if (d.validation && atoi(getenv("REGPU_VK_VALIDATION")) >= 2)
+    {
+        ici.pNext = &features;
+        Log("presenter: REGPU_VK_VALIDATION=2: synchronization validation on");
+    }
     Check(vkCreateInstance(&ici, nullptr, &d.instance), "vkCreateInstance");
     vkldr::ResolveInstance(d.instance);
     if (d.validation && debugUtils)

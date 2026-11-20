@@ -58,6 +58,13 @@ struct NoInitAllocator : std::allocator<T>
 };
 using RecordBytes = std::vector<uint8_t, NoInitAllocator<uint8_t>>;
 
+// Render passes always load and store their targets (VK_ATTACHMENT_LOAD_OP_LOAD), so a barrier into an attachment
+// layout must make both reads and writes of the attachment wait (synchronization validation: SYNC-HAZARD-READ-AFTER-
+// WRITE on vkCmdBeginRendering otherwise). Use these as the barrier's dstAccessMask (and srcAccessMask out of it).
+constexpr VkAccessFlags2 kColorTargetAccess = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+constexpr VkAccessFlags2 kDepthTargetAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+constexpr VkPipelineStageFlags2 kDepthTargetStages = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+
 // The render targets of the next draws (D3D12's OMSetRenderTargets): views in their attachment layouts.
 struct Targets
 {
