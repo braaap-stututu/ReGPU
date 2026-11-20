@@ -55,6 +55,11 @@ std::string AdaptHlsl(const std::string& hlsl)
             }
         }
     }
+    {
+        const char* const lean = "SamplerState gsamp[8] : register(s0, space1);";
+        if (const size_t at = source.find(lean); at != std::string::npos)
+            source.replace(at, strlen(lean), "#define gsamp gSamplers");
+    }
     return source;
 }
 

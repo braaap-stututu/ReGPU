@@ -9,6 +9,11 @@
 
 namespace vk
 {
+// The translator's HLSL as the Vulkan pipeline layout binds it (gpu/vk/bindings.h): the bindless arrays sized, ReGPU's
+// eight samplers (s0-s7) as one array binding (gSamplers[8]), and REGPU_LEAN_FETCH's sampler table (gsamp, s0-s7 in
+// space1, which would collide with gtex in set 1) as the same array.
+std::string AdaptHlsl(const std::string& hlsl);
+
 // pixel selects ps_6_0/vs_6_0. cacheDir may be empty to skip the disk cache.
 bool CompileHlsl(const std::string& hlsl, bool pixel, uint64_t key, const std::filesystem::path& cacheDir,
     std::vector<uint32_t>& spirv, std::string* error = nullptr, bool disableOptimizations = false);

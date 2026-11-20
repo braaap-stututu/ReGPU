@@ -448,6 +448,7 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir)
     w12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
     w12.descriptorBindingVariableDescriptorCount = have12.descriptorBindingVariableDescriptorCount;
     w12.descriptorBindingUpdateUnusedWhilePending = have12.descriptorBindingUpdateUnusedWhilePending;
+    d.updateUnusedWhilePending = have12.descriptorBindingUpdateUnusedWhilePending;
     w12.descriptorBindingStorageBufferUpdateAfterBind = have12.descriptorBindingStorageBufferUpdateAfterBind;
     w12.timelineSemaphore = VK_TRUE;
     w12.hostQueryReset = have12.hostQueryReset;

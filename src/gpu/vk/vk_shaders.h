@@ -36,9 +36,7 @@ struct ShaderSet
 
 void ShaderSetDestroy(Context& context, ShaderSet& set);
 
-// The translator's HLSL as the Vulkan pipeline layout binds it: the bindless arrays sized, and ReGPU's eight samplers
-// (s0-s7) as one array binding (gSamplers[8]).
-std::string AdaptHlsl(const std::string& hlsl);
+// AdaptHlsl: see vk_shader.h.
 
 // Returns the shader for `hash`, translating and compiling it if this is the first time.
 // The microcode must be the bytes the hash was taken over (Fnv over the used dwords, xor the

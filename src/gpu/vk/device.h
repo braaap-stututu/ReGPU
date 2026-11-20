@@ -52,6 +52,7 @@ struct Device
     bool pushDescriptor = false;       // VK_KHR_push_descriptor
     bool swapchain = false;            // VK_KHR_swapchain (+ the instance's surface extensions)
     bool memoryBudget = false;         // VK_EXT_memory_budget
+    bool updateUnusedWhilePending = false; // descriptorBindingUpdateUnusedWhilePending (bindless writes while in flight)
     bool validation = false;           // REGPU_VK_VALIDATION: VK_LAYER_KHRONOS_validation is on
     float maxAnisotropy = 1.0f;
 
