@@ -1644,7 +1644,29 @@ uint64_t ContentHash(const uint8_t* data, size_t bytes, size_t stride = 256)
     if (fullHash)
         stride = 4;
     uint64_t h = mix(0xCBF29CE484222325ull, bytes);
-    for (size_t i = 0; i + 4 <= bytes; i += stride)
+    // Four independent chains, joined at the end: one chain is a multiply's latency per sample (~6 cycles), the
+    // draw thread's single largest helper in PGR3 (vertex uploads hashed ~3,000 times a frame). Values are only
+    // compared within a run. REGPU_SERIAL_CONTENT_HASH=1: one chain, as before (A/B).
+    static LiveSwitch serial("REGPU_SERIAL_CONTENT_HASH");
+    size_t i = 0;
+    if (!serial)
+    {
+        uint64_t h1 = 0x9E3779B97F4A7C15ull, h2 = 0xC2B2AE3D27D4EB4Full, h3 = 0x165667B19E3779F9ull;
+        for (; i + 3 * stride + 4 <= bytes; i += 4 * stride)
+        {
+            uint32_t v0, v1, v2, v3;
+            memcpy(&v0, data + i, 4);
+            memcpy(&v1, data + i + stride, 4);
+            memcpy(&v2, data + i + 2 * stride, 4);
+            memcpy(&v3, data + i + 3 * stride, 4);
+            h = mix(h, v0);
+            h1 = mix(h1, v1);
+            h2 = mix(h2, v2);
+            h3 = mix(h3, v3);
+        }
+        h = mix(mix(mix(h, h1), h2), h3);
+    }
+    for (; i + 4 <= bytes; i += stride)
     {
         uint32_t v;
         memcpy(&v, data + i, 4);
@@ -14551,13 +14573,27 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const uint32_t nv = allConstants ? 256 : std::min(vs.info.constantsUsed, 256u), np = allConstants ? 256 : std::min(ps.info.constantsUsed, 256u);
         if (LiveSwitch &traceUsed = g_sw_REGPU_TRACE_CONSTANTS_USED; traceUsed)
         {
-            static uint64_t sv = 0, sp = 0, n = 0, lastFrame = 0;
+            static uint64_t sv = 0, sp = 0, n = 0, lastFrame = 0, bv = 0, bp = 0, lv = 0, lp = 0, kv = 0, kp = 0;
             sv += nv, sp += np, n++;
+            auto bitsAndLines = [](const std::array<uint64_t, 4>& mask, uint64_t& bits, uint64_t& lines) {
+                for (uint64_t w : mask)
+                {
+                    bits += uint64_t(__builtin_popcountll(w));
+                    w |= w >> 1;
+                    w |= w >> 2;
+                    lines += uint64_t(__builtin_popcountll(w & 0x1111111111111111ull));
+                }
+            };
+            bitsAndLines(vs.info.constantMask, bv, lv);
+            bitsAndLines(ps.info.constantMask, bp, lp);
+            kv += vs.info.packedConstants, kp += ps.info.packedConstants;
             if (g_r.frame >= lastFrame + 120)
             {
                 lastFrame = g_r.frame;
-                Log("constants used: vs %.1f ps %.1f per draw (%llu draws)", double(sv) / n, double(sp) / n, (unsigned long long)n);
-                sv = sp = n = 0;
+                Log("constants used: vs %.1f ps %.1f per draw (%llu draws); read: vs %.1f ps %.1f; lines: vs %.1f ps %.1f; packed: vs %.0f%% ps %.0f%%",
+                    double(sv) / n, double(sp) / n, (unsigned long long)n, double(bv) / n, double(bp) / n, double(lv) / n, double(lp) / n,
+                    100.0 * kv / n, 100.0 * kp / n);
+                sv = sp = n = bv = bp = lv = lp = kv = kp = 0;
             }
         }
         // Only the constants each shader reads (by its mask; the game's onDraw hook may read any).
@@ -16069,7 +16105,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (C().worker)
         C().draws++;
     else
-        g_r.drawsThisFrame++;
+    {
+        // A plain load and store, not a locked add: only this thread counts the main context's draws (workers add
+        // theirs at the end of a piece; the count is statistics and draw numbering). A locked add is a full barrier
+        // that waits for the draw's write-combined ring writes to drain (PGR3 port: 8.6% of the draw thread at this
+        // line; +0.7% fps, the rest of the wait moves to the next locked instruction). REGPU_LOCKED_DRAW_COUNT=1: as before.
+        static LiveSwitch lockedCount("REGPU_LOCKED_DRAW_COUNT");
+        if (!lockedCount)
+            g_r.drawsThisFrame.store(g_r.drawsThisFrame.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        else
+            g_r.drawsThisFrame++;
+    }
     // REGPU_SUBMIT_DRAWS=<n>: submit the frame so far every n draws (never inside an occlusion query), so
     // the GPU starts on it while the rest is recorded (pgr4-native). Off by default: FM2's race, already
     // GPU-bound, lost 4-17% at n = 128-512. It may help a game whose GPU waits on recording.
