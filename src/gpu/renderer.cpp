@@ -12289,7 +12289,9 @@ void ScanVrTag()
         if ((v & 0xFFFF0000u) != regpu::vr::kPoseTagBits || !(v & 0xFFFF))
             continue;
         const uint32_t tag = v & 0xFFFF;
-        if (!g_frameVrTag || int16_t(uint16_t(tag - g_frameVrTag)) > 0)
+        // (Only a pose handed in recently: another constant can have the same bit pattern; session 39, the user saw
+        // frames fall back to the flat view, logged as tags without a pose.)
+        if ((!g_frameVrTag || int16_t(uint16_t(tag - g_frameVrTag)) > 0) && regpu::xr::TagKnown(tag))
             g_frameVrTag = tag;
     }
 }
@@ -15756,7 +15758,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     static AsyncEnd asyncEnds[kFrames];
     AsyncEnd& asyncEnd = asyncEnds[g_r.frameIndex];
     bool presenting = false;
-    const uint32_t vrTag = g_frameVrTag;
+    const uint32_t vrTag = g_frameVrTag | regpu::xr::TakeFrameFlags(); // (the frame's own: carried to its copy)
     g_frameVrTag = 0;
     g_frameVrScans = 0;
     if (asyncPresent)
