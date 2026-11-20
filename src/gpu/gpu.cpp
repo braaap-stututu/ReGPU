@@ -1554,16 +1554,24 @@ uint32_t ExecutePacket(uint32_t ptr)
             if (perf)
             {
                 // Time per wait target, logged every 2 s.
-                static std::map<std::pair<uint32_t, uint32_t>, uint64_t> byTarget;
+                // (with the last reference and mask, how many waits, and how many found it not holding yet)
+                struct Target
+                {
+                    uint64_t us = 0, n = 0, blocked = 0;
+                    uint32_t ref = 0, mask = 0;
+                };
+                static std::map<std::pair<uint32_t, uint32_t>, Target> byTarget;
                 static auto lastLog = Clock::now();
-                byTarget[{ arg(1) | ((info & 0x10) ? 0x80000000u : 0), info & 7 }] += uint64_t(us);
+                Target& t = byTarget[{ arg(1) | ((info & 0x10) ? 0x80000000u : 0), info & 7 }];
+                t.us += uint64_t(us), t.n++, t.blocked += us > 0, t.ref = arg(2), t.mask = arg(3);
                 if (Clock::now() - lastLog > std::chrono::seconds(2))
                 {
                     lastLog = Clock::now();
                     for (auto& [key, total] : byTarget)
-                        if (total > 20000)
-                            Log("perf: CP waited %llu ms on %s %08X (fn %u)", (unsigned long long)(total / 1000), (key.first >> 31) ? "mem" : "reg",
-                                key.first & 0x7FFFFFFF, key.second);
+                        if (total.us > 20000)
+                            Log("perf: CP waited %llu ms on %s %08X (fn %u, ref %08X mask %08X; %llu waits, %llu took 1 us or more)",
+                                (unsigned long long)(total.us / 1000), (key.first >> 31) ? "mem" : "reg", key.first & 0x7FFFFFFF, key.second, total.ref,
+                                total.mask, (unsigned long long)total.n, (unsigned long long)total.blocked);
                     byTarget.clear();
                 }
             }
