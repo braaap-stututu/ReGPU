@@ -26,5 +26,7 @@ void CaptureFrame(ID3D12GraphicsCommandList* list, ID3D12Resource* backBuffer);
 // `halfIpd` = half the eye distance (metres).
 bool StereoFrame(float& clipPerMetre, float& halfIpd);
 // The headset's image for eye 0 (left) or 1 (right) at w x h, state COMMON (to be left so), or null without a session.
+// (eye 2: the HUD panel's image, premultiplied alpha; StereoHudCaptured once it is written this frame.)
 ID3D12Resource* StereoTarget(int eye, uint32_t w, uint32_t h);
+void StereoHudCaptured();
 }
