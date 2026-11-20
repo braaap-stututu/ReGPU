@@ -29,6 +29,15 @@ struct Config
     Upscaler upscaler = Upscaler::Off;
     uint32_t quality = 1;   // 0 native (anti-aliasing only), 1 quality, 2 balanced, 3 performance, 4 ultra performance
     float sharpness = 0.5f; // 0-1
+    // Anti-aliasing filters (FM3 port, session 36). postAA: a filter on the finished 3D scene, before the title's own
+    // post-processing and HUD (FXAA, SMAA, CMAA 2: need a REGPU_AA_DIR build; TAA: the motion vectors and jitter of the
+    // temporal upscalers, so not together with DLSS or FSR 3). ssaa: the game renders at this multiple of the shown size
+    // and each frame is filtered down at the present (1 = off; 1.5 and 2 sensible). eqaa: AMD's enhanced quality AA
+    // (more coverage than colour samples) where the driver offers it as an MSAA quality level.
+    enum class PostAA : uint32_t { Off, Fxaa, Smaa, Cmaa2, Taa };
+    PostAA postAA = PostAA::Off;
+    float ssaa = 1.0f;
+    bool eqaa = false;
     std::filesystem::path userDir = "."; // shader and pipeline caches, dumps
     std::wstring windowTitle = L"ReGPU";
     // A window the host already owns (an HWND): ReGPU presents into it instead of opening its own.
@@ -47,6 +56,8 @@ struct Config
     // The size the game renders at: the resolution, narrowed or shortened to the forced aspect
     // ratio (the rest of the screen is black bars).
     void RenderSize(uint32_t& w, uint32_t& h) const;
+    // The size the frame is shown at: RenderSize without supersampling.
+    void ShownSize(uint32_t& w, uint32_t& h) const;
 };
 
 // A shader found in the game's files or memory: its microcode as in guest memory (big endian).

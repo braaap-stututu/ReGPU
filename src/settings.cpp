@@ -1,4 +1,5 @@
 // Config and Host storage, and Start (include/regpu/regpu.h).
+#include <cmath>
 #include "settings.h"
 
 #include <algorithm>
@@ -34,7 +35,19 @@ void Start()
     GpuInit();
 }
 
+// Supersampling (FM3 port, session 36): the game renders at ssaa x the shown size, and the frame is filtered down to it
+// at the present (renderer.cpp, SsaaDownsample). The swap chain stays the shown size (ShownSize).
 void Config::RenderSize(uint32_t& w, uint32_t& h) const
+{
+    ShownSize(w, h);
+    if (ssaa > 1.0f)
+    {
+        w = uint32_t(std::lround(double(w) * ssaa)) & ~1u;
+        h = uint32_t(std::lround(double(h) * ssaa)) & ~1u;
+    }
+}
+
+void Config::ShownSize(uint32_t& w, uint32_t& h) const
 {
     w = width;
     h = height;
