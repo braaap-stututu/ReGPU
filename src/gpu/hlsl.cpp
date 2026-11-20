@@ -396,7 +396,6 @@ float4 CubeOp(float4 a, float4 b)
 float4 Mul9(float4 a, float4 b) { return (a == 0 || b == 0) ? 0 : a * b; }
 float Mul9(float a, float b) { return (a == 0 || b == 0) ? 0 : a * b; }
 float Dot9(float4 a, float4 b) { float4 m = Mul9(a, b); return m.x + m.y + m.z + m.w; }
-
 bool BoolConstant(uint4 b[2], uint index) { return (b[index >> 7][(index >> 5) & 3] >> (index & 31)) & 1; }
 )";
 
@@ -418,6 +417,30 @@ struct Emitter
     bool saveFetchIndex = false; // minis read the index their full fetch kept (vfi), see ScanFetchIndex
     bool lastRound = false;
     int indent = 1;
+
+    // Hyper (REGPU_HYPER_PLAIN_MUL=5, pixel shaders; from the FM2 port's hyper-prototype): registers an infinity or NaN
+    // may reach, from the scalar ops that can make one (exp2, raw log2, raw rcp, raw rsqrt, sqrt) and anything
+    // computed from them. Sticky; and TranslateShader translates such a shader twice, the second time with every
+    // register the first pass tainted already tainted from the start, so loops and branches stay conservative. Only
+    // multiplies with a tainted operand keep the Xenos zero rule (Mul9/Dot9); the rest are plain IEEE (MulP/DotP).
+    static bool SmartMul()
+    {
+        static const bool on = getenv("REGPU_HYPER_PLAIN_MUL") && atoi(getenv("REGPU_HYPER_PLAIN_MUL")) == 5;
+        return on;
+    }
+    uint64_t taint = 0;
+    bool psTaint = false;
+    bool curTaint = true; // the instruction being emitted reads a tainted operand
+    bool SrcTaint(const Source& s) const
+    {
+        if (s.isConstant)
+            return false;
+        if (s.relative)
+            return taint != 0;
+        return (taint >> (s.reg & 63)) & 1;
+    }
+    std::string MulName() const { return (pixel && SmartMul() && !curTaint) ? "MulP(" : "Mul9("; }
+    std::string DotName() const { return (pixel && SmartMul() && !curTaint) ? "DotP(" : "Dot9("; }
 
     void Line(const std::string& s)
     {
@@ -504,10 +527,11 @@ struct Emitter
 
     std::string VectorExpr(const Alu& a, const std::string& A, const std::string& B, const std::string& C)
     {
+        const std::string mul = MulName(), dot = DotName();
         switch (a.vectorOp)
         {
         case 0: return A + " + " + B;
-        case 1: return "Mul9(" + A + ", " + B + ")";
+        case 1: return mul + A + ", " + B + ")";
         case 2: return "max(" + A + ", " + B + ")";
         case 3: return "min(" + A + ", " + B + ")";
         case 4: return "float4(" + A + " == " + B + ")";
@@ -517,13 +541,13 @@ struct Emitter
         case 8: return "frac(" + A + ")";
         case 9: return "trunc(" + A + ")";
         case 10: return "floor(" + A + ")";
-        case 11: return "Mul9(" + A + ", " + B + ") + " + C;
+        case 11: return mul + A + ", " + B + ") + " + C;
         case 12: return "(" + A + " == 0.0) ? " + B + " : " + C;
         case 13: return "(" + A + " >= 0.0) ? " + B + " : " + C;
         case 14: return "(" + A + " > 0.0) ? " + B + " : " + C;
-        case 15: return "Dot9(" + A + ", " + B + ").xxxx";
-        case 16: return "Dot9(float4((" + A + ").xyz, 0), float4((" + B + ").xyz, 0)).xxxx";
-        case 17: return "(Dot9(float4((" + A + ").xy, 0, 0), float4((" + B + ").xy, 0, 0)) + (" + C + ").x).xxxx";
+        case 15: return dot + A + ", " + B + ").xxxx";
+        case 16: return dot + "float4((" + A + ").xyz, 0), float4((" + B + ").xyz, 0)).xxxx";
+        case 17: return "(" + dot + "float4((" + A + ").xy, 0, 0), float4((" + B + ").xy, 0, 0)) + (" + C + ").x).xxxx";
         case 18: // CUBE: operands are v.zzxy and v.yxzz; result (tc, sc, 2 * major axis, face)
             return "CubeOp(" + A + ", " + B + ")";
         case 19: { std::string t = A; return "max(max(" + t + ".x, " + t + ".y), max(" + t + ".z, " + t + ".w)).xxxx"; }
@@ -552,8 +576,8 @@ struct Emitter
         {
         case 0: return set(A + " + " + B);
         case 1: return set(A + " + ps");
-        case 2: return set("Mul9(" + A + ", " + B + ")");
-        case 3: case 4: return set("Mul9(" + A + ", ps)");
+        case 2: return set(MulName() + A + ", " + B + ")");
+        case 3: case 4: return set(MulName() + A + ", ps)");
         case 5: return set("max(" + A + ", " + B + ")");
         case 6: return set("min(" + A + ", " + B + ")");
         case 7: return set("float(" + A + " == 0.0)");
@@ -606,7 +630,7 @@ struct Emitter
             const char* op = a.scalarOp <= 43 ? " * " : (a.scalarOp <= 45 ? " + " : " - ");
             const char* neg = a.src[2].negate ? "-" : "";
             if (a.scalarOp <= 43)
-                return set(std::string("Mul9(") + neg + ca + ", " + neg + tb + ")");
+                return set(std::string(((taint >> temp) & 1) || !pixel || !SmartMul() ? "Mul9(" : "MulP(") + neg + ca + ", " + neg + tb + ")");
             static const int negMode = getenv("REGPU_SC_NEG") ? atoi(getenv("REGPU_SC_NEG")) : 0; // 0 both, 1 constant, 2 temp
             const char* negC = negMode == 2 ? "" : neg;
             const char* negT = negMode == 1 ? "" : neg;
@@ -665,11 +689,31 @@ struct Emitter
             body += "} ";
         }
         else
+        {
+            curTaint = SrcTaint(a.src[0]) || SrcTaint(a.src[1]) || SrcTaint(a.src[2]);
             body += "v = " + VectorExpr(a, A, B, C) + "; ";
+        }
+        const bool vectorTaint = SrcTaint(a.src[0]) || SrcTaint(a.src[1]) || SrcTaint(a.src[2]);
         if (a.vectorClamp && !vectorUnused)
             body += "v = saturate(v); ";
+        // The scalar half reads src[2] (and for some ops ps): tainted by them or by an op that can make an infinity.
+        const bool scalarTaint = !scalarKept && (SrcTaint(a.src[2]) || psTaint || a.scalarOp == 14 || a.scalarOp == 15 ||
+                                                 a.scalarOp == 16 || a.scalarOp == 19 || a.scalarOp == 22 || a.scalarOp == 40 ||
+                                                 (a.scalarOp >= 42 && a.scalarOp <= 47));
         if (!scalarKept)
+        {
+            curTaint = SrcTaint(a.src[2]) || psTaint;
             body += ScalarCode(a) + " ";
+        }
+        curTaint = true;
+        if (!a.exportData)
+        {
+            if (vectorTaint && a.vectorMask && !vectorUnused)
+                taint |= 1ull << (a.vectorDest & 63);
+            if (scalarTaint && a.scalarMask)
+                taint |= 1ull << (a.scalarDest & 63);
+        }
+        psTaint = psTaint || scalarTaint;
         if (a.vectorOp == 29) // MAXAv: a0 from the first operand's W, after the reads
             body += "a0 = clamp(int(floor((" + A + ").w + 0.5)), -256, 255); ";
         if (a.scalarClamp)
@@ -1261,7 +1305,25 @@ std::string Preamble(bool plainMul, bool plainMulVertex = false)
         ReplaceOnce(h, kOrigMul, kPlainMulAll);
     else if (plainMul)
         ReplaceOnce(h, kOrigMul, kPlainMul);
-    return LeanFetch() ? h + kLeanFetch : h;
+    if (LeanFetch())
+        h += kLeanFetch;
+    // Hyper's plain IEEE multiplies for operands no infinity or NaN can reach (REGPU_HYPER_PLAIN_MUL=5, Emitter::SmartMul).
+    // Only then, so the preamble (and every cached shader) is unchanged otherwise.
+    static const bool smartMul = getenv("REGPU_HYPER_PLAIN_MUL") && atoi(getenv("REGPU_HYPER_PLAIN_MUL")) == 5;
+    if (smartMul)
+        h += "float4 MulP(float4 a, float4 b) { return a * b; }\nfloat MulP(float a, float b) { return a * b; }\n"
+             "float DotP(float4 a, float4 b) { return dot(a, b); }\n";
+    // Hyper (REGPU_HYPER_SWIZZLE_SEL=1, from the FM2 port: +12.8% on an HD 630): the fetch swizzle as a select chain
+    // instead of a dynamically indexed register (v[sel]), which Intel's compiler spills. Same result.
+    static const bool swizzleSel = getenv("REGPU_HYPER_SWIZZLE_SEL") && atoi(getenv("REGPU_HYPER_SWIZZLE_SEL")) != 0;
+    if (swizzleSel)
+    {
+        const std::string from = "r[c] = sel < 4u ? v[sel] : (sel == 5u ? 1.0 : 0.0);";
+        const std::string to = "r[c] = sel == 0u ? v.x : sel == 1u ? v.y : sel == 2u ? v.z : sel == 3u ? v.w : (sel == 5u ? 1.0 : 0.0);";
+        for (size_t at = h.find(from); at != std::string::npos; at = h.find(from, at + to.size()))
+            h.replace(at, from.size(), to);
+    }
+    return h;
 }
 } // namespace
 
@@ -1485,7 +1547,21 @@ TranslatedShader TranslateShader(const Shader& shader)
         result.error = "no end of program";
         return result;
     }
+    // Hyper's smart multiplies: a first pass finds every register an infinity may reach; the real pass starts with
+    // all of them tainted (loops, branches).
+    uint64_t seedTaint = 0;
+    bool seedPs = false;
+    if (shader.pixel && Emitter::SmartMul())
+    {
+        TranslatedShader scratch;
+        Emitter pre{ shader, shader.pixel, {}, {}, scratch };
+        pre.EmitProgram();
+        seedTaint = pre.taint;
+        seedPs = pre.psTaint;
+    }
     Emitter e{ shader, shader.pixel, {}, {}, result };
+    e.taint = seedTaint;
+    e.psTaint = seedPs;
     e.EmitProgram();
     if (!e.error.empty())
     {
