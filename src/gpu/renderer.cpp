@@ -2938,11 +2938,36 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
 // surface (cleared: EDRAM content isn't kept that long by the titles seen so far). REGPU_KEEP_SURFACES=1 (live): keep.
 constexpr uint64_t kSurfaceIdleFrames = 3600; // (10 s at the 360 cap: loading screens run fast and came back to bases after 600)
 uint64_t SurfaceIdleFrames() { return kSurfaceIdleFrames; }
+// Under video memory pressure idle surfaces go sooner: after kSurfacePressureIdleFrames (the titles seen so far come back
+// to a base within ~600 frames, as above) once the process uses more than REGPU_SURFACE_PRESSURE (a fraction, default
+// 0.75; 0: never) of its memory budget (the device-local heaps; on an integrated GPU, all of them). At 4K 4x MSAA
+// FM3's menus and loading screens left ~6 GB of idle surfaces at their peak (11.7 GB in all, on D3D12 too): more than
+// an 8 GB card has.
+constexpr uint64_t kSurfacePressureIdleFrames = 600;
+bool SurfaceMemoryPressure()
+{
+    static const double fraction = getenv("REGPU_SURFACE_PRESSURE") ? atof(getenv("REGPU_SURFACE_PRESSURE")) : 0.75;
+    if (fraction <= 0 || !g_r.vkd)
+        return false;
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(g_r.vkd->allocator, budgets);
+    uint64_t use = 0, budget = 0;
+    for (uint32_t i = 0; i < g_r.vkd->memory.memoryHeapCount; i++)
+        if (g_r.vkd->uma || (g_r.vkd->memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
+            use += budgets[i].usage, budget += budgets[i].budget;
+    return budget && double(use) > fraction * double(budget);
+}
 void EvictSurfaces()
 {
     static LiveSwitch keep("REGPU_KEEP_SURFACES");
     if (keep || g_r.frame % 60)
         return;
+    const bool pressure = SurfaceMemoryPressure();
+    const uint64_t idleFrames = pressure ? kSurfacePressureIdleFrames : kSurfaceIdleFrames;
+    static bool pressureLogged = false;
+    if (pressure && !std::exchange(pressureLogged, true))
+        Log("renderer: video memory over the pressure mark (REGPU_SURFACE_PRESSURE): idle EDRAM surfaces go after %llu frames",
+            (unsigned long long)kSurfacePressureIdleFrames);
     std::lock_guard surfaceLock(g_surfaceMutex);
     for (int d = 0; d < 2; d++)
     {
@@ -2950,7 +2975,7 @@ void EvictSurfaces()
         const uint32_t bound = d ? C().depthBase : C().colorBase;
         for (auto it = map.begin(); it != map.end();)
         {
-            if (it->first != bound && it->second.lastFrame + kSurfaceIdleFrames < g_r.frame && !g_keptSurfaces.count({ d == 1, it->first }))
+            if (it->first != bound && it->second.lastFrame + idleFrames < g_r.frame && !g_keptSurfaces.count({ d == 1, it->first }))
             {
                 g_releasedSurfaces[{ d == 1, it->first }] = g_r.frame;
                 Log("renderer: EDRAM %s surface at base %03X released (unused for %llu frames)", d ? "depth" : "colour", it->first,
@@ -10786,6 +10811,8 @@ void Resolve()
         if (v == 0 && !noAliasedClear && clearRect.left == 0 && clearRect.top == 0 && clearRect.bottom >= LONG(PassHeight()))
             g_zeroedEdramBase = C().depthBase;
     }
+    if ((control >> 8) & 3)
+        PassMark("after resolve clear %u%u", (control >> 8) & 1, (control >> 9) & 1);
 }
 }
 
