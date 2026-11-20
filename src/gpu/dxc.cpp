@@ -125,9 +125,14 @@ HRESULT DxcCompileShader(const std::string& hlsl, bool pixel, ID3DBlob** code, s
         return v;
     }();
     // REGPU_DXC_SM (start-time): the shader model, e.g. 6_2 (with REGPU_DXC_ARGS="-denorm ftz") or 6_6; default 6_0.
+    // REGPU_HALF_REGS (hlsl.cpp, FM3 port session 43): 16-bit registers as real halves, which needs SM 6.2 and
+    // -enable-16bit-types (without it DXC treats min16float as 32-bit).
+    static const bool halfRegs = getenv("REGPU_HALF_REGS") && atoi(getenv("REGPU_HALF_REGS")) != 0;
     static const std::wstring smVer = [] {
         const char* e = getenv("REGPU_DXC_SM");
-        const std::string v = e && *e ? e : "6_0";
+        std::string v = e && *e ? e : "6_0";
+        if (halfRegs && v < "6_2")
+            v = "6_2";
         return std::wstring(v.begin(), v.end());
     }();
     const std::wstring profile = (pixel ? L"ps_" : L"vs_") + smVer;
@@ -138,6 +143,8 @@ HRESULT DxcCompileShader(const std::string& hlsl, bool pixel, ID3DBlob** code, s
     // instructions and VGPRs within 0.5%), but compiles faster: the slowest vertex shader 54 -> 20 s, pixel shaders ~15%.
     // REGPU_DXC_ARGS come after it, so an -O there wins. (Same cache files as -O3: the code is the same.)
     args.push_back(L"-O1");
+    if (halfRegs && pixel)
+        args.push_back(L"-enable-16bit-types");
     for (const std::wstring& a : extra)
         args.push_back(a.c_str());
     const DxcBuffer source{ hlsl.data(), hlsl.size(), DXC_CP_UTF8 };
