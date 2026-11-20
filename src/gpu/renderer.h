@@ -48,6 +48,11 @@ bool LongFramesOn();
 void RendererDrawThreadIdle(double ms);
 // True while REGPU_TRACE_DRAWS's frame is being recorded.
 bool RendererTracing();
+// Experimental GPU constants (renderer.cpp GpuConstants, REGPU_EXP_GPU_CONSTANTS, start-time): on; the ALU part of a
+// register run the draw thread applied; the register file replaced in bulk (a replay).
+bool RendererGpuConstantsOn();
+void RendererGpuConstantsLog(uint32_t index, const uint32_t* wordsBE, uint32_t count);
+void RendererGpuConstantsReset();
 
 // Parallel draw translation (gpu.cpp cuts the draw stream between resolves into pieces).
 #include <functional>

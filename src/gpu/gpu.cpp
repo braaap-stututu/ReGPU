@@ -769,6 +769,7 @@ void Append(const uint32_t* record, uint32_t words)
 void Replay()
 {
     memcpy(work::g_file.data(), g_startFile.data(), g_startFile.size());
+    RendererGpuConstantsReset();
     for (int t = 0; t < 2; t++)
         if (!g_startShader[t].empty())
             FrameOnShaderLoad(ShaderType(t), g_startShader[t].data(), uint32_t(g_startShader[t].size()), g_startShaderAddress[t]);
@@ -783,6 +784,8 @@ void Replay()
         {
         case work::kRegs:
             memcpy(work::g_file.data() + a[0] * 4, a + 1, size_t(words - 1) * 4);
+            if (RendererGpuConstantsOn())
+                RendererGpuConstantsLog(a[0], a + 1, words - 1);
             break;
         case work::kShader:
             FrameOnShaderLoad(ShaderType(a[0]), a + 3, a[2], a[1]);
@@ -818,6 +821,7 @@ void TripleAtSwap(uint32_t frontBuffer)
         }
     RendererSetTripleView(nullptr, false);
     memcpy(work::g_file.data(), g_endFile.data(), g_endFile.size());
+    RendererGpuConstantsReset();
     g_frames++;
     g_words += g_log.size();
     if (g_frames == 1 || g_frames % 3600 == 0)
@@ -855,6 +859,7 @@ void AtSwap(uint32_t frontBuffer)
     Replay();
     RendererSetStereoEye(0);
     memcpy(work::g_file.data(), g_endFile.data(), g_endFile.size()); // (the same values: the records ran in full)
+    RendererGpuConstantsReset();
     RendererStereoCaptureEye(1 - g_firstEye, frontBuffer);
     g_frames++;
     g_words += g_log.size();
@@ -872,11 +877,19 @@ namespace expstate
 {
 enum : uint32_t { kFetch = 1, kBoolLoop = 2, kOther = 4, kShader = 8 };
 uint32_t g_dirty = ~0u;
-uint64_t g_draws = 0, g_same = 0, g_by[16] = {}, g_frames = 0;
+uint64_t g_draws = 0, g_same = 0, g_by[16] = {}, g_frames = 0, g_aluWords = 0, g_aluRuns = 0, g_vsWords = 0;
 std::unordered_map<uint32_t, uint64_t> g_otherRegs; // register -> draws it broke (kOther only)
 void OnRegs(uint32_t index, uint32_t count)
 {
     const uint32_t end = index + count;
+    // ALU (float) constant words changed (X4: what a GPU-side constant log would carry instead of packed blocks).
+    if (const uint32_t a = std::max(index, gpureg::AluConstants), b = std::min(end, gpureg::FetchConstants); a < b)
+    {
+        g_aluWords += b - a;
+        g_aluRuns++;
+        if (a < gpureg::AluConstants + 256 * 4)
+            g_vsWords += std::min(b, gpureg::AluConstants + 256 * 4) - a;
+    }
     if (index < gpureg::AluConstants || end > gpureg::FetchConstants)
     {
         if (end > gpureg::FetchConstants && index < gpureg::BoolConstants)
@@ -924,6 +937,9 @@ void OnSwap()
         s += t;
     }
     Log("exp state: other registers written between draws (share of draws):%s", s.c_str());
+    Log("exp state: float constants changed between draws: %.0f bytes a draw (vertex %.0f, pixel %.0f) in %.1f runs",
+        4.0 * double(g_aluWords) / n, 4.0 * double(g_vsWords) / n, 4.0 * double(g_aluWords - g_vsWords) / n, double(g_aluRuns) / n);
+    g_aluWords = g_aluRuns = g_vsWords = 0;
     g_draws = g_same = 0;
     memset(g_by, 0, sizeof(g_by));
     g_otherRegs.clear();
@@ -934,6 +950,7 @@ void WorkerLoop()
 {
     SetThreadDescription(GetCurrentThread(), L"gpu draw worker");
     static LiveSwitch expTraceState("REGPU_EXP_TRACE_STATE");
+    const bool g_gpuConstantsLog = RendererGpuConstantsOn(); // (renderer.cpp GpuConstants: the draws' float constants on the GPU)
     // REGPU_DRAW_THREAD_PRIORITY=<Win32 level> (start-time; 1 above normal, 2 highest, 15 time critical): the draw thread
     // (and the replay thread, recorded_list.h) above the title's threads, which a port may map to "highest" (session 33
     // of the FM3 port: the 1% slowest frames at a frame cap, from the draw thread being pre-empted?).
@@ -974,6 +991,8 @@ void WorkerLoop()
             {
             case work::kRegs:
                 memcpy(work::g_file.data() + a[0] * 4, a + 1, size_t(words - 1) * 4);
+                if (g_gpuConstantsLog)
+                    RendererGpuConstantsLog(a[0], a + 1, words - 1);
                 if (expTraceState)
                     expstate::OnRegs(a[0], words - 1);
                 if (seg::g_open)
@@ -1945,6 +1964,7 @@ void CommandProcessorLoop(PPCContext& ctx)
     if (work::g_enabled)
     {
         memcpy(work::g_file.data(), gpureg::LiveFile(), work::g_file.size());
+        RendererGpuConstantsReset();
         memcpy(work::g_sent.data(), gpureg::LiveFile(), work::g_sent.size()); // (what the draw thread has)
         std::thread worker(WorkerLoop);
         static HANDLE workerHandle = nullptr;

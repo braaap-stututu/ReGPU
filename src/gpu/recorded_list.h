@@ -65,7 +65,11 @@ public:
     {
         Drain();
         m_real = real;
+        m_epoch++;
     }
+    // Bumped whenever recording moves to another real list (Rebind, HandOff to a next list, Switch, Reset): work that
+    // must stay inside one list (renderer.cpp GpuConstants groups) starts again when it changes.
+    uint64_t Epoch() const { return m_epoch; }
 
     // Hands the list over in order, without waiting: when the replay reaches this point, fn gets the real
     // list so far (to close and queue) and the replay goes on into next. With next null, fn is just called
@@ -77,6 +81,8 @@ public:
         struct A { ID3D12GraphicsCommandList* next; HandOffFn fn; void* ctx; } a{ next, fn, ctx };
         Put(kHandOff, &a, sizeof(a));
         Submit();
+        if (next)
+            m_epoch++;
     }
 
     // fn(real list, ctx) when the replay reaches this point; the replay goes on in the same list (unless fn closed it:
@@ -89,7 +95,11 @@ public:
     }
 
     // Records into another list from here on, without waiting (Rebind waits for the replay).
-    void Switch(ID3D12GraphicsCommandList* next) { Put(kSwitch, &next, sizeof(next)); }
+    void Switch(ID3D12GraphicsCommandList* next)
+    {
+        Put(kSwitch, &next, sizeof(next));
+        m_epoch++;
+    }
 
     // The real list, with everything recorded so far replayed into it.
     ID3D12GraphicsCommandList* Real()
@@ -124,6 +134,11 @@ public:
         Put(kComputeRoot32, &a, sizeof(a), data, n * 4);
     }
     void Dispatch(UINT x, UINT y, UINT z) { UINT a[3] = { x, y, z }; Put(kDispatch, a, sizeof(a)); }
+    void ExecuteIndirect(ID3D12CommandSignature* sig, UINT maxCount, ID3D12Resource* args, UINT64 argsOffset)
+    {
+        struct A { ID3D12CommandSignature* sig; UINT maxCount; ID3D12Resource* args; UINT64 offset; } a{ sig, maxCount, args, argsOffset };
+        Put(kExecuteIndirect, &a, sizeof(a));
+    }
     void SetComputeRootShaderResourceView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS v) { struct A { UINT i; D3D12_GPU_VIRTUAL_ADDRESS v; } a{ i, v }; Put(kComputeSrv, &a, sizeof(a)); }
     void SetComputeRootUnorderedAccessView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS v) { struct A { UINT i; D3D12_GPU_VIRTUAL_ADDRESS v; } a{ i, v }; Put(kComputeUav, &a, sizeof(a)); }
     void SetPredication(ID3D12Resource* r, UINT64 offset, D3D12_PREDICATION_OP op) { struct A { ID3D12Resource* r; UINT64 offset; D3D12_PREDICATION_OP op; } a{ r, offset, op }; Put(kPredication, &a, sizeof(a)); }
@@ -188,7 +203,11 @@ public:
     }
     // Close and Reset go straight to the real list after a drain.
     HRESULT Close() { return Real()->Close(); }
-    HRESULT Reset(ID3D12CommandAllocator* a, ID3D12PipelineState* p) { return Real()->Reset(a, p); }
+    HRESULT Reset(ID3D12CommandAllocator* a, ID3D12PipelineState* p)
+    {
+        m_epoch++;
+        return Real()->Reset(a, p);
+    }
 
 private:
     enum Op : uint32_t
@@ -196,11 +215,12 @@ private:
         kBarrier, kCopyTexture, kRootSignature, kTable, kCbv, kRoot32, kTargets, kPipeline, kViewports, kScissors, kStencilRef, kBlendFactor,
         kTopology, kHeaps, kDraw, kEndQuery, kResolveQuery, kClearRtv, kClearDsv, kCreateRtv, kCreateDsv, kDrawIndexed, kIndexBuffer, kCopyBuffer,
         kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch, kBeginQuery, kHandOff, kComputeSrv, kComputeUav, kPredication,
-        kCall, kSwitch, kResolveRegion
+        kCall, kSwitch, kResolveRegion, kExecuteIndirect
     };
     static constexpr size_t kChunk = 64 << 10;
 
     ID3D12GraphicsCommandList* m_real = nullptr;
+    uint64_t m_epoch = 0;
     bool m_direct = false;
     RecordBytes m_current;
     std::mutex m_mutex;
@@ -461,6 +481,13 @@ private:
             {
                 const UINT* d = reinterpret_cast<const UINT*>(a);
                 l->Dispatch(d[0], d[1], d[2]);
+                break;
+            }
+            case kExecuteIndirect:
+            {
+                struct A { ID3D12CommandSignature* sig; UINT maxCount; ID3D12Resource* args; UINT64 offset; };
+                const A& c = At<A>(a);
+                l->ExecuteIndirect(c.sig, c.maxCount, c.args, c.offset, nullptr, 0);
                 break;
             }
             case kCreateRtv:
