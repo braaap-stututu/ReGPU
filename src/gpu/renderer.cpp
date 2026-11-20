@@ -45,6 +45,15 @@
 #include "gpu/dlss.h"
 #include "gpu/fsr3.h"
 #include "gpu/recorded_list.h"
+// The Vulkan renderer's pieces (docs/vulkan-conversion-plan.md, step 6: renderer.cpp moves to them function by
+// function; the D3D12 includes above go once nothing uses them).
+#include "gpu/constants.h"
+#include "gpu/vk/bindings.h"
+#include "gpu/vk/device.h"
+#include "gpu/vk/pipelines.h"
+#include "gpu/vk/recorded.h"
+#include "gpu/vk/resources.h"
+#include "gpu/vk/vk_shader.h"
 #include "render/xr.h"
 #include "fsr1_cs.h"
 #include "postaa_cs.h"
@@ -866,6 +875,11 @@ struct ResolveDump
     uint64_t midCount = 0;
 };
 
+// REGPU_LEAN_FETCH's sampler table banks (D3D12), and the Vulkan set 0 per frame slot and bank: a change of texture
+// filtering (regpu::SetAnisotropy) goes to the next bank and the draws switch to it, so frames still in flight keep the
+// samplers they were recorded with.
+constexpr UINT kSamplerBanks = 4;
+
 struct FrameResources
 {
     ComPtr<ID3D12CommandAllocator> allocator;
@@ -889,6 +903,14 @@ struct FrameResources
     // Extra command lists of this frame (parallel draw pieces, main list continuations).
     std::vector<std::pair<ComPtr<ID3D12CommandAllocator>, ComPtr<ID3D12GraphicsCommandList>>> pool;
     size_t poolUsed = 0;
+
+    // Vulkan (docs/vulkan-conversion-plan.md, step 6: these replace the D3D12 members above, which go once unused).
+    VkCommandPool vkPool = VK_NULL_HANDLE;          // this slot's command buffers (reset when the slot is reused)
+    std::vector<VkCommandBuffer> vkBuffers;         // allocated from vkPool; vkBuffersUsed of them used this frame
+    size_t vkBuffersUsed = 0;
+    vk::Buffer vkRing;                              // the upload ring (ring / ringCpu / ringSize)
+    VkDescriptorSet vkSet0[kSamplerBanks] = {};     // set 0 over vkRing, guest memory and each sampler bank
+    uint64_t vkTimeline = 0;                        // the queue timeline value of this slot's last submission (fence)
 };
 
 // The pipeline this thread is handing to the driver compiler, named by RendererLogCrashContext if the driver faults.
@@ -1066,6 +1088,16 @@ struct Renderer
     uint64_t frame = 0;
     std::atomic<uint32_t> drawsThisFrame{ 0 }, skippedThisFrame{ 0 };
     bool ok = false;
+
+    // Vulkan (docs/vulkan-conversion-plan.md, step 6: these replace the D3D12 members above, which go once unused).
+    vk::Device* vkd = nullptr;                      // device / queue
+    vk::DrawBindings vkBindings;                    // rootSignature, motionRootSignature, srvHeap, samplerHeap
+    VkSampler vkSamplers[kSamplerBanks][vk::kSamplerCount] = {};
+    vk::Buffer vkPhysical;                          // physicalHeap + physical: guest physical memory in place (empty: copies)
+    vk::Buffer vkNullBuffer;                        // bound as gphys when guest memory isn't mapped
+    vk::RecordedList vkRecorder;                    // recorder
+    VkCommandBuffer vkMain = VK_NULL_HANDLE;        // realList
+    vk::Graveyard vkGraveyard;                      // FrameResources::garbage
 };
 
 Renderer g_r;
@@ -1074,7 +1106,6 @@ std::atomic<uint32_t> g_lastFrameDraws{ 0 }; // the debug server's status
 // REGPU_LEAN_FETCH's sampler table (Init): the eight samplers in banks. A change of texture filtering
 // (regpu::SetAnisotropy) is written into the next bank and the draws switch to it, so frames still in
 // flight keep reading the one they were recorded with.
-constexpr UINT kSamplerBanks = 4;
 D3D12_SAMPLER_DESC g_samplerBase[8]{};
 UINT g_samplerStride = 0;
 std::atomic<UINT> g_samplerBank{ 0 };
@@ -2683,6 +2714,73 @@ HRESULT SerializeRootSignatureFor(const D3D12_ROOT_SIGNATURE_DESC& rs, ComPtr<ID
     return D3D12SerializeVersionedRootSignature(&v, &blob, &error);
 }
 
+// The sampler anisotropy per slot (s0-s7) for a filtering setting: -1 as configured at start (s0 16x unless REGPU_NO_ANISO
+// or REGPU_ANISO_FROM_FETCH; s4-s7 2x/4x/8x/16x), 0 off, 1-16 for the surface samplers (s0, s4-s7): the D3D12 static
+// samplers and WriteSamplerBank.
+void SamplerAnisotropy(int aniso, int (&out)[vk::kSamplerCount])
+{
+    static LiveSwitch noAniso("REGPU_NO_ANISO");
+    for (uint32_t i = 0; i < vk::kSamplerCount; i++)
+        out[i] = i >= 4 ? int(2u << (i - 4)) : 0;
+    out[0] = noAniso || AnisoFromFetch() ? 0 : 16;
+    if (aniso >= 0)
+        for (uint32_t i : { 0u, 4u, 5u, 6u, 7u })
+            out[i] = std::clamp(aniso, 0, 16);
+}
+
+// The Vulkan half of Init (step 6 of the conversion): what Init makes on D3D12, made on Vulkan. Both exist until every
+// user of the D3D12 objects is converted.
+void InitVulkan()
+{
+    vk::Device& d = RenderVkDevice();
+    g_r.vkd = &d;
+    if (!vk::CreateDrawBindings(d, g_r.vkBindings, sizeof(gpu::VSConstants), sizeof(gpu::PSConstants), sizeof(gpu::VSConstants)))
+        Fatal("renderer: the graphics card can't hold ReGPU's bindless texture tables on Vulkan (see above)");
+    for (UINT bank = 0; bank < kSamplerBanks; bank++)
+    {
+        int aniso[vk::kSamplerCount];
+        SamplerAnisotropy(-1, aniso);
+        vk::CreateSamplers(d, aniso, g_r.vkSamplers[bank]);
+    }
+
+    // Guest physical memory in place (D3D12's heap over the same view, MapGuestMemory): the shaders read vertex and index
+    // data where the game wrote it. Without VK_EXT_external_memory_host, the copy path (as when D3D12 can't open it).
+    g_r.vkPhysical = vk::ImportHostMemory(d, HeapViewAddress(), 0x20000000,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        "guest physical memory");
+    Log("renderer: Vulkan: guest physical memory %s", g_r.vkPhysical ? "read in place (host memory import)" : "copied (no host memory import)");
+    g_r.vkNullBuffer = vk::CreateBuffer(d, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vk::Memory::Device, "null buffer");
+    const vk::Buffer& guest = g_r.vkPhysical ? g_r.vkPhysical : g_r.vkNullBuffer;
+
+    const VkBufferUsageFlags ringUsage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    for (UINT i = 0; i < kFrames; i++)
+    {
+        FrameResources& f = g_r.frames[i];
+        VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        pci.queueFamilyIndex = d.queueFamily;
+        vk::Check(vkCreateCommandPool(d.device, &pci, nullptr, &f.vkPool), "vkCreateCommandPool");
+        f.vkRing = vk::CreateBuffer(d, kRingSize, ringUsage, vk::Memory::Upload, "upload ring");
+        if (!f.vkRing)
+            Fatal("renderer: no memory for the %llu MB upload ring", (unsigned long long)(kRingSize >> 20));
+        for (UINT bank = 0; bank < kSamplerBanks; bank++)
+            f.vkSet0[bank] = vk::CreateSet0(d, g_r.vkBindings, f.vkRing.buffer, f.vkRing.size, guest.buffer, guest.size, g_r.vkSamplers[bank]);
+    }
+    // The main command buffer, from slot 0 (realList), recorded through vkRecorder.
+    VkCommandBufferAllocateInfo ai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    ai.commandPool = g_r.frames[0].vkPool;
+    ai.commandBufferCount = 1;
+    vk::Check(vkAllocateCommandBuffers(d.device, &ai, &g_r.vkMain), "vkAllocateCommandBuffers");
+    g_r.frames[0].vkBuffers.push_back(g_r.vkMain);
+    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vk::Check(vkBeginCommandBuffer(g_r.vkMain, &bi), "vkBeginCommandBuffer");
+    g_r.frames[0].vkBuffersUsed = 1;
+    g_r.vkRecorder.Init(g_r.vkMain);
+    Log("renderer: Vulkan objects ready (%u frame slots, %llu MB upload ring each)", kFrames, (unsigned long long)(kRingSize >> 20));
+}
+
 void Init()
 {
     g_r.device = RenderDevice();
@@ -2931,6 +3029,7 @@ void Init()
     g_mainContext.list = &g_r.recorder;
     Check(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_r.fence)), "CreateFence");
     g_r.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    InitVulkan();
     PresenterUseRenderer();
     g_r.ok = true;
     Log("renderer: D3D12 renderer ready");

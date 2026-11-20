@@ -65,9 +65,60 @@ Buffer CreateBuffer(Device& d, VkDeviceSize size, VkBufferUsageFlags usage, Memo
 
 void Destroy(Device& d, Buffer& b)
 {
-    if (b.buffer)
+    if (b.imported)
+    {
+        vkDestroyBuffer(d.device, b.buffer, nullptr);
+        vkFreeMemory(d.device, b.imported, nullptr);
+    }
+    else if (b.buffer)
         vmaDestroyBuffer(d.allocator, b.buffer, b.allocation);
     b = {};
+}
+
+Buffer ImportHostMemory(Device& d, void* host, VkDeviceSize size, VkBufferUsageFlags usage, const char* name)
+{
+    if (!d.externalMemoryHost || !d.hostPointerAlignment || (uintptr_t(host) | size) % d.hostPointerAlignment)
+        return {};
+    VkMemoryHostPointerPropertiesEXT props{ VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
+    if (vkGetMemoryHostPointerPropertiesEXT(d.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &props) != VK_SUCCESS ||
+        !props.memoryTypeBits)
+        return {};
+    Buffer b;
+    VkExternalMemoryBufferCreateInfo external{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+    external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    VkBufferCreateInfo ci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    ci.pNext = &external;
+    ci.size = size;
+    ci.usage = usage;
+    if (vkCreateBuffer(d.device, &ci, nullptr, &b.buffer) != VK_SUCCESS)
+        return {};
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(d.device, b.buffer, &req);
+    // A host-visible type the pointer allows (the import is the host's memory: never device-local).
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < d.memory.memoryTypeCount && type == UINT32_MAX; i++)
+        if ((props.memoryTypeBits & req.memoryTypeBits & (1u << i)) && (d.memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+            type = i;
+    VkImportMemoryHostPointerInfoEXT import{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT };
+    import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    import.pHostPointer = host;
+    VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    ai.pNext = &import;
+    ai.allocationSize = size;
+    ai.memoryTypeIndex = type;
+    if (type == UINT32_MAX || vkAllocateMemory(d.device, &ai, nullptr, &b.imported) != VK_SUCCESS ||
+        vkBindBufferMemory(d.device, b.buffer, b.imported, 0) != VK_SUCCESS)
+    {
+        if (b.imported)
+            vkFreeMemory(d.device, b.imported, nullptr);
+        vkDestroyBuffer(d.device, b.buffer, nullptr);
+        return {};
+    }
+    b.size = size;
+    b.mapped = static_cast<uint8_t*>(host);
+    if (name)
+        SetName(d, VK_OBJECT_TYPE_BUFFER, uint64_t(b.buffer), name);
+    return b;
 }
 
 namespace

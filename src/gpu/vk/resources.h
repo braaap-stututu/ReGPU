@@ -36,11 +36,16 @@ struct Buffer
     uint8_t* mapped = nullptr; // host-visible memories stay mapped
     VkDeviceSize size = 0;
     bool inVram = false;       // UploadVram that got device-local memory
+    VkDeviceMemory imported = VK_NULL_HANDLE; // ImportHostMemory's memory (allocation is null then)
     explicit operator bool() const { return buffer != VK_NULL_HANDLE; }
 };
 
 Buffer CreateBuffer(Device& d, VkDeviceSize size, VkBufferUsageFlags usage, Memory memory, const char* name = nullptr);
 void Destroy(Device& d, Buffer& b);
+// A buffer over existing host memory (VK_EXT_external_memory_host; D3D12's OpenExistingHeapFromAddress): the GPU reads
+// and writes `host` in place. `host` and `size` must be aligned to Device::hostPointerAlignment. An empty Buffer when the
+// device can't import it (the caller copies instead). Not owned: Destroy frees the import, not the memory.
+Buffer ImportHostMemory(Device& d, void* host, VkDeviceSize size, VkBufferUsageFlags usage, const char* name = nullptr);
 
 // The last use of an image (or of the subresources Transition covered): what the next barrier waits on.
 struct ImageState
