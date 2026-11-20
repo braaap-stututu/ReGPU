@@ -103,6 +103,7 @@ void BumpPassEpoch() { g_passEpoch.fetch_add(1, std::memory_order_relaxed); }
 uint32_t OutputWidth();
 uint32_t DumpWidth() { return ::TripleMode() ? OutputWidth() * 3 : OutputWidth(); }
 uint32_t g_dumpWidth = 0; // the last shot's (set where it is copied)
+uint32_t g_dumpHeight = 0; // ... and height (a front buffer smaller than the output: PGR3's 1024x600 races)
 
 void LoadOutputSize()
 {
@@ -17126,8 +17127,14 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     ID3D12Resource* image = C().color.Get();
     D3D12_RESOURCE_STATES imageState = D3D12_RESOURCE_STATE_COPY_SOURCE;
     auto it = g_r.resolved.find(frontBuffer);
-    const bool fromResolve = it != g_r.resolved.end() && it->second.width == kWidth && it->second.height == kHeight &&
-        it->second.format == DXGI_FORMAT_R8G8B8A8_UNORM;
+    // The console's display scaler takes a front buffer of any size up to the output (PGR3's races resolve a 1024x600
+    // front buffer; its menus are 1280x720). Only the exact output size was accepted before, so a smaller front buffer
+    // was never presented and the window kept the last menu frame. A smaller one is shown at its own size, centred
+    // (the presenter's letterbox path); not yet scaled up. REGPU_FRONT_BUFFER_EXACT=1 (live): only 1280x720, as before.
+    static LiveSwitch frontExact("REGPU_FRONT_BUFFER_EXACT");
+    const bool frontFound = it != g_r.resolved.end() && it->second.format == DXGI_FORMAT_R8G8B8A8_UNORM;
+    const bool frontFullSize = frontFound && it->second.width == kWidth && it->second.height == kHeight;
+    const bool fromResolve = frontFound && (frontFullSize || (!frontExact && it->second.width <= kWidth && it->second.height <= kHeight));
     ID3D12Resource* graded = nullptr; // the front buffer through the display's gamma table
     GradeJob* gradeJob = nullptr;     // ... graded straight into the back buffer at the frame end
     if (fromResolve)
@@ -17137,7 +17144,9 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         GradeJob& job = g_gradeJobs[g_r.frameIndex];
         job.valid = false;
         // (Supersampling grades into a texture first: the downsample reads it.)
-        graded = GradeFrontBuffer(image, it->second.guestFormat == 7, gammaCopy || GetSettings().enhance || GetSettings().ssaa > 1.0f || TripleMode() ? nullptr : &job);
+        // (A smaller front buffer is graded into its own image: grading straight into the back buffer needs equal sizes.)
+        graded = GradeFrontBuffer(image, it->second.guestFormat == 7,
+            gammaCopy || GetSettings().enhance || GetSettings().ssaa > 1.0f || TripleMode() || !frontFullSize ? nullptr : &job);
         if (job.valid)
             gradeJob = &job;
         D3D12_RESOURCE_BARRIER b{};
@@ -17286,8 +17295,11 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         // (Triple screen: the shown picture is three screens wide; a frame drawn once is one.)
         g_dumpWidth = UINT(std::min<UINT64>(src.pResource->GetDesc().Width, DumpWidth()));
-        dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, g_dumpWidth, OutputHeight(), 1, (g_dumpWidth * 4 + 255) & ~255u };
-        const D3D12_BOX box{ 0, 0, 0, g_dumpWidth, OutputHeight(), 1 };
+        // (A smaller front buffer: copied at its own height; a box past its bottom made the copy invalid and the shot
+        // read an unmapped buffer.)
+        g_dumpHeight = UINT(std::min<UINT64>(src.pResource->GetDesc().Height, OutputHeight()));
+        dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, g_dumpWidth, g_dumpHeight, 1, (g_dumpWidth * 4 + 255) & ~255u };
+        const D3D12_BOX box{ 0, 0, 0, g_dumpWidth, g_dumpHeight, 1 };
         C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
     }
     // REGPU_DUMP_RESOLVES=1 (with REGPU_DUMP_FRAME): also write every resolved texture to out/res.
@@ -17501,13 +17513,20 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         }
         resolveDumps.clear();
         uint8_t* data = nullptr;
-        g_r.readback->Map(0, nullptr, reinterpret_cast<void**>(&data));
+        if (FAILED(g_r.readback->Map(0, nullptr, reinterpret_cast<void**>(&data))) || !data)
+        {
+            Log("dump: the readback buffer could not be mapped; no shot this frame");
+            data = nullptr;
+        }
         // Written at the render size; the region probes below work on a 1280x720 copy.
-        const uint32_t dw = g_dumpWidth ? g_dumpWidth : OutputWidth(), dh = OutputHeight(), dpitch = (dw * 4 + 255) & ~255u;
+        const uint32_t dw = g_dumpWidth ? g_dumpWidth : OutputWidth(), dh = g_dumpHeight ? g_dumpHeight : OutputHeight(), dpitch = (dw * 4 + 255) & ~255u;
         std::vector<uint8_t> full(size_t(dw) * dh * 4);
-        for (uint32_t y = 0; y < dh; y++)
-            memcpy(&full[size_t(y) * dw * 4], data + size_t(y) * dpitch, size_t(dw) * 4);
-        g_r.readback->Unmap(0, nullptr);
+        if (data)
+        {
+            for (uint32_t y = 0; y < dh; y++)
+                memcpy(&full[size_t(y) * dw * 4], data + size_t(y) * dpitch, size_t(dw) * 4);
+            g_r.readback->Unmap(0, nullptr);
+        }
         for (size_t i = 3; i < full.size(); i += 4)
             full[i] = 255;
         std::vector<uint8_t> rgba(size_t(kWidth) * kHeight * 4);
