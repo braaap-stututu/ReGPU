@@ -5,6 +5,7 @@
 #include "live_switch.h"
 
 #include <cstdio>
+#include <cstring>
 
 namespace
 {
@@ -786,7 +787,12 @@ struct Emitter
                 : "float3(" + reg + comp[f.srcSwizzle & 3] + ", " + reg + comp[(f.srcSwizzle >> 2) & 3] + ", " + reg +
                 comp[(f.srcSwizzle >> 4) & 3] + ")";
             char call[320];
-            if (LeanFetch() && pixel && f.dimension == 1)
+            static const bool noOverrideLean = getenv("REGPU_NO_FETCH_FILTER_OVERRIDE") != nullptr;
+            if (LeanFetchLevel() >= 2 && pixel && f.dimension == 1)
+                snprintf(call, sizeof(call), "TFetch2DV2(%u, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f), %d)", f.constIndex, uv.c_str(),
+                    f.denormalized ? "true" : "false", f.lodBias, f.constIndex, f.offsetX, f.offsetY,
+                    !noOverrideLean && (f.magFilter == 0 || f.magFilter == 1) ? int(f.magFilter) : -1);
+            else if (LeanFetch() && pixel && f.dimension == 1)
                 snprintf(call, sizeof(call), "TFetch2D(%u, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
                     f.denormalized ? "true" : "false", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
             else
@@ -1131,11 +1137,88 @@ float4 TFetch2D(uint slot, float3 coord, bool denorm, float bias, float2 texel)
     }
     return r;
 }
+
+// REGPU_LEAN_FETCH=2: what the fetch constant asks for is worked out on the CPU (renderer.cpp, tinfo.x bit 7:
+// a plain texture: no mirror, border, single-axis clamp, 16-bit fixed conversion, gamma, exponent, shader
+// swizzle or declared sub-image), and such a fetch is one sample. The instruction's own filter (filt: 0
+// point, 1 linear, -1 the constant's) is a literal, as the full path applies it. The same results.
+float4 TFetch2DV2(uint slot, float3 coord, bool denorm, float bias, float2 texel, int filt)
+{
+    const uint info = tinfo[slot].x;
+    if (info & 128u)
+    {
+        uint mode = info & 3u;
+        if (filt >= 0)
+        {
+            const bool wrap = mode == 0u || mode == 3u;
+            mode = filt == 0 ? (wrap ? 3u : 2u) : (wrap ? 0u : 1u);
+        }
+        const uint aniso = (info >> 20) & 7u;
+        const uint s = mode != 0u ? mode : (aniso >= 1u && aniso <= 4u ? aniso + 3u : 0u);
+        float2 uv = coord.xy;
+        if (denorm || any(texel != 0.0))
+        {
+            const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
+            uv = denorm ? (uv + texel) / texelSize : uv + texel / texelSize;
+        }
+        return gtex[asuint(tbias[slot].y)].SampleBias(gsamp[s], uv, bias);
+    }
+    return TFetch2D(slot, coord, denorm, bias, texel);
+}
 )";
+
+// Variants swapped into the preamble only when their switch is on, so shaders cached without them stay valid.
+// REGPU_LEAN_VFETCH (LeanVertexFetch): only the dwords the format holds are loaded (each load bounds-checked and
+// byte-swapped); the others are 0, which Unpack never reads. The same values.
+const char kOrigVFetch[] = R"(float4 VFetch(uint fetch, float index, uint stride, uint offset, uint format, bool isSigned, bool norm)
+{
+    uint d = uint(max(index, 0.0)) * stride + offset; // index already rounded or floored
+    return Unpack(LoadGuest(fetch, d), LoadGuest(fetch, d + 1), LoadGuest(fetch, d + 2), LoadGuest(fetch, d + 3), format, isSigned, norm);
+})";
+const char kLeanVFetch[] = R"(uint VDwords(uint format)
+{
+    return (format == 26u || format == 32u || format == 34u || format == 37u) ? 2u : (format == 57u ? 3u : ((format == 35u || format == 38u) ? 4u : 1u));
+}
+float4 VFetch(uint fetch, float index, uint stride, uint offset, uint format, bool isSigned, bool norm)
+{
+    uint d = uint(max(index, 0.0)) * stride + offset; // index already rounded or floored
+    const uint n = VDwords(format);
+    const uint w0 = LoadGuest(fetch, d);
+    const uint w1 = n > 1u ? LoadGuest(fetch, d + 1) : 0u;
+    const uint w2 = n > 2u ? LoadGuest(fetch, d + 2) : 0u;
+    const uint w3 = n > 3u ? LoadGuest(fetch, d + 3) : 0u;
+    return Unpack(w0, w1, w2, w3, format, isSigned, norm);
+})";
+// REGPU_PLAIN_MUL_PS (PlainMulPixel): pixel shaders multiply as IEEE does (0 x inf = NaN), one instruction instead
+// of two compares and a select. Vertex shaders keep D3D9's rule: there an infinite or NaN term switched off by a
+// zero weight lands in positions (a HUD garbled when both stages did it).
+const char kOrigMul[] = R"(float4 Mul9(float4 a, float4 b) { return (a == 0 || b == 0) ? 0 : a * b; }
+float Mul9(float a, float b) { return (a == 0 || b == 0) ? 0 : a * b; }
+float Dot9(float4 a, float4 b) { float4 m = Mul9(a, b); return m.x + m.y + m.z + m.w; })";
+const char kPlainMul[] = R"(#ifndef REGPU_VERTEX_STAGE
+float4 Mul9(float4 a, float4 b) { return a * b; }
+float Mul9(float a, float b) { return a * b; }
+float Dot9(float4 a, float4 b) { return dot(a, b); }
+#else
+float4 Mul9(float4 a, float4 b) { return (a == 0 || b == 0) ? 0 : a * b; }
+float Mul9(float a, float b) { return (a == 0 || b == 0) ? 0 : a * b; }
+float Dot9(float4 a, float4 b) { float4 m = Mul9(a, b); return m.x + m.y + m.z + m.w; }
+#endif)";
+
+void ReplaceOnce(std::string& h, const char* from, const char* to)
+{
+    const size_t at = h.find(from);
+    if (at != std::string::npos)
+        h.replace(at, strlen(from), to);
+}
 
 std::string Preamble()
 {
     std::string h = kPreamble;
+    if (LeanVertexFetch())
+        ReplaceOnce(h, kOrigVFetch, kLeanVFetch);
+    if (PlainMulPixel())
+        ReplaceOnce(h, kOrigMul, kPlainMul);
     return LeanFetch() ? h + kLeanFetch : h;
 }
 } // namespace
@@ -1143,8 +1226,41 @@ std::string Preamble()
 // Read at first use (the renderer's root signature), not at load: a port may set it before Start.
 bool LeanFetch()
 {
-    static const bool lean = getenv("REGPU_LEAN_FETCH") != nullptr;
+    return LeanFetchLevel() >= 1;
+}
+
+// REGPU_LEAN_FETCH=<n>: 1 the lean 2D fetch, 2 also its plain-texture fast path (TFetch2DV2); empty or
+// any other value: 1, "0": off. Read once, at the first translation.
+int LeanFetchLevel()
+{
+    static const int level = [] {
+        const char* v = getenv("REGPU_LEAN_FETCH");
+        if (!v || strcmp(v, "0") == 0)
+            return 0;
+        return atoi(v) >= 2 ? 2 : 1;
+    }();
+    return level;
+}
+
+namespace
+{
+bool EnvOn(const char* name)
+{
+    const char* v = getenv(name);
+    return v && *v && strcmp(v, "0") != 0;
+}
+} // namespace
+
+bool LeanVertexFetch()
+{
+    static const bool lean = EnvOn("REGPU_LEAN_VFETCH");
     return lean;
+}
+
+bool PlainMulPixel()
+{
+    static const bool plain = EnvOn("REGPU_PLAIN_MUL_PS");
+    return plain;
 }
 
 bool BakedVertexFetch()
