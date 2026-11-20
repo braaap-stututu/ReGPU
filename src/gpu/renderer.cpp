@@ -348,6 +348,11 @@ UINT64 kRingSize = 64ull << 20;
 constexpr UINT64 kRingMax = 2048ull << 20;
 std::atomic<UINT64> g_ringWant{ 0 };
 UINT64 g_ringPeak = 0;
+// What each ring allocation holds (REGPU_TRACE_RING_KINDS).
+enum RingKind { RingOther, RingConstants, RingIndexList, RingVertexUpload, RingVertexArena, RingIndexBuffer, RingTexture, kRingKinds };
+std::atomic<uint64_t> g_ringKindBytes[kRingKinds], g_ringKindCount[kRingKinds];
+bool g_traceRingKinds = false; // REGPU_TRACE_RING_KINDS, read at each frame start (the counts cost ~2% of the draw thread)
+UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256, RingKind kind = RingOther);
 constexpr UINT kDescriptorsPerFrame = 8192; // per frame: ring + guest memory views, then resolve-blit views
 constexpr UINT kBindless = 1u << 16;      // permanent texture descriptors (0 null 2D, 1 null cube)
 constexpr UINT kBindlessBase = kDescriptorsPerFrame * 3;
@@ -2422,6 +2427,8 @@ LiveSwitch g_sw_REGPU_OLD_CLEAR_SHIFT("REGPU_OLD_CLEAR_SHIFT");
 LiveSwitch g_sw_REGPU_TEXTURE_CHECK_EVERY4("REGPU_TEXTURE_CHECK_EVERY4");
 LiveSwitch g_sw_REGPU_TEXTURE_CHECK_STAGGER("REGPU_TEXTURE_CHECK_STAGGER");
 LiveSwitch g_sw_REGPU_TRACE_CONSTANTS_USED("REGPU_TRACE_CONSTANTS_USED");
+LiveSwitch g_sw_REGPU_CONSTANT_REUSE("REGPU_CONSTANT_REUSE");
+LiveSwitch g_sw_REGPU_TRACE_CONSTANT_BYTES("REGPU_TRACE_CONSTANT_BYTES");
 LiveSwitch g_sw_REGPU_TRACE_MIDSIZE("REGPU_TRACE_MIDSIZE");
 LiveSwitch g_sw_REGPU_TRACE_TEXCHANGE("REGPU_TRACE_TEXCHANGE");
 LiveSwitch g_sw_REGPU_TRACE_TILES("REGPU_TRACE_TILES");
@@ -2750,6 +2757,27 @@ void BeginFrameIfNeeded()
     PassMark("frame start %u%u", 0, 0);
     if (perf && g_timestamps)
         C().list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2);
+    // REGPU_TRACE_RING_KINDS: what fills the upload ring, KB a frame by kind (RingKind), every 120 frames.
+    static LiveSwitch traceKinds("REGPU_TRACE_RING_KINDS");
+    g_traceRingKinds = traceKinds;
+    if (g_traceRingKinds)
+    {
+        static uint64_t lastFrame = 0;
+        if (g_r.frame >= lastFrame + 120)
+        {
+            const double frames = double(g_r.frame - lastFrame);
+            lastFrame = g_r.frame;
+            uint64_t k[kRingKinds], n[kRingKinds];
+            for (int i = 0; i < kRingKinds; i++)
+                k[i] = g_ringKindBytes[i].exchange(0), n[i] = g_ringKindCount[i].exchange(0);
+            Log("ring kinds (KB a frame / allocations a frame): constants %.0f/%.0f, index lists %.0f/%.0f, vertex uploads %.0f/%.0f, vertex arena %.0f/%.0f, "
+                "index buffers %.0f/%.0f, textures %.0f/%.0f, other %.0f/%.0f",
+                k[RingConstants] / 1024.0 / frames, n[RingConstants] / frames, k[RingIndexList] / 1024.0 / frames, n[RingIndexList] / frames,
+                k[RingVertexUpload] / 1024.0 / frames, n[RingVertexUpload] / frames, k[RingVertexArena] / 1024.0 / frames, n[RingVertexArena] / frames,
+                k[RingIndexBuffer] / 1024.0 / frames, n[RingIndexBuffer] / frames, k[RingTexture] / 1024.0 / frames, n[RingTexture] / frames,
+                k[RingOther] / 1024.0 / frames, n[RingOther] / frames);
+        }
+    }
     if (const UINT64 used = f.ringUsed.load(); used > g_ringPeak)
     {
         g_ringPeak = used;
@@ -2818,8 +2846,13 @@ void BeginFrameIfNeeded()
 }
 
 // Allocates from the frame's upload ring; returns the offset (or ~0).
-UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256)
+UINT64 RingAlloc(UINT64 bytes, UINT64 alignment, RingKind kind)
 {
+    if (g_traceRingKinds)
+    {
+        g_ringKindBytes[kind].fetch_add(bytes, std::memory_order_relaxed);
+        g_ringKindCount[kind].fetch_add(1, std::memory_order_relaxed);
+    }
     FrameResources& f = Frame();
     UINT64 used = f.ringUsed.load(std::memory_order_relaxed), offset;
     for (;;)
@@ -3011,7 +3044,7 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
         static std::atomic<uint32_t> logged{ 0 };
         if (logged++ < 8)
             Log("upload: %08X (%u bytes) is not all readable guest memory: %zu bytes copied, zeros after", guest, bytes, readable);
-        const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16);
+        const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16, RingVertexUpload);
         if (offset != ~0ull)
         {
             memcpy(f.ringCpu + offset, src, readable);
@@ -3128,7 +3161,7 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
     if (g_perfTiming) g_uploadStats.copied += bytes;
     if (RendererTracing() && bytes > (16u << 10))
         Log("upload: %08X %u bytes (ring %llu)", guest, bytes, (unsigned long long)f.ringUsed.load());
-    const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16);
+    const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16, RingVertexUpload);
     if (offset == ~0ull)
         return offset;
     memcpy(f.ringCpu + offset, src, bytes);
@@ -3371,7 +3404,7 @@ uint64_t VertexCacheLocked(uint32_t address, uint32_t bytes, bool& arenaHit)
         arena.hits++;
         return e.offset;
     }
-    const UINT64 offset = RingAlloc((bytes + 15) & ~15u, 16);
+    const UINT64 offset = RingAlloc((bytes + 15) & ~15u, 16, RingVertexArena);
     if (offset == ~0ull)
     {
         e.checkedFrame = ~0ull; // not staged: checked again next time
@@ -3554,7 +3587,7 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
         g_indexChanging = !checkOnce;
     }
     // Swap into the upload ring (as the vertex shader would read them), then copy.
-    const UINT64 offset = RingAlloc((bytes + 15) & ~15u, 16);
+    const UINT64 offset = RingAlloc((bytes + 15) & ~15u, 16, RingIndexBuffer);
     if (offset == ~0ull)
         return false;
     uint8_t* dst = Frame().ringCpu + offset;
@@ -5461,7 +5494,7 @@ ID3D12Resource* GetVolumeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     if (!DecodeTexture3D(fetch, rgba))
         return nullptr;
     const UINT rowPitch = (w * 4 + 255) & ~255u;
-    const UINT64 offset = RingAlloc(UINT64(rowPitch) * h * d, 512);
+    const UINT64 offset = RingAlloc(UINT64(rowPitch) * h * d, 512, RingTexture);
     if (offset == ~0ull)
     {
         NoteTextureFailure("upload ring full (3D)", fetch);
@@ -5660,7 +5693,7 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             return cached.resource.Get();
         const UINT rowPitch = (w * 4 + 255) & ~255u;
         const UINT64 faceBytes = (UINT64(rowPitch) * h + 511) & ~511ull;
-        const UINT64 offset = RingAlloc(faceBytes * 6 * 2, 512); // all levels fit in twice level 0
+        const UINT64 offset = RingAlloc(faceBytes * 6 * 2, 512, RingTexture); // all levels fit in twice level 0
         if (offset == ~0ull)
             return nullptr;
         C().list->ResourceBarrier(1, &b);
@@ -6105,7 +6138,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         {
             const uint32_t lw = levels[l].Width(), lh = levels[l].Height();
             const UINT rowPitch = (((lw + bs - 1) / bs) * blockBytes + 255) & ~255u;
-            const UINT64 offset = RingAlloc(UINT64(rowPitch) * ((lh + bs - 1) / bs), 512);
+            const UINT64 offset = RingAlloc(UINT64(rowPitch) * ((lh + bs - 1) / bs), 512, RingTexture);
             if (offset == ~0ull)
             {
                 NoteTextureFailure("upload ring full (compressed)", fetch);
@@ -6195,7 +6228,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         }
         const uint32_t lw = levels[l].Width(), lh = levels[l].Height();
         const UINT rowPitch = (lw * 4 + 255) & ~255u;
-        const UINT64 offset = RingAlloc(UINT64(rowPitch) * lh, 512);
+        const UINT64 offset = RingAlloc(UINT64(rowPitch) * lh, 512, RingTexture);
         if (offset == ~0ull)
         {
             NoteTextureFailure("upload ring full", fetch);
@@ -11151,7 +11184,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         if (indexEntry->frame != g_r.frame)
         {
-            indexEntry->offset = RingAlloc(list.size() * 4, 16);
+            indexEntry->offset = RingAlloc(list.size() * 4, 16, RingIndexList);
             if (indexEntry->offset != ~0ull)
             {
                 memcpy(f.ringCpu + indexEntry->offset, list.data(), list.size() * 4);
@@ -11194,7 +11227,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         uint32_t tinfo[32][4];
         float tbias[32][4];
     };
-    const UINT64 vsOffset = RingAlloc(sizeof(VSConstants)), psOffset = RingAlloc(sizeof(PSConstants));
+    UINT64 vsOffset = RingAlloc(sizeof(VSConstants), 256, RingConstants), psOffset = RingAlloc(sizeof(PSConstants), 256, RingConstants);
     if (vsOffset == ~0ull || psOffset == ~0ull)
     {
         TraceSkip("ring full", initiator);
@@ -11207,22 +11240,48 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // frame and reading back is slower still.
     auto* vcRing = reinterpret_cast<VSConstants*>(f.ringCpu + vsOffset);
     auto* pcRing = reinterpret_cast<PSConstants*>(f.ringCpu + psOffset);
-    thread_local VSConstants vcStage;
-    thread_local PSConstants pcStage;
+    // Two stages per thread, used in turn while blocks are compared (REGPU_CONSTANT_REUSE): the other
+    // one holds the previous draw's blocks.
+    thread_local VSConstants vcStages[2];
+    thread_local PSConstants pcStages[2];
+    thread_local uint32_t stageParity = 0;
+    // The previous draw's blocks in the ring (REGPU_CONSTANT_REUSE): valid within one frame's ring.
+    struct ConstantReuse
+    {
+        const uint8_t* ring = nullptr;
+        uint64_t frame = ~0ull;
+        const CompiledShader* vs = nullptr;
+        const CompiledShader* ps = nullptr;
+        uint32_t psSlots = 0, parity = 0;
+        UINT64 vsOffset = 0, psOffset = 0;
+    };
+    thread_local ConstantReuse lastBlocks;
     // Not in low performance mode (Config::lowPerformance): on an old CPU (FM2 on an FX-8350) the
     // block copies cost more than the scattered writes they replace. REGPU_CONSTANTS_IN_RING=1 too.
     LiveSwitch &inRingSwitch = g_sw_REGPU_CONSTANTS_IN_RING;
     const bool inRing = inRingSwitch || regpu::GetConfig().lowPerformance;
-    auto* vc = inRing ? vcRing : &vcStage;
-    auto* pc = inRing ? pcRing : &pcStage;
     const bool hooked = regpu::GetHost().onDraw && (vs.tag || ps.tag); // onDraw reads and writes vc->c
+    // REGPU_CONSTANT_REUSE: a draw whose vertex (or pixel) block is byte-identical to the previous
+    // draw's, over everything its shader reads, binds the previous draw's copy in the ring and writes
+    // nothing. Not for hooked or motion draws, a traced frame, or the A/B block modes.
+    // REGPU_TRACE_CONSTANT_BYTES: logs bytes written and how many blocks repeat (with reuse off too).
+    LiveSwitch &reuseSwitch = g_sw_REGPU_CONSTANT_REUSE;
+    LiveSwitch &traceBytes = g_sw_REGPU_TRACE_CONSTANT_BYTES;
+    const bool compareBlocks = (reuseSwitch || traceBytes) && !inRing && !hooked && !motion && !g_sw_REGPU_FULL_CONSTANT_BLOCKS &&
+                               !g_sw_REGPU_ALL_CONSTANTS && !g_sw_REGPU_CONSTANTS_BY_COUNT && !(TraceFrame() && g_r.frame + 1 == TraceFrame());
+    if (compareBlocks)
+        stageParity ^= 1;
+    else
+        lastBlocks.vs = nullptr, lastBlocks.ps = nullptr;
+    auto* vc = inRing ? vcRing : &vcStages[stageParity];
+    auto* pc = inRing ? pcRing : &pcStages[stageParity];
     {
         // Byte-swapped block copy of both constant banks (1024 dwords each).
         const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
         // Only the constants each shader reads (the rest of the block is never read).
         const auto* src = reinterpret_cast<const __m128i*>(gpureg::File() + gpureg::AluConstants * 4);
-        auto* dv = reinterpret_cast<__m128i*>(hooked && !inRing ? vc->c : vcRing->c);
-        auto* dp = reinterpret_cast<__m128i*>(pcRing->c);
+        auto* dv = reinterpret_cast<__m128i*>((hooked || compareBlocks) && !inRing ? vc->c : vcRing->c);
+        auto* dp = reinterpret_cast<__m128i*>(compareBlocks ? pc->c : pcRing->c);
         LiveSwitch &allConstants = g_sw_REGPU_ALL_CONSTANTS; // A/B
         const uint32_t nv = allConstants ? 256 : std::min(vs.info.constantsUsed, 256u), np = allConstants ? 256 : std::min(ps.info.constantsUsed, 256u);
         if (LiveSwitch &traceUsed = g_sw_REGPU_TRACE_CONSTANTS_USED; traceUsed)
@@ -12101,15 +12160,144 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             for (uint32_t k : vs.info.vertexFetchConstants)
                 fetches = std::max(fetches, k + 1);
             const size_t layouts = std::min<size_t>(vs.info.vertexFetchLayout.size(), 32);
-            const uint32_t slots = usedSlots ? 32 - uint32_t(__builtin_clz(usedSlots)) : 0;
-            put(vcRing, vc, vsFrom, offsetof(VSConstants, vf));
-            put(vcRing, vc, offsetof(VSConstants, vf), offsetof(VSConstants, vf) + fetches * sizeof(vc->vf[0]));
-            put(vcRing, vc, offsetof(VSConstants, info), offsetof(VSConstants, vfl));
-            put(vcRing, vc, offsetof(VSConstants, vfl), offsetof(VSConstants, vfl) + layouts * sizeof(vc->vfl[0]));
-            put(vcRing, vc, offsetof(VSConstants, vuser), sizeof(VSConstants));
-            put(pcRing, pc, psFrom, offsetof(PSConstants, tinfo));
-            put(pcRing, pc, offsetof(PSConstants, tinfo), offsetof(PSConstants, tinfo) + slots * sizeof(pc->tinfo[0]));
-            put(pcRing, pc, offsetof(PSConstants, tbias), offsetof(PSConstants, tbias) + slots * sizeof(pc->tbias[0]));
+            // The fetch table and the texture entries are written entry by entry: games pick vertex fetch
+            // constants near the top of the 96 (FM3: ~1.4 KB of unread entries below the used ones, per
+            // draw). REGPU_FETCH_TABLE_BY_RANGE=1 writes everything up to the highest one again (A/B).
+            static LiveSwitch byRangeSwitch("REGPU_FETCH_TABLE_BY_RANGE");
+            const bool byRange = byRangeSwitch;
+            const uint32_t slots = byRange && usedSlots ? 32 - uint32_t(__builtin_clz(usedSlots)) : 0;
+            const std::pair<size_t, size_t> vsRanges[] = {
+                { vsFrom, offsetof(VSConstants, vf) },
+                { offsetof(VSConstants, vf), offsetof(VSConstants, vf) + (byRange ? fetches : 0) * sizeof(vc->vf[0]) },
+                { offsetof(VSConstants, info), offsetof(VSConstants, vfl) },
+                { offsetof(VSConstants, vfl), offsetof(VSConstants, vfl) + layouts * sizeof(vc->vfl[0]) },
+                { offsetof(VSConstants, vuser), sizeof(VSConstants) },
+            };
+            const std::pair<size_t, size_t> psRanges[] = {
+                { psFrom, offsetof(PSConstants, tinfo) },
+                { offsetof(PSConstants, tinfo), offsetof(PSConstants, tinfo) + slots * sizeof(pc->tinfo[0]) },
+                { offsetof(PSConstants, tbias), offsetof(PSConstants, tbias) + slots * sizeof(pc->tbias[0]) },
+            };
+            // The used entries (none when by range: the ranges hold them).
+            auto vfPut = [&](VSConstants* vd) {
+                uint32_t n = 0;
+                if (!byRange)
+                    for (uint32_t k : vs.info.vertexFetchConstants)
+                        memcpy(vd->vf[k], vc->vf[k], sizeof(vc->vf[0])), n += 16;
+                return n;
+            };
+            auto texPut = [&](PSConstants* pd) {
+                uint32_t n = 0;
+                if (!byRange)
+                    for (uint32_t m = usedSlots; m; m &= m - 1, n += 32)
+                    {
+                        const uint32_t s = uint32_t(__builtin_ctz(m));
+                        memcpy(pd->tinfo[s], pc->tinfo[s], sizeof(pc->tinfo[0]));
+                        memcpy(pd->tbias[s], pc->tbias[s], sizeof(pc->tbias[0]));
+                    }
+                return n;
+            };
+            if (!compareBlocks)
+            {
+                for (const auto& [from, to] : vsRanges)
+                    put(vcRing, vc, from, to);
+                for (const auto& [from, to] : psRanges)
+                    put(pcRing, pc, from, to);
+                vfPut(vcRing);
+                texPut(pcRing);
+            }
+            else
+            {
+                // The float constants the shader reads, from the stage (compared, then copied).
+                auto floatsSame = [](const float (*a)[4], const float (*b)[4], const std::array<uint64_t, 4>& mask) {
+                    for (uint32_t w = 0; w < 4; w++)
+                        for (uint64_t bits = mask[w]; bits; bits &= bits - 1)
+                        {
+                            const uint32_t i = w * 64 + uint32_t(_tzcnt_u64(bits));
+                            const __m128i x = _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a[i])), _mm_loadu_si128(reinterpret_cast<const __m128i*>(b[i])));
+                            if (!_mm_testz_si128(x, x))
+                                return false;
+                        }
+                    return true;
+                };
+                auto floatsPut = [](float (*dst)[4], const float (*src)[4], const std::array<uint64_t, 4>& mask) {
+                    uint32_t n = 0;
+                    for (uint32_t w = 0; w < 4; w++)
+                        for (uint64_t bits = mask[w]; bits; bits &= bits - 1, n++)
+                        {
+                            const uint32_t i = w * 64 + uint32_t(_tzcnt_u64(bits));
+                            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst[i]), _mm_loadu_si128(reinterpret_cast<const __m128i*>(src[i])));
+                        }
+                    return n * 16u;
+                };
+                auto rangesSame = [](const void* a, const void* b, const auto& ranges) {
+                    for (const auto& [from, to] : ranges)
+                        if (to > from && memcmp(static_cast<const uint8_t*>(a) + from, static_cast<const uint8_t*>(b) + from, to - from) != 0)
+                            return false;
+                    return true;
+                };
+                const VSConstants* vcPrev = &vcStages[stageParity ^ 1];
+                const PSConstants* pcPrev = &pcStages[stageParity ^ 1];
+                const bool valid = lastBlocks.ring == f.ringCpu && lastBlocks.frame == g_r.frame && lastBlocks.parity == (stageParity ^ 1);
+                auto vfSame = [&] {
+                    for (uint32_t k : vs.info.vertexFetchConstants)
+                        if (memcmp(vc->vf[k], vcPrev->vf[k], sizeof(vc->vf[0])) != 0)
+                            return false;
+                    return true;
+                };
+                auto texSame = [&] {
+                    for (uint32_t m = usedSlots; m; m &= m - 1)
+                    {
+                        const uint32_t s = uint32_t(__builtin_ctz(m));
+                        if (memcmp(pc->tinfo[s], pcPrev->tinfo[s], sizeof(pc->tinfo[0])) != 0 || memcmp(pc->tbias[s], pcPrev->tbias[s], sizeof(pc->tbias[0])) != 0)
+                            return false;
+                    }
+                    return true;
+                };
+                const bool vsSame = valid && lastBlocks.vs == &vs && rangesSame(vc, vcPrev, vsRanges) && vfSame() && floatsSame(vc->c, vcPrev->c, vs.info.constantMask);
+                const bool psSame = valid && lastBlocks.ps == &ps && lastBlocks.psSlots == usedSlots && rangesSame(pc, pcPrev, psRanges) && texSame() &&
+                                    floatsSame(pc->c, pcPrev->c, ps.info.constantMask);
+                uint64_t written = 0, part[4] = {};
+                if (vsSame && reuseSwitch)
+                    vsOffset = lastBlocks.vsOffset;
+                else
+                {
+                    for (const auto& [from, to] : vsRanges)
+                        put(vcRing, vc, from, to), part[1] += to > from ? to - from : 0;
+                    part[1] += vfPut(vcRing);
+                    part[0] = floatsPut(vcRing->c, vc->c, vs.info.constantMask);
+                }
+                if (psSame && reuseSwitch)
+                    psOffset = lastBlocks.psOffset;
+                else
+                {
+                    for (const auto& [from, to] : psRanges)
+                        put(pcRing, pc, from, to), part[3] += to > from ? to - from : 0;
+                    part[3] += texPut(pcRing);
+                    part[2] = floatsPut(pcRing->c, pc->c, ps.info.constantMask);
+                }
+                lastBlocks = { f.ringCpu, g_r.frame, &vs, &ps, usedSlots, stageParity, vsOffset, psOffset };
+                if (traceBytes)
+                {
+                    written = part[0] + part[1] + part[2] + part[3];
+                    static uint64_t draws = 0, vsRepeat = 0, psRepeat = 0, bytes = 0, lastFrame = 0, parts[4] = {};
+                    draws++, vsRepeat += vsSame, psRepeat += psSame, bytes += written;
+                    for (int i = 0; i < 4; i++)
+                        parts[i] += part[i];
+                    if (g_r.frame >= lastFrame + 120)
+                    {
+                        const uint64_t frames = g_r.frame - lastFrame;
+                        lastFrame = g_r.frame;
+                        Log("constant blocks: %.0f draws a frame, vs repeats %.1f%%, ps repeats %.1f%%; %.0f bytes a draw, %.0f KB a frame written (reuse %s)",
+                            double(draws) / double(frames), 100.0 * double(vsRepeat) / double(std::max<uint64_t>(draws, 1)), 100.0 * double(psRepeat) / double(std::max<uint64_t>(draws, 1)),
+                            double(bytes) / double(std::max<uint64_t>(draws, 1)), double(bytes) / 1024.0 / double(frames), reuseSwitch ? "on" : "off");
+                        const double n = double(std::max<uint64_t>(draws, 1));
+                        Log("constant blocks: bytes a draw: vs floats %.0f, vs rest %.0f, ps floats %.0f, ps rest %.0f", parts[0] / n, parts[1] / n, parts[2] / n, parts[3] / n);
+                        draws = vsRepeat = psRepeat = bytes = 0;
+                        parts[0] = parts[1] = parts[2] = parts[3] = 0;
+                    }
+                }
+            }
         }
     }
     C().list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
