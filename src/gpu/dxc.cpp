@@ -40,7 +40,13 @@ DxcCreateInstanceProc CreateInstance()
             return nullptr;
         }
         auto f = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(m, "DxcCreateInstance"));
-        Log("dxc: %s", f ? "translated shaders compile with DXC (shader model 6.0)" : "DxcCreateInstance missing: shaders compile with FXC");
+        const char* sm = getenv("REGPU_DXC_SM");
+        const char* extra = getenv("REGPU_DXC_ARGS");
+        if (f)
+            Log("dxc: translated shaders compile with DXC (shader model %s%s%s)", sm && *sm ? sm : "6_0", extra && *extra ? ", extra arguments: " : "",
+                extra && *extra ? extra : "");
+        else
+            Log("dxc: DxcCreateInstance missing: shaders compile with FXC");
         return f;
     }();
     return create;
@@ -73,13 +79,16 @@ bool DxcFor(bool pixel)
 std::string DxcCacheTag()
 {
     static const std::string tag = [] {
-        const char* e = getenv("REGPU_DXC_ARGS");
+        // (REGPU_DXC_SM, the shader model, is part of it too.)
+        std::string key = getenv("REGPU_DXC_ARGS") ? getenv("REGPU_DXC_ARGS") : "";
+        if (const char* sm = getenv("REGPU_DXC_SM"); sm && *sm && strcmp(sm, "6_0"))
+            key += std::string(" sm") + sm;
         const std::string stage;
-        if (!e || !*e)
+        if (key.empty())
             return stage;
         uint32_t h = 2166136261u;
-        for (const char* c = e; *c; c++)
-            h = (h ^ uint8_t(*c)) * 16777619u;
+        for (const char c : key)
+            h = (h ^ uint8_t(c)) * 16777619u;
         char b[16];
         snprintf(b, sizeof(b), "-%08x", h);
         return stage + b;
@@ -98,7 +107,7 @@ HRESULT DxcCompileShader(const std::string& hlsl, bool pixel, ID3DBlob** code, s
     thread_local ComPtr<IDxcCompiler3> compiler;
     if (!compiler && FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))))
         return E_FAIL;
-    // REGPU_DXC_ARGS: extra arguments, space-separated (e.g. "-O0", "-Od"; default DXC's -O3).
+    // REGPU_DXC_ARGS: extra arguments, space-separated (e.g. "-O3", "-Od"; default -O1, below).
     static const std::vector<std::wstring> extra = [] {
         std::vector<std::wstring> v;
         if (const char* e = getenv("REGPU_DXC_ARGS"))
@@ -115,9 +124,20 @@ HRESULT DxcCompileShader(const std::string& hlsl, bool pixel, ID3DBlob** code, s
         }
         return v;
     }();
-    std::vector<LPCWSTR> args = { L"-E", L"main", L"-T", pixel ? L"ps_6_0" : L"vs_6_0", L"-HV", L"2018" };
+    // REGPU_DXC_SM (start-time): the shader model, e.g. 6_2 (with REGPU_DXC_ARGS="-denorm ftz") or 6_6; default 6_0.
+    static const std::wstring smVer = [] {
+        const char* e = getenv("REGPU_DXC_SM");
+        const std::string v = e && *e ? e : "6_0";
+        return std::wstring(v.begin(), v.end());
+    }();
+    const std::wstring profile = (pixel ? L"ps_" : L"vs_") + smVer;
+    std::vector<LPCWSTR> args = { L"-E", L"main", L"-T", profile.c_str(), L"-HV", L"2018" };
     if (!pixel)
         args.insert(args.end(), { L"-D", L"REGPU_VERTEX_STAGE=1" });
+    // -O1 (FM3 port, session 35): the drivers' code from DXC's -O1 matched -O3 (16 pixel shaders, both AMD driver branches:
+    // instructions and VGPRs within 0.5%), but compiles faster: the slowest vertex shader 54 -> 20 s, pixel shaders ~15%.
+    // REGPU_DXC_ARGS come after it, so an -O there wins. (Same cache files as -O3: the code is the same.)
+    args.push_back(L"-O1");
     for (const std::wstring& a : extra)
         args.push_back(a.c_str());
     const DxcBuffer source{ hlsl.data(), hlsl.size(), DXC_CP_UTF8 };
