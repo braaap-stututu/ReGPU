@@ -159,9 +159,9 @@ measurements are FM2's, at 1080p. FM2's environment variable names are `FM2_*`; 
 | Step | Work | Status |
 |---|---|---|
 | 1 | Vendored Vulkan-Headers 1.4.369, volk (the loader) and VMA. Vulkan is always built. | Done, `2ec5f4b` |
-| 2 | **Device** (`src/gpu/vk/device.{h,cpp}`) | Started |
-| 3 | **`RecordedList` with Vulkan operations** | |
-| 4 | **Resources** | |
+| 2 | **Device** (`src/gpu/vk/device.{h,cpp}`) | Done, `266fac0` |
+| 3 | **`RecordedList` with Vulkan operations** (`src/gpu/vk/recorded.h`, test `regpu_vkrecord`) | Done, `8d57e6b` |
+| 4 | **Resources** | Next |
 | 5 | **Pipelines and shaders** | |
 | 6 | **The renderer, function by function** | |
 | 7 | **First boot**, only once the user agrees, then slice-by-slice comparison with `d3d12-reference` (phase 2 below) | |
@@ -179,6 +179,14 @@ measurements are FM2's, at 1080p. FM2's environment variable names are `FM2_*`; 
 - Render targets: the replay begins and ends `vkCmdBeginRendering` lazily. Setting targets only records them; the first
   draw or clear begins rendering; a barrier, copy or new target ends it.
 - Root constants become push constants.
+
+**Steps 2 and 3, what to know:**
+- `vk::Submit`, `vk::Completed` and `vk::WaitFor` on the queue timeline replace D3D12's fences. The queue needs a
+  lock (`Device::queueLock`), where a D3D12 queue was free-threaded.
+- **Queries:** `RecordedList` begins and ends occlusion queries outside rendering, so a query can span target changes.
+  That costs a render pass break per query; measure it once the game runs.
+- **Validation layer:** not installed on this machine (it comes with the LunarG Vulkan SDK). Nothing has run under it
+  yet.
 
 **Step 4, resources:**
 - Committed and placed resources, and the texture heaps, become VMA allocations.
