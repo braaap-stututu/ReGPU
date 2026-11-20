@@ -1229,8 +1229,8 @@ float Mul9(float a, float b) { return a * b; }
 float Dot9(float4 a, float4 b) { return dot(a, b); })";
 
 // REGPU_VR=stereo (read once): the vertex shaders take the eye offset (see the viewport transform below).
-// Triple screen (REGPU_TRIPLE, FM3 port session 39): the main view's perspective geometry turned about the eye for a side
-// screen and narrowed from the game's wide frustum to the screen's own (vdepth.y turn, z k, w the screen's P00).
+// Triple screen (REGPU_TRIPLE, FM3 port session 39): the main view's perspective geometry mapped from the game's wide
+// frustum to each screen's own projection (regpu::triple::View: vtriple = a b c d, vdepth.z = e, vdepth.w = 1 on).
 bool TripleShaders()
 {
     static const bool on = [] {
@@ -1252,6 +1252,9 @@ bool StereoShaders()
 std::string Preamble(bool plainMul, bool plainMulVertex = false)
 {
     std::string h = kPreamble;
+    // Triple screen: the pass's view in the slot after vwide (renderer.cpp's vjitter: no motion variants in triple).
+    if (TripleShaders())
+        ReplaceOnce(h, "    float4 vwide;\n};", "    float4 vwide;\n    float4 vtriple;\n};");
     if (LeanVertexFetch())
         ReplaceOnce(h, kOrigVFetch, kLeanVFetch);
     if (plainMulVertex)
@@ -1650,17 +1653,14 @@ TranslatedShader TranslateShader(const Shader& shader)
         // main view). Only in stereo mode, so the shaders (and their cache entries) stay as they were otherwise.
         if (StereoShaders())
             h += "    if (!flat) r.pos.x += vdepth.y;\n";
-        // Triple screen: clip (x, w) back to the eye's view (x_v = x k / P00, z_v = w), turned by vdepth.y, projected
-        // with the screen's P00; y narrowed by k (both frustums 16:9); depth kept for the turned view (z += w' - w: exact
-        // for a projection with z = w + B, close for far >> near).
+        // Triple screen: the screen's view of the game's wide frustum (x' = a x + b w, w' = c x + d w, y' = e y; depth
+        // kept for the screen's view: z += w' - w, exact for a projection with z = w + B, close for far >> near).
         if (TripleShaders())
-            h += "    if (!flat && vdepth.z != 0.0)\n"
+            h += "    if (!flat && vdepth.w != 0.0)\n"
                  "    {\n"
-                 "        float ts, tc;\n"
-                 "        sincos(vdepth.y, ts, tc);\n"
                  "        const float x0 = r.pos.x, w0 = r.pos.w;\n"
-                 "        const float w1 = ts * x0 * vdepth.z / vdepth.w + tc * w0;\n"
-                 "        r.pos.x = vdepth.z * tc * x0 - vdepth.w * ts * w0;\n"
+                 "        const float w1 = vtriple.z * x0 + vtriple.w * w0;\n"
+                 "        r.pos.x = vtriple.x * x0 + vtriple.y * w0;\n"
                  "        r.pos.y *= vdepth.z;\n"
                  "        r.pos.z += w1 - w0;\n"
                  "        r.pos.w = w1;\n"

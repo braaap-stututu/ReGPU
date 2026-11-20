@@ -240,13 +240,20 @@ void Recentre();
 } // namespace vr
 
 // Triple screen (REGPU_TRIPLE=1, FM3 port session 39): one simulation, three screens. The main view (the frame from
-// its first full-width draw to the swap) is drawn three times, each turned about the eye to face its screen, side by
-// side in a window three screens wide (the resolution is the three together). The title's camera must draw with a
-// frustum wide enough for all three (its culling): `gameFovY` is the vertical field of view it was given (radians,
-// 16:9), `screenFovY` each screen's, `angle` the turn between the centre screen's axis and a side screen's. Once per
-// game frame while a 3D view is drawn; without a recent call a frame is drawn once, in the middle.
+// its first full-width draw to the swap) is drawn three times, once per screen, side by side in a window three screens
+// wide (the resolution is the three together). The title's camera must draw with a frustum wide enough for all three
+// (its culling); each screen's pass maps that frustum's clip position (x, y, z, w) to the screen's own projection:
+//   x' = a x + b w,  w' = c x + d w,  y' = e y,  z' = z + (w' - w)
+// (a turn about the eye and an off-axis projection onto the screen's plane; depth exact for z = w + B). The host works
+// these out from its screens' layout (sizes, distance, bezels, gaps, angles) in the camera's own clip convention.
+// views: 0 left, 1 centre, 2 right. Once per game frame while a 3D view is drawn; without a recent call a frame is
+// drawn once, in the middle.
 namespace triple
 {
-void SubmitFrame(float gameFovY, float screenFovY, float angle);
+struct View
+{
+    float a = 0, b = 0, c = 0, d = 1, e = 0;
+};
+void SubmitViews(const View (&views)[3]);
 } // namespace triple
 } // namespace regpu
