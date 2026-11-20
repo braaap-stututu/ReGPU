@@ -5,6 +5,7 @@
 #include "live_switch.h"
 
 #include <cstdio>
+#include <cstring>
 
 namespace
 {
@@ -212,6 +213,7 @@ float3 CubeDirection(float3 stf)
 float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel);
 static bool gLevelWrap = false; // a pixel fetch at a given level: wrap as the constant says (the vertex path clamps)
 static int gFilterOverride = -1; // the fetch instruction's filter (0 point, 1 linear), -1 the constant's
+static bool gBorderHit = false;  // TFetchRaw returned the border colour (clamp to border, outside the image)
 // The sampler for a fetch: the constant's mode (0 linear wrap, 1 linear clamp, 2 point clamp, 3 point
 // wrap), its filter replaced by the instruction's when it has one.
 uint FetchMode(uint mode)
@@ -256,9 +258,32 @@ float PWLGammaToLinear(float g)
     return l / 1023.0;
 }
 
+// A resolved 16-bit fixed image read with another number format than it was copied in (renderer.cpp: tinfo.x
+// bit 6 on; bits 4-5 the copy's format, 0 integer, 1 unsigned fraction, 2 signed fraction; bits 14-15 the
+// fetch's, 0 signed integer, 1 unsigned fraction, 2 signed fraction, 3 unsigned integer; bits 2-3 the
+// components, 0 one, 1 two, 2 four). Back to the 16 bits the console stores, then read as the fetch asks.
+float4 Fixed16Fetch(float4 v, uint info)
+{
+    if (!((info >> 6) & 1u))
+        return v;
+    const uint copy = (info >> 4) & 3u, mode = (info >> 14) & 3u;
+    // Vector selects, no loop: fxc can't unroll a loop that writes v[c] (error X3500 / X3511).
+    const float4 stored = copy == 1u ? round(saturate(v) * 65535.0) : (copy == 2u ? round(clamp(v, -1.0, 1.0) * 32767.0) : v);
+    const float4 asSigned = stored - (stored >= 32768.0 ? 65536.0 : 0.0);
+    const float4 asUnsigned = stored + (stored < 0.0 ? 65536.0 : 0.0);
+    const float4 r = mode == 1u ? asUnsigned / 65535.0 : (mode == 2u ? max(asSigned / 32767.0, -1.0) : (mode == 3u ? asUnsigned : asSigned));
+    const uint comps = 1u << ((info >> 2) & 3u);
+    const bool4 use = bool4(true, comps >= 2u, comps >= 4u, comps >= 4u);
+    return use ? r : v;
+}
+
 float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)
 {
+    gBorderHit = false;
     float4 v = TFetchRaw(slot, coord, denorm, vertexStage, bias, texel);
+    // A texel of a resolved 16-bit fixed image, converted as the fetch reads it; the border colour is not.
+    if (!gBorderHit)
+        v = Fixed16Fetch(v, tinfo[slot].x);
     // Gamma-signed components (tinfo.x bits 24-27, in v's order): before the exponent adjust.
     uint gamma = (tinfo[slot].x >> 24) & 0xFu;
     if (gamma != 0u)
@@ -324,7 +349,10 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     // Clamp to border (tinfo.x bit 16; bit 17 white): outside the image the border colour, as
     // shadow maps rely on (white: nothing casts a shadow beyond the map).
     if (((tinfo[slot].x >> 16) & 1u) && any(uv < 0.0 || uv > 1.0))
+    {
+        gBorderHit = true; // the border colour is final: TFetch doesn't convert it (Fixed16Fetch)
         return ((tinfo[slot].x >> 17) & 1u) ? float4(1, 1, 1, 1) : float4(0, 0, 0, 0);
+    }
     // One axis clamped, the other wrapping (tinfo.x bits 18 U, 19 V): clamp that axis here to
     // the edge texels' centres; the sampler wraps.
     if ((tinfo[slot].x >> 18) & 1u) uv.x = clamp(uv.x, 0.5 / texelSize.x, 1.0 - 0.5 / texelSize.x);
@@ -371,7 +399,6 @@ float4 CubeOp(float4 a, float4 b)
 float4 Mul9(float4 a, float4 b) { return (a == 0 || b == 0) ? 0 : a * b; }
 float Mul9(float a, float b) { return (a == 0 || b == 0) ? 0 : a * b; }
 float Dot9(float4 a, float4 b) { float4 m = Mul9(a, b); return m.x + m.y + m.z + m.w; }
-
 bool BoolConstant(uint4 b[2], uint index) { return (b[index >> 7][(index >> 5) & 3] >> (index & 31)) & 1; }
 )";
 
@@ -384,6 +411,8 @@ struct Emitter
     TranslatedShader& result;
     bool layoutOnly = false;   // only collect the vertex fetch layout (no HLSL)
     bool literalFetch = false; // a fetch had to be baked into the code
+    bool mayMakeInf = false;   // a scalar op that can give inf or NaN (raw rcp/rsq/log, sqrt, exp2): keeps 0 x inf = 0
+    bool mayMakeInfStrict = false; // the same without rsq/sqrt (REGPU_PLAIN_MUL_PS=3: normalize's rsq counted safe)
     mutable bool exportsDepth = false; // a pixel shader writing depth (export 61)
     uint32_t lastStride = 0;
     uint32_t lastSrc = 0, lastSrcSwizzle = 0; // mini fetches reuse the full fetch's index
@@ -391,6 +420,63 @@ struct Emitter
     bool saveFetchIndex = false; // minis read the index their full fetch kept (vfi), see ScanFetchIndex
     bool lastRound = false;
     int indent = 1;
+
+    // Hyper (REGPU_HYPER_PLAIN_MUL=5, pixel shaders; from the FM2 port's hyper-prototype): registers an infinity or NaN
+    // may reach, from the scalar ops that can make one (exp2, raw log2, raw rcp, raw rsqrt, sqrt) and anything
+    // computed from them. Sticky; and TranslateShader translates such a shader twice, the second time with every
+    // register the first pass tainted already tainted from the start, so loops and branches stay conservative. Only
+    // multiplies with a tainted operand keep the Xenos zero rule (Mul9/Dot9); the rest are plain IEEE (MulP/DotP).
+    static bool SmartMul()
+    {
+        static const bool on = getenv("REGPU_HYPER_PLAIN_MUL") && atoi(getenv("REGPU_HYPER_PLAIN_MUL")) == 5;
+        return on;
+    }
+    uint64_t taint = 0;
+    bool psTaint = false;
+
+    // N9 (FM3 port session 43; REGPU_HALF_REGS=1): registers that must stay 32-bit in a pixel shader. Roots: texture
+    // coordinates, predicate, kill and address operands, the depth export; then every register those were computed
+    // from (Precision32 closes over `deps`). A relative register access keeps the whole shader 32-bit.
+    uint64_t full32 = 0;
+    bool relativeRegs = false;
+    std::vector<std::pair<uint32_t, uint64_t>> deps; // dest register <- source registers
+    uint64_t SrcRegs(const Source& s)
+    {
+        if (s.isConstant)
+            return 0;
+        if (s.relative)
+        {
+            relativeRegs = true;
+            return 0;
+        }
+        return 1ull << (s.reg & 63);
+    }
+    uint64_t Precision32() const
+    {
+        uint64_t m = full32;
+        for (bool changed = true; changed;)
+        {
+            changed = false;
+            for (const auto& [dest, src] : deps)
+                if ((m >> dest) & 1 && (m | src) != m)
+                {
+                    m |= src;
+                    changed = true;
+                }
+        }
+        return m;
+    }
+    bool curTaint = true; // the instruction being emitted reads a tainted operand
+    bool SrcTaint(const Source& s) const
+    {
+        if (s.isConstant)
+            return false;
+        if (s.relative)
+            return taint != 0;
+        return (taint >> (s.reg & 63)) & 1;
+    }
+    std::string MulName() const { return (pixel && SmartMul() && !curTaint) ? "MulP(" : "Mul9("; }
+    std::string DotName() const { return (pixel && SmartMul() && !curTaint) ? "DotP(" : "Dot9("; }
 
     void Line(const std::string& s)
     {
@@ -477,10 +563,11 @@ struct Emitter
 
     std::string VectorExpr(const Alu& a, const std::string& A, const std::string& B, const std::string& C)
     {
+        const std::string mul = MulName(), dot = DotName();
         switch (a.vectorOp)
         {
         case 0: return A + " + " + B;
-        case 1: return "Mul9(" + A + ", " + B + ")";
+        case 1: return mul + A + ", " + B + ")";
         case 2: return "max(" + A + ", " + B + ")";
         case 3: return "min(" + A + ", " + B + ")";
         case 4: return "float4(" + A + " == " + B + ")";
@@ -490,13 +577,13 @@ struct Emitter
         case 8: return "frac(" + A + ")";
         case 9: return "trunc(" + A + ")";
         case 10: return "floor(" + A + ")";
-        case 11: return "Mul9(" + A + ", " + B + ") + " + C;
+        case 11: return mul + A + ", " + B + ") + " + C;
         case 12: return "(" + A + " == 0.0) ? " + B + " : " + C;
         case 13: return "(" + A + " >= 0.0) ? " + B + " : " + C;
         case 14: return "(" + A + " > 0.0) ? " + B + " : " + C;
-        case 15: return "Dot9(" + A + ", " + B + ").xxxx";
-        case 16: return "Dot9(float4((" + A + ").xyz, 0), float4((" + B + ").xyz, 0)).xxxx";
-        case 17: return "(Dot9(float4((" + A + ").xy, 0, 0), float4((" + B + ").xy, 0, 0)) + (" + C + ").x).xxxx";
+        case 15: return dot + A + ", " + B + ").xxxx";
+        case 16: return dot + "float4((" + A + ").xyz, 0), float4((" + B + ").xyz, 0)).xxxx";
+        case 17: return "(" + dot + "float4((" + A + ").xy, 0, 0), float4((" + B + ").xy, 0, 0)) + (" + C + ").x).xxxx";
         case 18: // CUBE: operands are v.zzxy and v.yxzz; result (tc, sc, 2 * major axis, face)
             return "CubeOp(" + A + ", " + B + ")";
         case 19: { std::string t = A; return "max(max(" + t + ".x, " + t + ".y), max(" + t + ".z, " + t + ".w)).xxxx"; }
@@ -509,6 +596,15 @@ struct Emitter
     // Emits code computing the scalar result into `s`; may update p.
     std::string ScalarCode(const Alu& a)
     {
+        // Raw reciprocal / reciprocal square root / log (inf at 0, NaN below 0), log with its -inf clamped (NaN below 0
+        // stays), square root (NaN below 0) and exp2 (overflow): a later multiply by 0 may rely on Xenos' 0 x inf = 0.
+        switch (a.scalarOp)
+        {
+        case 14: case 15: case 16: case 19: case 22: case 40: mayMakeInf = true; break;
+        default: break;
+        }
+        if (a.scalarOp == 14 || a.scalarOp == 15 || a.scalarOp == 16 || a.scalarOp == 19)
+            mayMakeInfStrict = true;
         const std::string sv = Src(a.src[2]);
         const std::string A = sv + ".w", B = sv + ".x";
         auto set = [](const std::string& e) { return "s = " + e + ";"; };
@@ -516,8 +612,8 @@ struct Emitter
         {
         case 0: return set(A + " + " + B);
         case 1: return set(A + " + ps");
-        case 2: return set("Mul9(" + A + ", " + B + ")");
-        case 3: case 4: return set("Mul9(" + A + ", ps)");
+        case 2: return set(MulName() + A + ", " + B + ")");
+        case 3: case 4: return set(MulName() + A + ", ps)");
         case 5: return set("max(" + A + ", " + B + ")");
         case 6: return set("min(" + A + ", " + B + ")");
         case 7: return set("float(" + A + " == 0.0)");
@@ -570,7 +666,7 @@ struct Emitter
             const char* op = a.scalarOp <= 43 ? " * " : (a.scalarOp <= 45 ? " + " : " - ");
             const char* neg = a.src[2].negate ? "-" : "";
             if (a.scalarOp <= 43)
-                return set(std::string("Mul9(") + neg + ca + ", " + neg + tb + ")");
+                return set(std::string(((taint >> temp) & 1) || !pixel || !SmartMul() ? "Mul9(" : "MulP(") + neg + ca + ", " + neg + tb + ")");
             static const int negMode = getenv("REGPU_SC_NEG") ? atoi(getenv("REGPU_SC_NEG")) : 0; // 0 both, 1 constant, 2 temp
             const char* negC = negMode == 2 ? "" : neg;
             const char* negT = negMode == 1 ? "" : neg;
@@ -629,11 +725,55 @@ struct Emitter
             body += "} ";
         }
         else
+        {
+            curTaint = SrcTaint(a.src[0]) || SrcTaint(a.src[1]) || SrcTaint(a.src[2]);
             body += "v = " + VectorExpr(a, A, B, C) + "; ";
+        }
+        const bool vectorTaint = SrcTaint(a.src[0]) || SrcTaint(a.src[1]) || SrcTaint(a.src[2]);
         if (a.vectorClamp && !vectorUnused)
             body += "v = saturate(v); ";
+        // The scalar half reads src[2] (and for some ops ps): tainted by them or by an op that can make an infinity.
+        const bool scalarTaint = !scalarKept && (SrcTaint(a.src[2]) || psTaint || a.scalarOp == 14 || a.scalarOp == 15 ||
+                                                 a.scalarOp == 16 || a.scalarOp == 19 || a.scalarOp == 22 || a.scalarOp == 40 ||
+                                                 (a.scalarOp >= 42 && a.scalarOp <= 47));
         if (!scalarKept)
+        {
+            curTaint = SrcTaint(a.src[2]) || psTaint;
             body += ScalarCode(a) + " ";
+        }
+        curTaint = true;
+        if (pixel)
+        {
+            const uint64_t srcs = SrcRegs(a.src[0]) | SrcRegs(a.src[1]) | SrcRegs(a.src[2]);
+            const uint64_t scalarSrcs = SrcRegs(a.src[2]);
+            const bool vectorRoot = (a.vectorOp >= 20 && a.vectorOp <= 27) || a.vectorOp == 29;
+            const bool scalarRoot = a.scalarOp == 23 || a.scalarOp == 24 || (a.scalarOp >= 27 && a.scalarOp <= 39);
+            if (vectorRoot && !vectorUnused)
+                full32 |= srcs;
+            if (scalarRoot && !scalarKept)
+                full32 |= scalarSrcs;
+            if (a.exportData && a.vectorDest == 61) // the depth export
+                full32 |= srcs;
+            if (a.scalarOp >= 42 && a.scalarOp <= 47) // (a temp spread over the opcode bits: keep it simple)
+                relativeRegs = true;
+            if (!a.exportData)
+            {
+                if (a.vectorMask && !vectorUnused)
+                    deps.push_back({ a.vectorDest & 63, srcs });
+                if (a.scalarMask && !scalarKept)
+                    deps.push_back({ a.scalarDest & 63, scalarSrcs });
+                if (a.scalarDestRelative)
+                    relativeRegs = true;
+            }
+        }
+        if (!a.exportData)
+        {
+            if (vectorTaint && a.vectorMask && !vectorUnused)
+                taint |= 1ull << (a.vectorDest & 63);
+            if (scalarTaint && a.scalarMask)
+                taint |= 1ull << (a.scalarDest & 63);
+        }
+        psTaint = psTaint || scalarTaint;
         if (a.vectorOp == 29) // MAXAv: a0 from the first operand's W, after the reads
             body += "a0 = clamp(int(floor((" + A + ").w + 0.5)), -256, 255); ";
         if (a.scalarClamp)
@@ -684,6 +824,8 @@ struct Emitter
 
     void EmitFetch(const Fetch& f)
     {
+        if (pixel && f.opcode != 0)
+            full32 |= 1ull << (f.src & 63); // texture coordinates
         std::string body;
         if (f.opcode == 0)
         {
@@ -710,6 +852,8 @@ struct Emitter
             // FM4 port. REGPU_NO_MINI_CONST=1 takes the mini's own field again (A/B; read at translation).
             static const bool miniOwnConst = getenv("REGPU_NO_MINI_CONST") != nullptr;
             const uint32_t constIndex = f.isMini && !miniOwnConst ? lastConst : f.constIndex;
+            if (!f.isMini && !result.positionFetch[0])
+                result.positionFetch = { constIndex + 1, f.format | (f.isSigned ? 0x100u : 0), lastStride, f.offset };
             // The index register, or (ScanFetchIndex) the value the full fetch kept before overwriting it.
             const std::string indexReg = "r[" + std::to_string(lastSrc) + "]." + "xyzw"[lastSrcSwizzle & 3];
             const std::string indexSrc = saveFetchIndex ? "vfi" : indexReg;
@@ -769,7 +913,12 @@ struct Emitter
             const bool level = pixel && !noRegisterLod && !f.useComputedLod;
             const std::string lod = !noRegisterLod && f.useRegisterLod ? "regLod + " : "";
             char call[320];
-            if (LeanFetch() && pixel && f.dimension == 1 && !level && lod.empty())
+            static const bool noOverrideLean = getenv("REGPU_NO_FETCH_FILTER_OVERRIDE") != nullptr;
+            if (LeanFetchLevel() >= 2 && pixel && f.dimension == 1 && !level && lod.empty())
+                snprintf(call, sizeof(call), "TFetch2DV2(%u, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f), %d)", f.constIndex, uv.c_str(),
+                    f.denormalized ? "true" : "false", f.lodBias, f.constIndex, f.offsetX, f.offsetY,
+                    !noOverrideLean && (f.magFilter == 0 || f.magFilter == 1) ? int(f.magFilter) : -1);
+            else if (LeanFetch() && pixel && f.dimension == 1 && !level && lod.empty())
                 snprintf(call, sizeof(call), "TFetch2D(%u, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
                     f.denormalized ? "true" : "false", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
             else
@@ -1264,7 +1413,7 @@ float4 TFetch2D(uint slot, float3 coord, bool denorm, float bias, float2 texel)
     // Sampler index: the filter mode (1-3 its own sampler), else the anisotropy (s4-s7), else s0.
     const uint mode = info & 3u, aniso = (info >> 20) & 7u;
     const uint s = mode != 0u ? mode : (aniso >= 1u && aniso <= 4u ? aniso + 3u : 0u);
-    float4 v = gtex[asuint(tbias[slot].y)].SampleBias(gsamp[s], uv, bias);
+    float4 v = Fixed16Fetch(gtex[asuint(tbias[slot].y)].SampleBias(gsamp[s], uv, bias), info);
     uint gamma = (info >> 24) & 0xFu;
     if (gamma != 0u)
     {
@@ -1285,20 +1434,283 @@ float4 TFetch2D(uint slot, float3 coord, bool denorm, float bias, float2 texel)
     }
     return r;
 }
+
+// REGPU_LEAN_FETCH=2: what the fetch constant asks for is worked out on the CPU (renderer.cpp, tinfo.x bit 7:
+// a plain texture: no mirror, border, single-axis clamp, 16-bit fixed conversion, gamma, exponent, shader
+// swizzle or declared sub-image), and such a fetch is one sample. The instruction's own filter (filt: 0
+// point, 1 linear, -1 the constant's) is a literal, as the full path applies it. The same results.
+float4 TFetch2DV2(uint slot, float3 coord, bool denorm, float bias, float2 texel, int filt)
+{
+    const uint info = tinfo[slot].x;
+    if (info & 128u)
+    {
+        uint mode = info & 3u;
+        if (filt >= 0)
+        {
+            const bool wrap = mode == 0u || mode == 3u;
+            mode = filt == 0 ? (wrap ? 3u : 2u) : (wrap ? 0u : 1u);
+        }
+        const uint aniso = (info >> 20) & 7u;
+        const uint s = mode != 0u ? mode : (aniso >= 1u && aniso <= 4u ? aniso + 3u : 0u);
+        float2 uv = coord.xy;
+        if (denorm || any(texel != 0.0))
+        {
+            const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
+            uv = denorm ? (uv + texel) / texelSize : uv + texel / texelSize;
+        }
+        return gtex[asuint(tbias[slot].y)].SampleBias(gsamp[s], uv, bias);
+    }
+    return TFetch2D(slot, coord, denorm, bias, texel);
+}
 )";
 
-std::string Preamble()
+// Variants swapped into the preamble only when their switch is on, so shaders cached without them stay valid.
+// REGPU_LEAN_VFETCH (LeanVertexFetch): only the dwords the format holds are loaded (each load bounds-checked and
+// byte-swapped); the others are 0, which Unpack never reads. The same values.
+const char kOrigVFetch[] = R"(float4 VFetch(uint fetch, float index, uint stride, uint offset, uint format, bool isSigned, bool norm)
+{
+    uint d = uint(max(index, 0.0)) * stride + offset; // index already rounded or floored
+    return Unpack(LoadGuest(fetch, d), LoadGuest(fetch, d + 1), LoadGuest(fetch, d + 2), LoadGuest(fetch, d + 3), format, isSigned, norm);
+})";
+const char kLeanVFetch[] = R"(uint VDwords(uint format)
+{
+    return (format == 26u || format == 32u || format == 34u || format == 37u) ? 2u : (format == 57u ? 3u : ((format == 35u || format == 38u) ? 4u : 1u));
+}
+float4 VFetch(uint fetch, float index, uint stride, uint offset, uint format, bool isSigned, bool norm)
+{
+    uint d = uint(max(index, 0.0)) * stride + offset; // index already rounded or floored
+    const uint n = VDwords(format);
+    const uint w0 = LoadGuest(fetch, d);
+    const uint w1 = n > 1u ? LoadGuest(fetch, d + 1) : 0u;
+    const uint w2 = n > 2u ? LoadGuest(fetch, d + 2) : 0u;
+    const uint w3 = n > 3u ? LoadGuest(fetch, d + 3) : 0u;
+    return Unpack(w0, w1, w2, w3, format, isSigned, norm);
+})";
+// REGPU_PLAIN_MUL_PS (PlainMulPixel): pixel shaders multiply as IEEE does (0 x inf = NaN), one instruction instead
+// of two compares and a select. Vertex shaders keep D3D9's rule: there an infinite or NaN term switched off by a
+// zero weight lands in positions (a HUD garbled when both stages did it).
+const char kOrigMul[] = R"(float4 Mul9(float4 a, float4 b) { return (a == 0 || b == 0) ? 0 : a * b; }
+float Mul9(float a, float b) { return (a == 0 || b == 0) ? 0 : a * b; }
+float Dot9(float4 a, float4 b) { float4 m = Mul9(a, b); return m.x + m.y + m.z + m.w; })";
+const char kPlainMul[] = R"(#ifndef REGPU_VERTEX_STAGE
+float4 Mul9(float4 a, float4 b) { return a * b; }
+float Mul9(float a, float b) { return a * b; }
+float Dot9(float4 a, float4 b) { return dot(a, b); }
+#else
+float4 Mul9(float4 a, float4 b) { return (a == 0 || b == 0) ? 0 : a * b; }
+float Mul9(float a, float b) { return (a == 0 || b == 0) ? 0 : a * b; }
+float Dot9(float4 a, float4 b) { float4 m = Mul9(a, b); return m.x + m.y + m.z + m.w; }
+#endif)";
+
+void ReplaceOnce(std::string& h, const char* from, const char* to)
+{
+    const size_t at = h.find(from);
+    if (at != std::string::npos)
+        h.replace(at, strlen(from), to);
+}
+
+// REGPU_PLAIN_MUL_VS (FM3 port, session 33): plain multiplies in vertex shaders too (kPlainMul keeps Mul9 there).
+const char kPlainMulAll[] = R"(float4 Mul9(float4 a, float4 b) { return a * b; }
+float Mul9(float a, float b) { return a * b; }
+float Dot9(float4 a, float4 b) { return dot(a, b); })";
+
+// REGPU_VR=stereo (read once): the vertex shaders take the eye offset (see the viewport transform below).
+// Triple screen (REGPU_TRIPLE, FM3 port session 39): the main view's perspective geometry mapped from the game's wide
+// frustum to each screen's own projection (regpu::triple::View: vtriple = a b c d, vdepth.z = e, vdepth.w = 1 on).
+bool TripleShaders()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_TRIPLE");
+        return v && *v && strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+bool StereoShaders()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_VR");
+        return v && strcmp(v, "stereo") == 0;
+    }();
+    return on;
+}
+
+std::string Preamble(bool plainMul, bool plainMulVertex = false)
 {
     std::string h = kPreamble;
-    return LeanFetch() ? h + kLeanFetch : h;
+    // Triple screen: the pass's view in the slot after vwide (renderer.cpp's vjitter: no motion variants in triple).
+    if (TripleShaders())
+        ReplaceOnce(h, "    float4 vwide;\n};", "    float4 vwide;\n    float4 vtriple;\n};");
+    if (LeanVertexFetch())
+        ReplaceOnce(h, kOrigVFetch, kLeanVFetch);
+    if (plainMulVertex)
+        ReplaceOnce(h, kOrigMul, kPlainMulAll);
+    else if (plainMul)
+        ReplaceOnce(h, kOrigMul, kPlainMul);
+    if (LeanFetch())
+        h += kLeanFetch;
+    // Hyper's plain IEEE multiplies for operands no infinity or NaN can reach (REGPU_HYPER_PLAIN_MUL=5, Emitter::SmartMul).
+    // Only then, so the preamble (and every cached shader) is unchanged otherwise.
+    static const bool smartMul = getenv("REGPU_HYPER_PLAIN_MUL") && atoi(getenv("REGPU_HYPER_PLAIN_MUL")) == 5;
+    if (smartMul)
+        h += "float4 MulP(float4 a, float4 b) { return a * b; }\nfloat MulP(float a, float b) { return a * b; }\n"
+             "float DotP(float4 a, float4 b) { return dot(a, b); }\n";
+    // Hyper (REGPU_HYPER_SWIZZLE_SEL=1, from the FM2 port: +12.8% on an HD 630): the fetch swizzle as a select chain
+    // instead of a dynamically indexed register (v[sel]), which Intel's compiler spills. Same result.
+    static const bool swizzleSel = getenv("REGPU_HYPER_SWIZZLE_SEL") && atoi(getenv("REGPU_HYPER_SWIZZLE_SEL")) != 0;
+    if (swizzleSel)
+    {
+        const std::string from = "r[c] = sel < 4u ? v[sel] : (sel == 5u ? 1.0 : 0.0);";
+        const std::string to = "r[c] = sel == 0u ? v.x : sel == 1u ? v.y : sel == 2u ? v.z : sel == 3u ? v.w : (sel == 5u ? 1.0 : 0.0);";
+        for (size_t at = h.find(from); at != std::string::npos; at = h.find(from, at + to.size()))
+            h.replace(at, from.size(), to);
+    }
+    return h;
 }
 } // namespace
 
 // Read at first use (the renderer's root signature), not at load: a port may set it before Start.
 bool LeanFetch()
 {
-    static const bool lean = getenv("REGPU_LEAN_FETCH") != nullptr;
+    return LeanFetchLevel() >= 1;
+}
+
+// REGPU_LEAN_FETCH=<n>: 1 the lean 2D fetch, 2 also its plain-texture fast path (TFetch2DV2); empty or
+// any other value: 1, "0": off. Read once, at the first translation.
+int LeanFetchLevel()
+{
+    static const int level = [] {
+        const char* v = getenv("REGPU_LEAN_FETCH");
+        if (!v || strcmp(v, "0") == 0)
+            return 0;
+        return atoi(v) >= 2 ? 2 : 1;
+    }();
+    return level;
+}
+
+namespace
+{
+bool EnvOn(const char* name)
+{
+    const char* v = getenv(name);
+    return v && *v && strcmp(v, "0") != 0;
+}
+} // namespace
+
+bool LeanVertexFetch()
+{
+    static const bool lean = EnvOn("REGPU_LEAN_VFETCH");
     return lean;
+}
+
+bool PlainMulPixel()
+{
+    return PlainMulPixelLevel() != 0;
+}
+
+// REGPU_PLAIN_MUL_PS: 0/unset off, 2 safe shaders only (no op that can give inf/NaN), anything else 1 = every pixel shader.
+int PlainMulPixelLevel()
+{
+    static const int level = [] {
+        const char* v = getenv("REGPU_PLAIN_MUL_PS");
+        if (!v || !*v || strcmp(v, "0") == 0)
+            return 0;
+        return atoi(v) == 2 ? 2 : atoi(v) == 3 ? 3 : 1;
+    }();
+    return level;
+}
+
+// REGPU_PLAIN_MUL_VS: the same levels for vertex shaders (1 all, 2 safe, 3 safe with rsq/sqrt allowed). Session 33:
+// on a small GPU (2 RDNA2 compute units) vertex work was a quarter of the frame.
+int PlainMulVertexLevel()
+{
+    static const int level = [] {
+        const char* v = getenv("REGPU_PLAIN_MUL_VS");
+        if (!v || !*v || strcmp(v, "0") == 0)
+            return 0;
+        return atoi(v) == 2 ? 2 : atoi(v) == 3 ? 3 : 1;
+    }();
+    return level;
+}
+
+// TFetch2DK (session 33, FM3 port): the lean TFetch2D with the fetch-constant words as arguments, made from its own
+// text so the two can't drift apart. With literal words (a specialised variant: renderer.cpp SpecVariant) the
+// compiler folds every branch the constant rules out: FM3's car paint went from 117 KB of RDNA3 code (236 sample
+// instructions, 1,064 branches) to 22 KB (41, 182). filt: TFetch2DV2's own filter (-1 = the constant's), applied
+// as TFetch2DV2 does, only to a plain fetch (tinfo.x bit 7).
+const std::string& SpecializedFetchFunction()
+{
+    static const std::string text = [] {
+        const std::string lean = kLeanFetch;
+        const char* head = "float4 TFetch2D(uint slot, float3 coord, bool denorm, float bias, float2 texel)";
+        const size_t start = lean.find(head), end = lean.find("// REGPU_LEAN_FETCH=2", start);
+        if (start == std::string::npos || end == std::string::npos)
+            return std::string();
+        std::string f = lean.substr(start, end - start);
+        auto replaceAll = [&f](const std::string& a, const std::string& b) {
+            for (size_t at = f.find(a); at != std::string::npos; at = f.find(a, at + b.size()))
+                f.replace(at, a.size(), b);
+        };
+        replaceAll(head, "float4 TFetch2DK(uint slot, float3 coord, bool denorm, float bias, float2 texel, int filt, uint infoK, uint wK)");
+        replaceAll("tinfo[slot].x", "infoK");
+        replaceAll("tinfo[slot].w", "wK");
+        // (A literal selector: FXC rejects v[sel] once it can see sel may be 4-7.)
+        replaceAll("r[c] = sel < 4u ? v[sel] : (sel == 5u ? 1.0 : 0.0);",
+            "r[c] = sel == 0u ? v.x : sel == 1u ? v.y : sel == 2u ? v.z : sel == 3u ? v.w : (sel == 5u ? 1.0 : 0.0);");
+        // TFetch2DV2's own filter, for a plain fetch only (its other fetches go to TFetch2D, which has none).
+        const std::string open = "{\n";
+        const size_t body = f.find(open);
+        if (body == std::string::npos)
+            return std::string();
+        f.insert(body + open.size(),
+            "    if (filt >= 0 && (infoK & 128u))\n"
+            "    {\n"
+            "        const bool wrapK = (infoK & 3u) == 0u || (infoK & 3u) == 3u;\n"
+            "        infoK = (infoK & ~3u) | (filt == 0 ? (wrapK ? 3u : 2u) : (wrapK ? 0u : 1u));\n"
+            "    }\n");
+        // A 3D or cube texture behind the 2D fetch: the specialised full path too.
+        replaceAll("return TFetch(slot, coord, denorm, false, bias, texel);", "return TFetchK(slot, coord, denorm, false, bias, texel, infoK, wK);");
+        const std::string full = SpecializedFullFetchFunction();
+        return full.empty() ? std::string() : full + f;
+    }();
+    return text;
+}
+
+// TFetchK / TFetchRawK (L62, session 34, FM3 port): the full TFetch path (cube, 3D and 2D fetches outside the lean
+// 2D path: FM3's car paint reads its two reflection cubes this way) with the fetch-constant words as arguments, made
+// from the preamble's own TFetch and TFetchRaw text. With literal words only the constant's own branch is left.
+std::string SpecializedFullFetchFunction()
+{
+    const std::string pre = kPreamble;
+    auto cut = [&pre](const char* from, const char* to) {
+        const size_t start = pre.find(from), end = start == std::string::npos ? start : pre.find(to, start);
+        return start == std::string::npos || end == std::string::npos ? std::string() : pre.substr(start, end - start);
+    };
+    std::string raw = cut("float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)\n{", "float4 CubeOp(");
+    std::string fetch = cut("float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)\n{", "// The lean 2D path");
+    if (raw.empty() || fetch.empty())
+        return {};
+    auto replaceAll = [](std::string& f, const std::string& a, const std::string& b) {
+        size_t n = 0;
+        for (size_t at = f.find(a); at != std::string::npos; at = f.find(a, at + b.size()))
+            f.replace(at, a.size(), b), n++;
+        return n;
+    };
+    const std::string args = "(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)";
+    const std::string argsK = "(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel, uint infoK, uint wK)";
+    replaceAll(raw, "float4 TFetchRaw" + args, "float4 TFetchRawK" + argsK);
+    replaceAll(fetch, "float4 TFetch" + args, "float4 TFetchK" + argsK);
+    if (!replaceAll(fetch, "TFetchRaw(slot, coord, denorm, vertexStage, bias, texel)", "TFetchRawK(slot, coord, denorm, vertexStage, bias, texel, infoK, wK)"))
+        return {};
+    for (std::string* f : { &raw, &fetch })
+    {
+        replaceAll(*f, "tinfo[slot].x", "infoK");
+        replaceAll(*f, "tinfo[slot].w", "wK");
+    }
+    // (A literal selector, as in TFetch2DK.)
+    replaceAll(fetch, "r[c] = sel < 4u ? v[sel] : (sel == 5u ? 1.0 : 0.0);",
+        "r[c] = sel == 0u ? v.x : sel == 1u ? v.y : sel == 2u ? v.z : sel == 3u ? v.w : (sel == 5u ? 1.0 : 0.0);");
+    return raw + fetch;
 }
 
 bool BakedVertexFetch()
@@ -1319,6 +1731,16 @@ bool TranslateVertexFetchLayout(const Shader& shader, TranslatedShader& out)
     for (const Cf& cf : shader.cf)
         if (cf.op() == CfOp::CondCall)
             return false;
+    // (Likewise a jump or loop past the first end: that code is reached too, so translate in full. PGR3 port.)
+    for (size_t i = 0, firstEnd = shader.cf.size(); i < shader.cf.size(); i++)
+    {
+        const Cf& cf = shader.cf[i];
+        if (cf.IsEnd() && firstEnd == shader.cf.size())
+            firstEnd = i;
+        const CfOp op = cf.op();
+        if ((op == CfOp::CondJmp || op == CfOp::LoopStart || op == CfOp::LoopEnd) && (cf.lo & 0x1FFF) > firstEnd)
+            return false;
+    }
     for (const Cf& cf : shader.cf)
     {
         if (cf.IsExec())
@@ -1329,6 +1751,7 @@ bool TranslateVertexFetchLayout(const Shader& shader, TranslatedShader& out)
             break;
     }
     out.vertexFetchLayout = std::move(result.vertexFetchLayout);
+    out.positionFetch = result.positionFetch;
     out.vertexFetchConstants = std::move(result.vertexFetchConstants);
     return true;
 }
@@ -1377,7 +1800,21 @@ TranslatedShader TranslateShader(const Shader& shader)
         result.error = "no end of program";
         return result;
     }
+    // Hyper's smart multiplies: a first pass finds every register an infinity may reach; the real pass starts with
+    // all of them tainted (loops, branches).
+    uint64_t seedTaint = 0;
+    bool seedPs = false;
+    if (shader.pixel && Emitter::SmartMul())
+    {
+        TranslatedShader scratch;
+        Emitter pre{ shader, shader.pixel, {}, {}, scratch };
+        pre.EmitProgram();
+        seedTaint = pre.taint;
+        seedPs = pre.psTaint;
+    }
     Emitter e{ shader, shader.pixel, {}, {}, result };
+    e.taint = seedTaint;
+    e.psTaint = seedPs;
     e.EmitProgram();
     if (!e.error.empty())
     {
@@ -1385,7 +1822,18 @@ TranslatedShader TranslateShader(const Shader& shader)
         return result;
     }
 
-    std::string h = Preamble();
+    // REGPU_PLAIN_MUL_PS=1: plain multiplies in every pixel shader; =2: only in those with no op that can give inf or NaN
+    // (session 33 of the FM3 port: =1 turned the crowd's waving flags black, a shader relying on 0 x inf = 0).
+    const int plainLevel = PlainMulPixelLevel();
+    // (=3: like 2, but square roots and reciprocal square roots (normalize) don't keep the rule.)
+    const bool unsafe = plainLevel == 3 ? e.mayMakeInfStrict : e.mayMakeInf;
+    const int vsLevel = PlainMulVertexLevel();
+    const bool vsUnsafe = vsLevel == 3 ? e.mayMakeInfStrict : e.mayMakeInf;
+    const bool plainVertex = !shader.pixel && (vsLevel == 1 || (vsLevel >= 2 && !vsUnsafe));
+    std::string h = Preamble(plainLevel == 1 || (plainLevel >= 2 && shader.pixel && !unsafe), plainVertex);
+    if (plainLevel >= 2 && shader.pixel)
+        result.plainMul = !unsafe;
+    result.bodyStart = h.size();
     std::vector<uint32_t> regs = ScalarRegisters(e.out);
     std::string decl;
     if (!shader.pixel)
@@ -1451,38 +1899,76 @@ TranslatedShader TranslateShader(const Shader& shader)
              "        {\n"
              "            uint b = vinfo.x + (e & 0x1FFFFFFFu) * 4;\n"
              "            vi[0] = gmem.Load(b); vi[1] = gmem.Load(b + 4); vi[2] = gmem.Load(b + 8);\n"
-             "        }\n"
-             "        float4 vp[3]; float4 vq[3][16]; float4 opts = 0;\n"
-             "        [loop] for (uint k = 0; k < (rect ? 3u : 1u); k++)\n"
+             "        }\n";
+        // REGPU_OLD_VS_CORNERS (read once, at the first translation; the shader text and so its cache key change):
+        // the old form, the three corners' outputs kept in a float4[3][16] array indexed at run time.
+        static const bool oldCorners = getenv("REGPU_OLD_VS_CORNERS") != nullptr;
+        if (oldCorners)
+            h += "        float4 vp[3]; float4 vq[3][16]; float4 opts = 0;\n"
+                 "        [loop] for (uint k = 0; k < (rect ? 3u : 1u); k++)\n"
+                 "        {\n"
+                 "            float4 kp, ko[16], kpts;\n"
+                 "            GuestVS(vi[k], kp, ko, kpts);\n"
+                 "            vp[k] = kp; vq[k] = ko;\n"
+                 "            if (k == 0u) opts = kpts;\n"
+                 "        }\n"
+                 "        if (isPoint) { r.pos = vp[0]; r.o = vq[0]; }\n"
+                 "        else\n"
+                 "        {\n"
+                 "            uint role = (e >> 29) & 3u;\n"
+                 "            float d01 = distance(vp[0].xy / vp[0].w, vp[1].xy / vp[1].w), d02 = distance(vp[0].xy / vp[0].w, vp[2].xy / vp[2].w);\n"
+                 "            float d12 = distance(vp[1].xy / vp[1].w, vp[2].xy / vp[2].w);\n"
+                 "            uint ra = (d12 >= d01 && d12 >= d02) ? 0u : ((d02 >= d01) ? 1u : 2u);\n"
+                 "            uint e1 = (ra + 1u) % 3u, e2 = (ra + 2u) % 3u;\n"
+                 "            if (role == 1u) { r.pos = vp[e1]; r.o = vq[e1]; }\n"
+                 "            else if (role == 2u) { r.pos = vp[e2]; r.o = vq[e2]; }\n"
+                 "            else { r.pos = vp[e1] + vp[e2] - vp[ra]; [unroll] for (int i = 0; i < 16; i++) r.o[i] = vq[e1][i] + vq[e2][i] - vq[ra][i]; }\n"
+                 "        }\n";
+        else
+            h +=
+             "        // No array of the three corners' outputs (float4[3][16], indexed at run time): FXC put it in\n"
+             "        // scratch (816 bytes a vertex), and AMD's drivers kept DXC's in registers, ~190 VGPRs in every\n"
+             "        // vertex shader (FM3 port, session 35). Rectangles run the guest shader for the three corners'\n"
+             "        // positions first, then again for the outputs they need, adding them in the old order. One call\n"
+             "        // site for both (each GuestVS call is inlined: three call sites took twice as long to compile).\n"
+             "        float4 vp[3]; float4 opts = 0;\n"
+             "        vp[0] = 0; vp[1] = 0; vp[2] = 0;\n"
+             "        uint first = rect ? 3u : 0u, n = 1u, pk0 = 0u, pk1 = 0u, pk2 = 0u;\n"
+             "        [loop] for (uint j = 0; j < first + n; j++)\n"
              "        {\n"
+             "            uint m = j - first;\n"
              "            float4 kp, ko[16], kpts;\n"
-             "            GuestVS(vi[k], kp, ko, kpts);\n"
-             "            vp[k] = kp; vq[k] = ko;\n"
-             "            if (k == 0u) opts = kpts;\n"
-             "        }\n"
-             "        if (isPoint)\n"
+             "            GuestVS(vi[j < first ? j : (m == 0u ? pk0 : (m == 1u ? pk1 : pk2))], kp, ko, kpts);\n"
+             "            if (j < first)\n"
+             "            {\n"
+             "                vp[j] = kp;\n"
+             "                if (j == 2u)\n"
+             "                {\n"
+             "                    // Rectangle second triangle: role 0 is the computed fourth corner, roles 1 and 2 the\n"
+             "                    // ends of the hypotenuse (the corners next to the right angle).\n"
+             "                    uint role = (e >> 29) & 3u;\n"
+             "                    float d01 = distance(vp[0].xy / vp[0].w, vp[1].xy / vp[1].w), d02 = distance(vp[0].xy / vp[0].w, vp[2].xy / vp[2].w);\n"
+             "                    float d12 = distance(vp[1].xy / vp[1].w, vp[2].xy / vp[2].w);\n"
+             "                    uint ra = (d12 >= d01 && d12 >= d02) ? 0u : ((d02 >= d01) ? 1u : 2u);\n"
+             "                    uint e1 = (ra + 1u) % 3u, e2 = (ra + 2u) % 3u;\n"
+             "                    if (role == 1u) { r.pos = vp[e1]; pk0 = e1; }\n"
+             "                    else if (role == 2u) { r.pos = vp[e2]; pk0 = e2; }\n"
+             "                    else { r.pos = vp[e1] + vp[e2] - vp[ra]; n = 3u; pk0 = e1; pk1 = e2; pk2 = ra; }\n"
+             "                }\n"
+             "            }\n"
+             "            else if (m == 0u) { r.o = ko; if (isPoint) { r.pos = kp; opts = kpts; } }\n"
+             "            else if (m == 1u) { [unroll] for (int i = 0; i < 16; i++) r.o[i] += ko[i]; }\n"
+             "            else { [unroll] for (int i = 0; i < 16; i++) r.o[i] -= ko[i]; }\n"
+             "        }\n";
+        h += "        if (isPoint)\n"
              "        {\n"
              "            // Point sprite: corner in bits 29-30, expanded around the point in screen space.\n"
              "            uint corner = (e >> 29) & 3u;\n"
-             "            r.pos = vp[0]; r.o = vq[0];\n"
              "            float2 d = opts.x > 0 ? opts.xx : vpoint.xy;\n"
              "            d = clamp(d, vpoint.zz, vpoint.ww);\n"
              "            float2 c = float2(corner & 1u, corner >> 1);\n"
              "            r.pcoord = c;\n"
              "            pointOffset = (c * 2.0 - 1.0) * d * 0.5;\n"
-             "        }\n"
-             "        else\n"
-             "        {\n"
-             "            // Rectangle second triangle: role 0 is the computed fourth corner, roles 1 and 2 the\n"
-             "            // ends of the hypotenuse (the corners next to the right angle).\n"
-             "            uint role = (e >> 29) & 3u;\n"
-             "            float d01 = distance(vp[0].xy / vp[0].w, vp[1].xy / vp[1].w), d02 = distance(vp[0].xy / vp[0].w, vp[2].xy / vp[2].w);\n"
-             "            float d12 = distance(vp[1].xy / vp[1].w, vp[2].xy / vp[2].w);\n"
-             "            uint ra = (d12 >= d01 && d12 >= d02) ? 0u : ((d02 >= d01) ? 1u : 2u);\n"
-             "            uint e1 = (ra + 1u) % 3u, e2 = (ra + 2u) % 3u;\n"
-             "            if (role == 1u) { r.pos = vp[e1]; r.o = vq[e1]; }\n"
-             "            else if (role == 2u) { r.pos = vp[e2]; r.o = vq[e2]; }\n"
-             "            else { r.pos = vp[e1] + vp[e2] - vp[ra]; [unroll] for (int i = 0; i < 16; i++) r.o[i] = vq[e1][i] + vq[e2][i] - vq[ra][i]; }\n"
              "        }\n"
              "    }\n"
              "    float2 size = float2(vinfo.zw);\n"
@@ -1490,8 +1976,25 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    // per-axis scale and offset to screen pixels; back to D3D clip space after.\n"
              "    // Hor+: on a wider-than-16:9 output a full-width pass is drawn wider; perspective\n"
              "    // geometry is narrowed to match, so the view widens instead of stretching.\n"
-             "    const bool flat = abs(r.pos.w - 1.0) <= 1e-4;\n"
-             "    if (!flat) r.pos.xy *= vwide.xy;\n"
+             "    const bool flat = abs(r.pos.w - 1.0) <= 1e-4;\n";
+        // VR stereo (REGPU_VR=stereo): perspective geometry seen from one eye, the view moved sideways in the camera's
+        // space: clip x moves by -P00 * eye offset, the same at every depth (vdepth.y, renderer.cpp; 0 outside the
+        // main view). Only in stereo mode, so the shaders (and their cache entries) stay as they were otherwise.
+        if (StereoShaders())
+            h += "    if (!flat) r.pos.x += vdepth.y;\n";
+        // Triple screen: the screen's view of the game's wide frustum (x' = a x + b w, w' = c x + d w, y' = e y; depth
+        // kept for the screen's view: z += w' - w, exact for a projection with z = w + B, close for far >> near).
+        if (TripleShaders())
+            h += "    if (!flat && vdepth.w != 0.0)\n"
+                 "    {\n"
+                 "        const float x0 = r.pos.x, w0 = r.pos.w;\n"
+                 "        const float w1 = vtriple.z * x0 + vtriple.w * w0;\n"
+                 "        r.pos.x = vtriple.x * x0 + vtriple.y * w0;\n"
+                 "        r.pos.y *= vdepth.z;\n"
+                 "        r.pos.z += w1 - w0;\n"
+                 "        r.pos.w = w1;\n"
+                 "    }\n";
+        h += "    if (!flat) r.pos.xy *= vwide.xy;\n"
              "    float w = r.pos.w;\n"
              "    // (VTX_W0_FMT set means w is the true W0, the normal case.)\n"
              "    float3 p = r.pos.xyz;\n"
@@ -1552,8 +2055,18 @@ TranslatedShader TranslateShader(const Shader& shader)
             h += "float4 main(VSOut input) : SV_Target0\n{\n";
         // Interpolators land in r0-r15; the generated parameter in the register pinfo.y names.
         std::string inputs;
+        // N9 (REGPU_HALF_REGS=1): registers no coordinate, predicate, address or depth depends on, declared 16-bit
+        // (DXC with REGPU_HALF_REGS compiles them as real halves: dxc.cpp; FXC only as a min-precision hint). Not when a
+        // register is accessed relatively, nor for the generated-parameter register (a pixel position).
+        static const bool halfEnv = getenv("REGPU_HALF_REGS") && atoi(getenv("REGPU_HALF_REGS")) != 0;
+        const bool halfRegs = halfEnv && !e.relativeRegs;
+        static const bool halfInputs = halfEnv && atoi(getenv("REGPU_HALF_REGS")) >= 2;
+        const uint64_t keep32 = halfRegs ? e.Precision32() : ~0ull;
         for (uint32_t n : regs)
-            decl += "    float4 r" + std::to_string(n) + (n < 16 ? " = input.o[" + std::to_string(n) + "];\n" : " = 0;\n");
+            // (r0-r15 can receive the pixel position at run time (pinfo.y), which 16 bits can't hold exactly above 2048:
+            // only with REGPU_HALF_REGS=2.)
+            decl += std::string(halfRegs && !((keep32 >> (n & 63)) & 1) && (n >= 16 || halfInputs) ? "    min16float4 r" : "    float4 r") + std::to_string(n) +
+                (n < 16 ? " = input.o[" + std::to_string(n) + "];\n" : " = 0;\n");
         for (uint32_t n : regs)
             if (n < 16)
                 inputs += "    if (pinfo.y == " + std::to_string(n) + "u) r" + std::to_string(n) + " = float4(((pinfo.z & 65536u) ? floor(input.pos.xy) : input.pos.xy) * pinfo2.yz, input.pcoord);\n";
@@ -1597,6 +2110,30 @@ TranslatedShader TranslateShader(const Shader& shader)
             const std::string ret = "    return oC0;\n}\n";
             if (const size_t r = h.rfind(ret); r != std::string::npos)
                 h.replace(r, ret.size(), "    float4 oC[1] = { oC0 };\n    return oC[0];\n}\n");
+        }
+    }
+    // REGPU_EXP_MIN16=1 (FM3 port session 34, a measurement only, read at translation; its shaders cache apart by their
+    // HLSL): a pixel shader's registers and ALU temporaries as min16float (FXC's minimum-precision hint, which a driver
+    // may run at 16 bits). An upper bound on what 16-bit math (I7) could give: coordinates lose precision too, so the
+    // picture may be wrong.
+    static const bool min16 = [] { const char* v = getenv("REGPU_EXP_MIN16"); return v && *v && strcmp(v, "0") != 0; }();
+    if (shader.pixel && min16)
+    {
+        const size_t mainAt = h.find(e.exportsDepth ? "struct PSOut" : "float4 main(VSOut input)");
+        if (mainAt != std::string::npos)
+        {
+            auto replaceFrom = [&h](size_t from, const std::string& a, const std::string& b) {
+                for (size_t at = h.find(a, from); at != std::string::npos; at = h.find(a, at + b.size()))
+                    h.replace(at, a.size(), b);
+            };
+            replaceFrom(mainAt, "    float4 r", "    min16float4 r");
+            replaceFrom(mainAt, "float4 v = float4(0, 0, 0, 0);", "min16float4 v = 0;");
+            replaceFrom(mainAt, "float s = ps;", "min16float s = ps;");
+            replaceFrom(mainAt, "float ps = 0;", "min16float ps = 0;");
+            h.insert(mainAt,
+                "min16float4 Mul9(min16float4 a, min16float4 b) { return (a == 0 || b == 0) ? (min16float4)0 : a * b; }\n"
+                "min16float Mul9(min16float a, min16float b) { return (a == 0 || b == 0) ? (min16float)0 : a * b; }\n"
+                "min16float Dot9(min16float4 a, min16float4 b) { min16float4 m = Mul9(a, b); return m.x + m.y + m.z + m.w; }\n");
         }
     }
     result.hlsl = h;

@@ -30,6 +30,9 @@ struct TranslatedShader
     bool memExport = false;         // a vertex shader writing eA/eM (memory export): not translated, its writes are lost
     std::vector<uint32_t> vertexFetchConstants; // vertex shaders
     std::vector<std::array<uint32_t, 4>> vertexFetchLayout; // vfl[k] for each vertex fetch (see hlsl.cpp)
+    // The first full vertex fetch (Hyper's mesh decimation reads positions through it; from the FM2 port): fetch constant
+    // + 1 (0: none), format | 0x100 when signed, stride and offset in dwords.
+    std::array<uint32_t, 4> positionFetch{};
     // Vertex shaders whose vertex fetch indices are simple arithmetic on the vertex index and constants
     // (index = (vertex + c252.x) * c251.y: four corners per particle): the index expressions, and each
     // fetch's {constant, stride, offset, expression}, so a draw can work out how much of a buffer its
@@ -51,6 +54,18 @@ struct TranslatedShader
     std::array<uint64_t, 4> constantMask{};
     // Vertex shaders: bit per interpolator (o0-o15) the code exports.
     uint32_t interpolatorsWritten = 0;
+    // Where the shader's own code starts in hlsl (after the shared preamble).
+    size_t bodyStart = 0;
+    // REGPU_PLAIN_MUL_PS=2: this pixel shader multiplies as IEEE (no op in it can give inf or NaN).
+    bool plainMul = false;
+    // The other parts of the constant blocks the code reads (ScanBlockUse in renderer.cpp, after the game's
+    // rewrite): bool constants, loop constants, the vertex fetch layout (vfl), the game's vuser constants.
+    // A draw writes the unread ones to the upload ring no more. True (written) until scanned.
+    bool readsBools = true, readsLoops = true, readsFetchLayout = true, readsUser = true;
+    // The float constants the code reads are numbered by their rank in constantMask (PackConstants in
+    // renderer.cpp): a draw writes them packed from c[0], one sequential run instead of a scattered 16-byte store
+    // each (FM3 session 30). Not with relative addressing (the mask is all 256) or a game rewrite hook.
+    bool packedConstants = false;
 };
 
 TranslatedShader TranslateShader(const ucode::Shader& shader);
@@ -91,3 +106,17 @@ bool BakedVertexFetch();
 const char* HlslPreamble();
 // REGPU_LEAN_FETCH=1: lean 2D pixel fetches through a sampler table (root parameter 4, space1).
 bool LeanFetch();
+// REGPU_LEAN_FETCH=2: also the plain-texture fast path (tinfo.x bit 7, set by the renderer).
+int LeanFetchLevel();
+// REGPU_LEAN_VFETCH=1: vertex fetches load only the dwords their format holds.
+bool LeanVertexFetch();
+// REGPU_PLAIN_MUL_PS=1: pixel shaders multiply as IEEE (vertex shaders keep D3D9's 0 x anything = 0).
+bool PlainMulPixel();
+// 0 off, 1 every pixel shader, 2 pixel shaders without inf/NaN-making ops (session 33 of the FM3 port).
+int PlainMulPixelLevel();
+// REGPU_FETCH_SPECIALIZE (renderer.cpp SpecVariant): the lean TFetch2D as TFetch2DK(slot, coord, denorm, bias, texel,
+// filt, info, w), its fetch-constant words (tinfo.x, tinfo.w) as arguments: a variant passes them as literals.
+const std::string& SpecializedFetchFunction();
+// L62 (FM3 port, session 34): the full TFetch path as TFetchK(slot, coord, denorm, vertexStage, bias, texel, info, w)
+// (with TFetchRawK); part of SpecializedFetchFunction's text.
+std::string SpecializedFullFetchFunction();

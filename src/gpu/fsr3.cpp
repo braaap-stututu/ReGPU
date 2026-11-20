@@ -1,223 +1,180 @@
-// AMD FSR 3 and FSR 4 upscaling (FidelityFX API, MIT): the same inputs as DLSS (see dlss.h). Needs
-// amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll next to the
-// executable (copied there by the build). FSR 3 runs on any D3D12 GPU. FSR 4 is the same upscaler
-// DLL's ML version: the FidelityFX API lists the versions this GPU can run and one is picked by name
-// (REGPU_FSR_VERSION=<text> picks the first whose name contains the text, for testing).
-// Context lifetime, sticky HDR, the exception guards and the FSR 4 version pick are from the FM4 port (Aiden Piercee).
+// AMD FSR 3 / FSR 4 upscaling (FidelityFX API, MIT): the same inputs as DLSS (see dlss.h). Needs
+// amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll next to the executable (copied there by the build).
+// The upscaler DLL (4.0.x in SDK 2.1) holds several versions: FSR 4 (machine-learned, RDNA 4 GPUs) and FSR 3.1 (any
+// D3D12 GPU). DlssSetup::fsr4 picks the newest 4.x the device offers, else the newest 3.x (FM3 port, session 36).
+//
+// Contexts are kept, one per setup (FM3 port, session 36): a setup change (the scene image switching between 8-bit and
+// HDR formats while a track loads) used to destroy the context at once and create another, while the GPU had not yet
+// run the work already recorded with the old one (this frame's list is still open, earlier frames may be in flight):
+// its history and work textures were freed under the GPU's feet, and at 4K the AMD driver timed out (FM3 OPEN-ISSUES U,
+// six re-creations in 23 s, then the display reset). A switch between kept contexts resets that context's history.
 #include "gpu/fsr3.h"
+
+#include <cstring>
+#include <string>
+#include <vector>
 
 #include <ffx_api.h>
 #include <ffx_upscale.h>
 #include <dx12/ffx_api_dx12.h>
 
-#include <dxgi1_4.h>
-#include <wrl/client.h>
-
-#include <cstdlib>
-#include <cstring>
-#include <vector>
-
 #include "log.h"
 
 namespace
 {
+struct Fsr3Context
+{
+    DlssSetup setup{};
+    ffxContext context = nullptr;
+};
 struct Fsr3
 {
     bool failed = false;
-    ffxContext context = nullptr;
-    DlssSetup setup{};
-    // A replaced context is destroyed kRetireFrames evaluations later, once the frames in flight that
-    // used it are done (destroying it at once could free resources the GPU was still using).
-    struct Retired
-    {
-        ffxContext context;
-        int left;
-    };
-    std::vector<Retired> retired;
-    bool hdrSeen = false; // sticky: the scene format flips in menus, which would rebuild the context
-    bool ml = false;      // the context is an FSR 4 (ML) one
-    bool versionsLogged = false;
+    std::vector<Fsr3Context> contexts; // at most kMaxContexts, for the life of the device
+    const void* last = nullptr;        // the context of the last dispatch (a different one starts without history)
+    bool listed = false;
+    uint64_t fsr4Version = 0, fsr3Version = 0;
+    std::string fsr4Name, fsr3Name;
 } g_fsr3;
-constexpr int kRetireFrames = 8;
+constexpr size_t kMaxContexts = 4;
 
-bool Contains(const char* name, const char* text)
+// The major version in a provider's display name ("FSR 4.0.3" -> 4; 0 if none).
+int MajorOf(const char* name)
 {
-    return name && std::strstr(name, text) != nullptr;
+    for (const char* p = name; p && *p; p++)
+        if (*p >= '0' && *p <= '9')
+            return atoi(p);
+    return 0;
 }
 
-// A name from the list of upscaler versions the API offers: "FSR 4" ones are the ML models. The names'
-// wording is the SDK's, so REGPU_FSR_VERSION can override the match.
-bool IsMlVersion(const char* name)
+// The upscaler versions this device offers, listed once: the newest 4.x and 3.x by their order (the API lists the
+// default, newest, first).
+void ListVersions(ID3D12Device* device)
 {
-    // (A bare version such as "4.1.2" starts with 4; "3.1.4" must not match.)
-    return Contains(name, "FSR 4") || Contains(name, "FSR4") || (name && name[0] == '4' && name[1] == '.');
-}
-
-// FSR 4 is the ML upscaler. The FidelityFX API lists it on RDNA 2/3 too (a slower fallback path in newer
-// SDKs), where in the FM4 port it worked but hung the device and crashed inside amdxc64.dll in some long
-// runs. So it is opt-in: Config::Upscaler::Fsr4 runs FSR 3 unless REGPU_FSR4=1 is set. The adapter is
-// logged either way.
-bool Fsr4Enabled(ID3D12Device* device)
-{
-    static int cached = -1;
-    if (cached >= 0)
-        return cached != 0;
-    const char* v = std::getenv("REGPU_FSR4");
-    const bool on = v && *v == '1';
-    const char* state = on ? "enabled (REGPU_FSR4=1)" : "off by default, using FSR 3 (REGPU_FSR4=1 to try it)";
-    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
-    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))))
-    {
-        DXGI_ADAPTER_DESC1 d{};
-        adapter->GetDesc1(&d);
-        Log("fsr: adapter %04x:%04x, FSR 4 %s", d.VendorId, d.DeviceId, state);
-    }
-    else
-        Log("fsr: FSR 4 %s", state);
-    cached = on ? 1 : 0;
-    return on;
-}
-
-// The version id to ask for, or false to leave the choice to the SDK (which takes the newest one the
-// GPU runs, so FSR 4 where supported and FSR 3.1 elsewhere). `found`: a version of the wanted kind was listed.
-bool PickVersion(ID3D12Device* device, bool ml, uint64_t& id, bool& found)
-{
-    found = false;
+    if (g_fsr3.listed)
+        return;
+    g_fsr3.listed = true;
     uint64_t count = 0;
     ffxQueryDescGetVersions q{};
     q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
     q.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     q.device = device;
     q.outputCount = &count;
-    if (ffxQuery(nullptr, &q.header) != FFX_API_RETURN_OK || count == 0)
-        return false;
+    if (ffxQuery(nullptr, &q.header) != FFX_API_RETURN_OK || !count)
+    {
+        Log("fsr: no upscaler versions listed (the default one is used)");
+        return;
+    }
     std::vector<uint64_t> ids(count);
     std::vector<const char*> names(count);
-    q.outputCount = &count;
     q.versionIds = ids.data();
     q.versionNames = names.data();
     if (ffxQuery(nullptr, &q.header) != FFX_API_RETURN_OK)
-        return false;
-    if (!g_fsr3.versionsLogged)
+        return;
+    std::string all;
+    for (uint64_t i = 0; i < count; i++)
     {
-        g_fsr3.versionsLogged = true;
-        for (uint64_t i = 0; i < count; ++i)
-            Log("fsr: upscaler version %llu: %s", (unsigned long long)ids[i], names[i] ? names[i] : "?");
+        const char* name = names[i] ? names[i] : "?";
+        all += (i ? ", " : "") + std::string(name);
+        const int major = MajorOf(name);
+        if (major >= 4 && !g_fsr3.fsr4Version)
+            g_fsr3.fsr4Version = ids[i], g_fsr3.fsr4Name = name;
+        if (major == 3 && !g_fsr3.fsr3Version)
+            g_fsr3.fsr3Version = ids[i], g_fsr3.fsr3Name = name;
     }
-    const char* want = std::getenv("REGPU_FSR_VERSION");
-    for (uint64_t i = 0; i < count; ++i)
+    Log("fsr: upscaler versions on this GPU: %s", all.c_str());
+}
+
+Fsr3Context* ContextFor(ID3D12Device* device, const DlssSetup& setup)
+{
+    for (Fsr3Context& c : g_fsr3.contexts)
+        if (c.setup == setup)
+            return &c;
+    if (g_fsr3.contexts.size() >= kMaxContexts)
     {
-        const bool match = (want && *want) ? Contains(names[i], want) : IsMlVersion(names[i]) == ml;
-        if (match)
-        {
-            id = ids[i];
-            found = true;
-            Log("fsr: using %s", names[i]);
-            return true;
-        }
+        static bool logged = false;
+        if (!logged)
+            Log("fsr: %zu contexts already: this setup falls back to FSR 1", kMaxContexts);
+        logged = true;
+        return nullptr;
     }
-    if (!ml && !(want && *want))
-        Log("fsr: no non-ML upscaler version listed; the SDK default may be FSR 4");
-    return false;
+    ListVersions(device);
+    g_fsr3.contexts.reserve(kMaxContexts); // (dispatches use the element's address)
+    uint64_t version = setup.fsr4 ? g_fsr3.fsr4Version : g_fsr3.fsr3Version;
+    const char* versionName = setup.fsr4 ? g_fsr3.fsr4Name.c_str() : g_fsr3.fsr3Name.c_str();
+    if (setup.fsr4 && !version)
+    {
+        static bool logged = false;
+        if (!logged)
+            Log("fsr: FSR 4 is not offered on this GPU by its driver (RDNA 4; RDNA 3 with recent drivers, INT8): FSR 3 instead");
+        logged = true;
+        version = g_fsr3.fsr3Version;
+        versionName = g_fsr3.fsr3Name.c_str();
+    }
+    ffxCreateBackendDX12Desc backend{};
+    backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+    backend.device = device;
+    // SDK 2.1: the API version the program was built against must be chained (super-resolution-ml.md, "New APIs").
+    ffxCreateContextDescUpscaleVersion apiVersion{};
+    apiVersion.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
+    apiVersion.version = FFX_UPSCALER_VERSION;
+    apiVersion.header.pNext = &backend.header;
+    ffxOverrideVersion pick{};
+    pick.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    pick.versionId = version;
+    if (version)
+        backend.header.pNext = &pick.header;
+    ffxCreateContextDescUpscale create{};
+    create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+    create.header.pNext = &apiVersion.header;
+    create.maxRenderSize = { setup.renderWidth, setup.renderHeight };
+    create.maxUpscaleSize = { setup.outputWidth, setup.outputHeight };
+    create.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | (setup.depthInverted ? FFX_UPSCALE_ENABLE_DEPTH_INVERTED : 0) |
+        (setup.hdr ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : 0);
+    Fsr3Context c;
+    c.setup = setup;
+    ffxReturnCode_t r = FFX_API_RETURN_ERROR;
+    try
+    {
+        r = ffxCreateContext(&c.context, &create.header, nullptr);
+    }
+    catch (...)
+    {
+        // (A C++ exception out of the FidelityFX DLL: seen in the FM4 port when the device was lost.)
+        Log("fsr: ffxCreateContext threw; the device is probably lost");
+    }
+    if (r != FFX_API_RETURN_OK)
+    {
+        Log("fsr: create failed (%d): amd_fidelityfx_*_dx12.dll missing?", int(r));
+        if (g_fsr3.contexts.empty())
+            g_fsr3.failed = true;
+        return nullptr;
+    }
+    Log("fsr: %s, %ux%u -> %ux%u%s (context %zu)", *versionName ? versionName : "default version", setup.renderWidth, setup.renderHeight,
+        setup.outputWidth, setup.outputHeight, setup.hdr ? ", HDR" : "", g_fsr3.contexts.size() + 1);
+    g_fsr3.contexts.push_back(c);
+    return &g_fsr3.contexts.back();
 }
+} // namespace
 
-bool FsrEvaluate(ID3D12Device* device, ID3D12GraphicsCommandList* list, const DlssSetup& setup, const DlssFrame& frame, float sharpness, bool ml);
-}
-
-bool Fsr3Evaluate(ID3D12Device* device, ID3D12GraphicsCommandList* list, const DlssSetup& setup, const DlssFrame& frame, float sharpness)
-{
-    return FsrEvaluate(device, list, setup, frame, sharpness, false);
-}
-
-bool Fsr4Evaluate(ID3D12Device* device, ID3D12GraphicsCommandList* list, const DlssSetup& setup, const DlssFrame& frame, float sharpness)
-{
-    return FsrEvaluate(device, list, setup, frame, sharpness, Fsr4Enabled(device));
-}
-
-namespace
-{
-bool FsrEvaluate(ID3D12Device* device, ID3D12GraphicsCommandList* list, const DlssSetup& setup, const DlssFrame& frame, float sharpness, bool ml)
+// On the draw thread (FM3 port, session 36): the context for `setup`, made on first use; *handle and *switched (a
+// different context than the last dispatch's: no history) go to Fsr3Dispatch, which runs where the list replays.
+bool Fsr3Prepare(ID3D12Device* device, const DlssSetup& setup, void** handle, bool* switched)
 {
     if (g_fsr3.failed)
         return false;
-    for (size_t i = 0; i < g_fsr3.retired.size();)
-    {
-        if (--g_fsr3.retired[i].left <= 0)
-        {
-            ffxDestroyContext(&g_fsr3.retired[i].context, nullptr);
-            g_fsr3.retired.erase(g_fsr3.retired.begin() + ptrdiff_t(i));
-        }
-        else
-            ++i;
-    }
-    g_fsr3.hdrSeen = g_fsr3.hdrSeen || setup.hdr;
-    DlssSetup want = setup;
-    want.hdr = g_fsr3.hdrSeen;
-    if (!g_fsr3.context || !(want == g_fsr3.setup) || ml != g_fsr3.ml)
-    {
-        const char* why = !g_fsr3.context ? "first context" : ml != g_fsr3.ml ? "FSR 3/4 switched"
-            : (want.renderWidth != g_fsr3.setup.renderWidth || want.renderHeight != g_fsr3.setup.renderHeight) ? "render size changed"
-            : (want.outputWidth != g_fsr3.setup.outputWidth || want.outputHeight != g_fsr3.setup.outputHeight) ? "output size changed"
-            : want.hdr != g_fsr3.setup.hdr ? "scene became HDR" : "quality or depth flags changed";
-        Log("%s: new context (%s): %ux%u -> %ux%u", ml ? "fsr4" : "fsr3", why, want.renderWidth, want.renderHeight, want.outputWidth, want.outputHeight);
-        if (g_fsr3.context)
-        {
-            g_fsr3.retired.push_back({ g_fsr3.context, kRetireFrames });
-            g_fsr3.context = nullptr;
-        }
-        ffxCreateBackendDX12Desc backend{};
-        backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
-        backend.device = device;
-        // The version is pinned by name: FSR 4 only when asked for, and FSR 3 otherwise even where the SDK's
-        // own choice would be FSR 4. FSR 4 asked for but not listed for this GPU: FSR 3.
-        ffxOverrideVersion version{};
-        uint64_t versionId = 0;
-        bool found = false;
-        bool pinned = PickVersion(device, ml, versionId, found);
-        const bool runsMl = ml && found;
-        if (ml && !found)
-        {
-            static bool said = false;
-            if (!said)
-                Log("fsr4: this GPU and driver list no FSR 4 version; using FSR 3");
-            said = true;
-            pinned = PickVersion(device, false, versionId, found);
-        }
-        if (pinned)
-        {
-            version.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
-            version.versionId = versionId;
-            backend.header.pNext = &version.header;
-        }
-        ffxCreateContextDescUpscale create{};
-        create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-        create.header.pNext = &backend.header;
-        create.maxRenderSize = { want.renderWidth, want.renderHeight };
-        create.maxUpscaleSize = { want.outputWidth, want.outputHeight };
-        create.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | (want.depthInverted ? FFX_UPSCALE_ENABLE_DEPTH_INVERTED : 0) |
-            (want.hdr ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : 0);
-        ffxReturnCode_t r = FFX_API_RETURN_ERROR;
-        try
-        {
-            r = ffxCreateContext(&g_fsr3.context, &create.header, nullptr);
-        }
-        catch (...)
-        {
-            // (A C++ exception out of the FidelityFX DLL: seen in FM4 when the device was lost.)
-            Log("fsr3: ffxCreateContext threw; the device is probably lost");
-        }
-        if (r != FFX_API_RETURN_OK)
-        {
-            Log("fsr3: create failed (%d): amd_fidelityfx_*_dx12.dll missing?", int(r));
-            g_fsr3.context = nullptr;
-            g_fsr3.failed = true;
-            return false;
-        }
-        g_fsr3.setup = want;
-        g_fsr3.ml = ml;
-        Log("%s: context ready%s%s", ml ? "fsr4" : "fsr3", ml && !runsMl ? " (running FSR 3)" : "", want.hdr ? ", HDR" : "");
-    }
+    Fsr3Context* c = ContextFor(device, setup);
+    if (!c)
+        return false;
+    *switched = g_fsr3.last != c->context;
+    g_fsr3.last = c->context;
+    *handle = c->context;
+    return true;
+}
+
+bool Fsr3Dispatch(ID3D12GraphicsCommandList* list, void* handle, bool switched, const DlssSetup& setup, const DlssFrame& frame, float sharpness)
+{
+    ffxContext context = handle;
     ffxDispatchDescUpscale d{};
     d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     d.commandList = list;
@@ -235,7 +192,7 @@ bool FsrEvaluate(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Dl
     d.sharpness = sharpness;
     d.frameTimeDelta = frame.frameTimeMs;
     d.preExposure = 1.0f;
-    d.reset = frame.reset;
+    d.reset = frame.reset || switched;
     // The game's camera is unknown here; typical values (used for depth-based heuristics).
     d.cameraNear = 0.1f;
     d.cameraFar = 10000.0f;
@@ -244,20 +201,34 @@ bool FsrEvaluate(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Dl
     ffxReturnCode_t r = FFX_API_RETURN_ERROR;
     try
     {
-        r = ffxDispatch(&g_fsr3.context, &d.header);
+        r = ffxDispatch(&context, &d.header);
     }
     catch (...)
     {
-        Log("fsr3: ffxDispatch threw; the device is probably lost");
+        Log("fsr: ffxDispatch threw; the device is probably lost");
         g_fsr3.failed = true;
     }
     if (r != FFX_API_RETURN_OK)
     {
         static int logged = 0;
         if (logged++ < 3)
-            Log("fsr3: dispatch failed (%d)", int(r));
+            Log("fsr: dispatch failed (%d)", int(r));
         return false;
     }
     return true;
 }
-} // namespace
+
+bool Fsr3Evaluate(ID3D12Device* device, ID3D12GraphicsCommandList* list, const DlssSetup& setup, const DlssFrame& frame, float sharpness)
+{
+    void* handle = nullptr;
+    bool switched = false;
+    return Fsr3Prepare(device, setup, &handle, &switched) && Fsr3Dispatch(list, handle, switched, setup, frame, sharpness);
+}
+
+// Upscaler::Fsr4 through the one-step path (from the FM2 port): FSR 4 where the device offers it, else FSR 3.
+bool Fsr4Evaluate(ID3D12Device* device, ID3D12GraphicsCommandList* list, const DlssSetup& setup, const DlssFrame& frame, float sharpness)
+{
+    DlssSetup s = setup;
+    s.fsr4 = true;
+    return Fsr3Evaluate(device, list, s, frame, sharpness);
+}

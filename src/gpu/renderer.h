@@ -8,6 +8,20 @@ void RendererSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t used
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize);
 // frontBuffer: physical address of the resolved image to show.
 void RendererOnSwap(uint64_t frame, uint32_t frontBuffer);
+// VR stereo (gpu.cpp stereo::): the draw is in the main view (the full-width surface); the eye being drawn (clip-space x
+// offset of the main view's perspective geometry, 0 none); the front buffer as resolved so far, graded as the presenter
+// shows it, into the headset's image for `eye`.
+bool RendererMainViewNow();
+void RendererSetStereoEye(float clipX);
+// The second eye's pass runs: resolves are not written back to guest memory (the first pass did).
+void RendererSetStereoReplay(bool on);
+void RendererStereoCaptureEye(int eye, uint32_t frontBuffer);
+// Triple screen (REGPU_TRIPLE, gpu.cpp stereo::): this pass's view (regpu::triple::View's a b c d e; null = off) and
+// whether it is a side screen (no HUD); the pass's front buffer into screen `slot` (0 left, 1 centre, 2 right) of the
+// triple-wide picture.
+void RendererSetTripleView(const float* view, bool side);
+void RendererTripleCapture(int slot, uint32_t frontBuffer);
+bool TripleMode();
 // Lookahead hooks (see GpuLookahead): shader loads and draws the command processor has
 // not executed yet, seen on a shadow copy of the registers.
 void RendererPredictBegin();
@@ -28,6 +42,10 @@ void RendererSetGammaPwl(uint32_t index, uint32_t component, uint32_t data);
 // Benchmark: frame times are recorded while on; the report summarises them.
 void BenchmarkRecord(bool on);
 void BenchmarkWriteReport(const char* path);
+// The long-frame log (REGPU_LONG_FRAMES, renderer.cpp): whether it is on, and the draw thread's waits for the
+// command processor (ms), summed per frame.
+bool LongFramesOn();
+void RendererDrawThreadIdle(double ms);
 // True while REGPU_TRACE_DRAWS's frame is being recorded.
 bool RendererTracing();
 
@@ -81,6 +99,14 @@ void RendererOcclusionBegin();
 // The query's samples that passed and, as the console's Total, the samples its draws covered, as
 // counted for the last finished query that wrote its counts to `address` (RB_SAMPLE_COUNT_ADDR).
 bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total, uint32_t address);
+// Whether a query is counting now (begun or resumed, not paused or ended): its draws must be recorded on
+// the command processor's list (gpu.cpp, seg::g_query).
+bool RendererOcclusionCounting();
+// With the draw thread: the command processor answers a query's end (`kindOrder`: its place among this
+// frame's queries to `address`, counted by the caller), the draw thread records its end (after
+// RendererOcclusionBegin for each of its starts).
+bool RendererOcclusionAnswer(uint32_t& samples, uint32_t& total, uint32_t address, uint32_t kindOrder);
+void RendererOcclusionEndOn(uint32_t address, uint32_t kindOrder);
 // Follows the tile state draws set (see DrawImpl), for the state at each piece's start.
 void RendererTrackTile(RendererTile& tile);
 void RendererSetTile(const RendererTile& tile);

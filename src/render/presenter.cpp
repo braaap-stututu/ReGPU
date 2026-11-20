@@ -2,12 +2,16 @@
 // VdSwap hands a frame over; a render thread presents it without blocking
 // the guest. Until the D3D hooks draw real content the frame is a clear
 // whose shade pulses with the frame count, proving the path end to end.
+#include "render/xr.h"
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cstdlib>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <string>
+#include <vector>
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -15,6 +19,8 @@
 #include <wrl/client.h>
 
 #include "log.h"
+#include "live_switch.h"
+#include "precise_sleep.h"
 #include "render/presenter.h"
 #include "settings.h"
 
@@ -165,18 +171,66 @@ void EnsureDevice()
             Log("presenter: device-removed breadcrumbs and page-fault reporting on (REGPU_DRED)");
         }
     }
-    ComPtr<IDXGIAdapter1> adapter = PickAdapter();
-    Check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device)), "D3D12CreateDevice");
-    if (adapter)
+    // REGPU_ADAPTER (FM3 port, session 33; the FM3 launcher's "Graphics card"): the GPU to render on, as a part of its
+    // name ("7900", "Radeon(TM) Graphics"; case-insensitive, the first match), an adapter index ("1"), or "high" /
+    // "low" (Windows' high-performance / power-saving GPU). Empty or no match: the high-performance adapter (PickAdapter).
+    ComPtr<IDXGIAdapter1> chosen;
+    if (const char* want = getenv("REGPU_ADAPTER"); want && *want)
     {
-        DXGI_ADAPTER_DESC1 desc{};
-        adapter->GetDesc1(&desc);
-        char name[128] = {};
-        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
-        Log("presenter: drawing on %s", name);
+        ComPtr<IDXGIFactory6> factory;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+        {
+            std::string w = want;
+            std::transform(w.begin(), w.end(), w.begin(), [](unsigned char c) { return char(tolower(c)); });
+            if (w == "high" || w == "low")
+                factory->EnumAdapterByGpuPreference(0, w == "high" ? DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE : DXGI_GPU_PREFERENCE_MINIMUM_POWER,
+                    IID_PPV_ARGS(&chosen));
+            else if (w.find_first_not_of("0123456789") == std::string::npos)
+                factory->EnumAdapters1(UINT(atoi(want)), &chosen);
+            else
+            {
+                ComPtr<IDXGIAdapter1> a;
+                for (UINT i = 0; !chosen && factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++)
+                {
+                    DXGI_ADAPTER_DESC1 d{};
+                    a->GetDesc1(&d);
+                    char name[128] = {};
+                    WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+                    std::string n = name;
+                    std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return char(tolower(c)); });
+                    if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && n.find(w) != std::string::npos)
+                        chosen = a;
+                }
+            }
+        }
+        if (!chosen)
+            Log("presenter: REGPU_ADAPTER=%s matches no graphics card: using the default one", want);
     }
-    else
-        Log("presenter: drawing on the default adapter");
+    if (chosen && FAILED(D3D12CreateDevice(chosen.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device))))
+    {
+        Log("presenter: REGPU_ADAPTER=%s: that graphics card can't run D3D12 feature level 12_0: using the default one", getenv("REGPU_ADAPTER"));
+        chosen.Reset();
+    }
+    if (!g_device)
+    {
+        // No REGPU_ADAPTER: the high-performance GPU on laptops with two (PickAdapter), else Windows' default.
+        ComPtr<IDXGIAdapter1> adapter = PickAdapter();
+        Check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device)), "D3D12CreateDevice");
+    }
+    {
+        // Which card it is (by the device's LUID), for the log and bug reports.
+        ComPtr<IDXGIFactory4> factory;
+        ComPtr<IDXGIAdapter1> a;
+        DXGI_ADAPTER_DESC1 d{};
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapterByLuid(g_device->GetAdapterLuid(), IID_PPV_ARGS(&a))) &&
+            SUCCEEDED(a->GetDesc1(&d)))
+        {
+            char name[128] = {};
+            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+            Log("presenter: rendering on %s (%04X:%04X, %llu MB of its own memory)%s", name, d.VendorId, d.DeviceId,
+                (unsigned long long)(d.DedicatedVideoMemory >> 20), chosen ? " (REGPU_ADAPTER)" : "");
+        }
+    }
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     Check(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_queue)), "CreateCommandQueue");
@@ -188,6 +242,8 @@ void EnsureDevice()
 // area the window is placed at its top left, title bar on screen. Pixels are physical: the process is
 // made per-monitor DPI aware before ReGPU opens a window (a host's window has its own awareness).
 // Maximised or borderless (fullscreen) windows are left alone. Asynchronous: safe off the window's thread.
+RECT MonitorRow();
+bool SpanMonitors();
 void SizeWindow(HWND hwnd, uint32_t width, uint32_t height)
 {
     if (!hwnd || !width || !height || IsZoomed(hwnd))
@@ -200,6 +256,8 @@ void SizeWindow(HWND hwnd, uint32_t width, uint32_t height)
     const int w = r.right - r.left, h = r.bottom - r.top;
     MONITORINFO mi{ sizeof(mi) };
     GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    if (SpanMonitors())
+        mi.rcWork = MonitorRow(); // (triple screen: the whole row of monitors, not the nearest one)
     RECT now{};
     GetWindowRect(hwnd, &now);
     // Kept on the work area as far as it fits; its top left (the title bar) always is.
@@ -232,6 +290,50 @@ void LayoutSurface()
     SetWindowPos(g_p.surface, nullptr, (cw - w) / 2, (ch - h) / 2, w, h, SWP_NOZORDER | SWP_NOACTIVATE | (own ? 0u : UINT(SWP_ASYNCWINDOWPOS)));
 }
 
+// Fullscreen over several monitors (REGPU_TRIPLE, or REGPU_FULLSCREEN_SPAN=1; FM3 port session 39): the row of monitors
+// the primary one is in (those beside it that overlap its rows, side by side), as one rectangle. Separate monitors, not
+// an Eyefinity/Surround desktop, show the triple-wide picture this way. One monitor: just it.
+RECT MonitorRow()
+{
+    struct Ctx { RECT primary{}; std::vector<RECT> all; } ctx;
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM p) -> BOOL {
+        auto& c = *reinterpret_cast<Ctx*>(p);
+        MONITORINFO mi{ sizeof(mi) };
+        if (GetMonitorInfoW(m, &mi))
+        {
+            c.all.push_back(mi.rcMonitor);
+            if (mi.dwFlags & MONITORINFOF_PRIMARY)
+                c.primary = mi.rcMonitor;
+        }
+        return TRUE;
+    }, LPARAM(&ctx));
+    RECT row = ctx.primary;
+    // Grow left and right with monitors that touch the row's edge and share most of its height.
+    for (bool grew = true; grew;)
+    {
+        grew = false;
+        for (const RECT& r : ctx.all)
+        {
+            const LONG overlap = std::min(r.bottom, row.bottom) - std::max(r.top, row.top);
+            if (overlap < (row.bottom - row.top) / 2)
+                continue;
+            if (std::abs(r.right - row.left) <= 8 && r.left < row.left) { row.left = r.left; grew = true; }
+            if (std::abs(r.left - row.right) <= 8 && r.right > row.right) { row.right = r.right; grew = true; }
+        }
+    }
+    return row;
+}
+
+bool SpanMonitors()
+{
+    static const bool on = [] {
+        const char* t = getenv("REGPU_TRIPLE");
+        const char* s = getenv("REGPU_FULLSCREEN_SPAN");
+        return (t && *t && strcmp(t, "0") != 0) || (s && *s && strcmp(s, "0") != 0);
+    }();
+    return on;
+}
+
 void CreateWindowAndDevice()
 {
     // Physical pixels for the window ReGPU opens (an unaware window at 125% scaling would be stretched).
@@ -260,16 +362,27 @@ void CreateWindowAndDevice()
     }
     else if (settings.fullscreen)
     {
-        // Borderless window over the whole display; the picture is its child window (LayoutSurface).
-        const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+        // Borderless window over the whole display; the picture is its child window (LayoutSurface). Triple screen:
+        // over the row of monitors (MonitorRow).
+        RECT area{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+        if (SpanMonitors())
+        {
+            area = MonitorRow();
+            Log("presenter: fullscreen over the monitors at %ld,%ld, %ldx%ld", area.left, area.top, area.right - area.left, area.bottom - area.top);
+        }
+        const int sw = area.right - area.left, sh = area.bottom - area.top;
         g_p.fullscreen = true;
-        g_p.window = CreateWindowExW(0, L"regpu", GetSettings().windowTitle.c_str(), WS_POPUP | WS_VISIBLE, 0, 0, sw, sh, nullptr, nullptr, wc.hInstance, nullptr);
+        g_p.window = CreateWindowExW(0, L"regpu", GetSettings().windowTitle.c_str(), WS_POPUP | WS_VISIBLE, area.left, area.top, sw, sh, nullptr, nullptr,
+            wc.hInstance, nullptr);
     }
     else
     {
         g_p.window = CreateWindowW(L"regpu", GetSettings().windowTitle.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
             CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr, wc.hInstance, nullptr);
-        SetWindowPos(g_p.window, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER); // (sized from the work area's corner)
+        // (Sized from the work area's corner; triple screen: from the monitor row's left edge, so a three-screen-wide window
+        // starts on the left monitor.)
+        const LONG left = SpanMonitors() ? MonitorRow().left : 0;
+        SetWindowPos(g_p.window, nullptr, left, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
         SizeWindow(g_p.window, outW, outH);
         ShowWindow(g_p.window, SW_SHOW);
     }
@@ -294,6 +407,7 @@ void CreateWindowAndDevice()
     EnsureDevice();
     g_p.device = g_device;
     g_p.queue = g_queue;
+    regpu::xr::Start(g_device.Get(), g_queue.Get()); // (REGPU_VR: the headset thread, on this device and queue)
 
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width = outW;
@@ -544,7 +658,8 @@ void PresenterUseRenderer()
     g_rendererActive = true;
 }
 
-bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, ID3D12Resource* overlay, uint32_t overlayW, uint32_t overlayH)
+bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, ID3D12Resource* overlay, uint32_t overlayW, uint32_t overlayH,
+    ID3D12Resource* timer, uint32_t timerW, uint32_t timerH, ID3D12Resource* fps, uint32_t fpsW, uint32_t fpsH, PresenterGrade grade, void* gradeCtx)
 {
     if (!g_p.ready)
         return false;
@@ -571,9 +686,27 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, I
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     }
-    list->ResourceBarrier(1, &b);
-    if (!offsetX && !offsetY && sd.Width == bd.Width && sd.Height == bd.Height)
-        list->CopyResource(backBuffer, src);
+    const bool sameSize = !offsetX && !offsetY && sd.Width == bd.Width && sd.Height == bd.Height;
+    if (grade && sameSize)
+    {
+        // The gamma pass writes the back buffer itself: one full-size write and read less than grading into an image
+        // and copying that (session 33: ~4% at 4K 4x).
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        list->ResourceBarrier(1, &b);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(i) * g_p.rtvStride;
+        grade(list, size_t(rtv.ptr), UINT(bd.Width), bd.Height, gradeCtx);
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        list->ResourceBarrier(1, &b);
+    }
+    else
+        list->ResourceBarrier(1, &b);
+    if (sameSize)
+    {
+        if (!grade)
+            list->CopyResource(backBuffer, src);
+    }
     else
     {
         D3D12_TEXTURE_COPY_LOCATION dst{}, from{};
@@ -591,8 +724,29 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, I
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         from.pResource = overlay;
         from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        list->CopyTextureRegion(&dst, offsetX + 24, offsetY + 24, 0, &from, nullptr);
+        list->CopyTextureRegion(&dst, offsetX + 24, offsetY + 24 + (timer ? timerH : 0), 0, &from, nullptr);
     }
+    if (timer && timerW <= bd.Width && timerH <= bd.Height)
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst{}, from{};
+        dst.pResource = backBuffer;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        from.pResource = timer;
+        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&dst, offsetX, offsetY, 0, &from, nullptr);
+    }
+    if (fps && fpsW <= std::min<UINT64>(sd.Width, bd.Width) && fpsH + 12 <= bd.Height)
+    {
+        // Top centre of the picture.
+        D3D12_TEXTURE_COPY_LOCATION dst{}, from{};
+        dst.pResource = backBuffer;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        from.pResource = fps;
+        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        const UINT shownW = UINT(std::min(sd.Width, bd.Width));
+        list->CopyTextureRegion(&dst, offsetX + (shownW - fpsW) / 2, offsetY + 12, 0, &from, nullptr);
+    }
+    regpu::xr::CaptureFrame(list, backBuffer); // (REGPU_VR: the finished frame for the headset's virtual screen)
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
@@ -600,8 +754,80 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, I
     return true;
 }
 
+uint32_t RegpuFrameCap();
+bool RegpuPerfLiteOn();
+
+// The window, the picture's own window and the swap chain, in physical pixels: logged at the first present and whenever
+// they change (session 39: a triple-screen picture shown at a third of its size on the centre screen).
+void LogWindowSizes()
+{
+    static RECT lastWin{}, lastSurf{};
+    static UINT lastW = 0, lastH = 0;
+    if (!g_p.window || !g_p.swapChain)
+        return;
+    RECT win{}, surf{};
+    GetWindowRect(g_p.window, &win);
+    GetWindowRect(g_p.surface ? g_p.surface : g_p.window, &surf);
+    DXGI_SWAP_CHAIN_DESC1 d{};
+    g_p.swapChain->GetDesc1(&d);
+    if (memcmp(&win, &lastWin, sizeof(win)) == 0 && memcmp(&surf, &lastSurf, sizeof(surf)) == 0 && d.Width == lastW && d.Height == lastH)
+        return;
+    lastWin = win, lastSurf = surf, lastW = d.Width, lastH = d.Height;
+    Log("presenter: window %ld,%ld %ldx%ld, picture %ld,%ld %ldx%ld, swap chain %ux%u, DPI %u", win.left, win.top, win.right - win.left, win.bottom - win.top,
+        surf.left, surf.top, surf.right - surf.left, surf.bottom - surf.top, d.Width, d.Height, GetDpiForWindow(g_p.window));
+}
+
 void PresenterPresent()
 {
+    using Clock = std::chrono::steady_clock;
+    {
+        static Clock::time_point lastCheck{};
+        if (Clock::now() - lastCheck > std::chrono::seconds(5))
+        {
+            lastCheck = Clock::now();
+            LogWindowSizes();
+        }
+    }
+    // REGPU_PRESENT_PACE=1 (live, session 33 of the FM3 port): presents held to an even spacing at the frame cap. The cap
+    // gates the title's VdSwap, at the start of the pipeline; the frame then reaches here after the command processor,
+    // the draw thread and the replay thread, whose time varies with the frame's load: the presents came unevenly (the
+    // 1% slowest present gaps ~15% over the cap's at 1440p even in light seconds). Here a frame waits for its slot
+    // (high-resolution timer, then a short spin); one that comes late starts the spacing again from now.
+    static LiveSwitch pace("REGPU_PRESENT_PACE");
+    static Clock::time_point slot{};
+    if (pace && g_p.ready && !GetSettings().vsync)
+    {
+        const auto interval = std::chrono::microseconds(1000000 / std::max(RegpuFrameCap(), 30u));
+        const auto now = Clock::now();
+        if (slot > now && slot - now <= interval)
+            PreciseSleepUntil(slot, 300);
+        slot = std::max(slot + interval, Clock::now() - interval / 4); // (a little catch-up; no burst after a late one)
+    }
+    // Present gaps for the light performance log: their 99th percentile once a second (what reaches the screen; the
+    // perf lite line's frame times are the draw thread's).
+    if (RegpuPerfLiteOn())
+    {
+        static std::vector<float> gaps;
+        static Clock::time_point last{}, windowStart = Clock::now();
+        const auto now = Clock::now();
+        if (last != Clock::time_point{})
+            gaps.push_back(std::chrono::duration<float, std::milli>(now - last).count());
+        last = now;
+        if (now - windowStart >= std::chrono::seconds(1) && gaps.size() > 10)
+        {
+            std::vector<float> sorted = gaps;
+            const size_t k = std::min(sorted.size() - 1, size_t(double(sorted.size()) * 0.99));
+            std::nth_element(sorted.begin(), sorted.begin() + ptrdiff_t(k), sorted.end());
+            const float p99 = sorted[k], worst = *std::max_element(gaps.begin(), gaps.end());
+            double sum = 0;
+            for (float g : gaps)
+                sum += g;
+            Log("perf lite: presents %zu, gap avg %.3f ms, p99 %.3f ms, max %.2f ms%s", gaps.size(), sum / double(gaps.size()), p99, worst,
+                pace ? " (paced)" : "");
+            gaps.clear();
+            windowStart = now;
+        }
+    }
     // Vsync: wait for the display's refresh; off: present at once (tearing allowed).
     if (g_p.ready)
     {

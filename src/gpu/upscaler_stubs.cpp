@@ -2,6 +2,11 @@
 // unavailable and the renderer falls back as it does on hardware without them.
 #include "gpu/fsr3.h"
 
+#include "gpu/xess.h"
+#ifndef REGPU_XESS
+bool XessInit(ID3D12Device*) { return false; }
+bool XessEvaluate(ID3D12GraphicsCommandList*, const DlssSetup&, const DlssFrame&) { return false; }
+#endif
 #ifndef REGPU_DLSS
 bool DlssInit(ID3D12Device*) { return false; }
 bool DlssEvaluate(ID3D12GraphicsCommandList*, const DlssSetup&, const DlssFrame&) { return false; }
@@ -9,4 +14,6 @@ bool DlssEvaluate(ID3D12GraphicsCommandList*, const DlssSetup&, const DlssFrame&
 #ifndef REGPU_FSR3
 bool Fsr3Evaluate(ID3D12Device*, ID3D12GraphicsCommandList*, const DlssSetup&, const DlssFrame&, float) { return false; }
 bool Fsr4Evaluate(ID3D12Device*, ID3D12GraphicsCommandList*, const DlssSetup&, const DlssFrame&, float) { return false; }
+bool Fsr3Prepare(ID3D12Device*, const DlssSetup&, void**, bool*) { return false; }
+bool Fsr3Dispatch(ID3D12GraphicsCommandList*, void*, bool, const DlssSetup&, const DlssFrame&, float) { return false; }
 #endif

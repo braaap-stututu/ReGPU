@@ -28,6 +28,7 @@ using Clock = std::chrono::steady_clock;
 #include "gpu/regs.h"
 #include "render/presenter.h"
 #include "gpu/renderer.h"
+#include "render/xr.h"
 #include "precise_sleep.h"
 
 extern HANDLE g_profiledWorker; // renderer.cpp
@@ -110,6 +111,7 @@ struct Gpu
     uint64_t droppedDraws = 0;
     uint64_t binMask = ~0ull;
     uint64_t binSelect = ~0ull;
+    bool windowUnion = false; // REGPU_WINDOW_FIXUP_UNION: a predicated window fixup ran since the last draw
     std::atomic<uint64_t> skippedPredicated{ 0 };
     std::atomic<uint64_t> waits{ 0 }, slowWaits{ 0 }, waitMicros{ 0 };
     std::atomic<uint32_t> interruptsHandled{ 0 };
@@ -127,6 +129,22 @@ void RaiseInterrupt(uint32_t source, uint32_t cpu)
     g_gpu.interruptCv.notify_one();
 }
 
+// REGPU_VBLANK_ON_WAIT=1 (live): a memory-polling WAIT_REG_MEM that doesn't hold after a few microseconds wakes the
+// vblank thread, which raises the next vblank at once instead of at its tick. A title that presents on vblank
+// boundaries (the swap waits for a flag its vblank handler clears: PGR3 port, session 4, twice a frame at
+// presentation interval 2, ~140 us each at 4000 Hz) then waits only for the interrupt's round trip. For uncapped
+// play (the title must keep time by its clock, not by vblanks: the extra vblanks run it no faster); off by default.
+bool VblankOnWait()
+{
+    static LiveSwitch on("REGPU_VBLANK_ON_WAIT");
+    return on;
+}
+HANDLE VblankKickEvent()
+{
+    static const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    return event;
+}
+
 // ---- Draw worker ---------------------------------------------------------------------
 // The command processor (this file's CommandProcessorLoop) parses the command stream and
 // keeps the guest's view (registers, read pointer, waits) current; draws are translated on
@@ -139,7 +157,7 @@ void RaiseInterrupt(uint32_t source, uint32_t cpu)
 // 5800X, 98-100 -> 106-108 fps once its main and render threads overlapped.
 namespace work
 {
-enum : uint32_t { kPad, kRegs, kShader, kDraw, kSwap, kWriteBack, kStore };
+enum : uint32_t { kPad, kRegs, kShader, kDraw, kSwap, kWriteBack, kStore, kQuery };
 constexpr uint64_t kWords = 16ull << 20; // 64 MB
 std::vector<uint32_t> g_ring(kWords);
 alignas(64) std::atomic<uint64_t> g_head{ 0 }; // written by the command processor
@@ -148,6 +166,56 @@ std::vector<uint8_t> g_file(0x8000 * 4);       // the worker's register file (re
 // Read when the command processor starts (a host may set REGPU_DRAW_THREAD before regpu::Start).
 bool g_enabled = false;
 std::atomic<bool> g_started{ false };
+
+// Wake-ups only for a thread that waits: each side counts itself in before it sleeps, and the other notifies only
+// when someone is counted (a notify is a call into the OS wait table every time: per record on the command
+// processor ~4% of its time, per batch on the draw thread ~2%; on a 4-thread CPU that time is the draw thread's).
+// The count's locked add and the publisher's seq_cst store each order the following load (x86), so a waiter either
+// sees the new value in wait()'s compare or is seen by the publisher. REGPU_ALWAYS_NOTIFY=1: every time (start-time).
+alignas(64) std::atomic<int> g_headWaiters{ 0 };
+alignas(64) std::atomic<int> g_tailWaiters{ 0 };
+const bool g_alwaysNotify = getenv("REGPU_ALWAYS_NOTIFY") != nullptr;
+// REGPU_HANDOFF_SPIN=<n> (start-time, read at static init: set it in the process environment): each side first spins
+// n pauses (~15 ns each on Zen 4) for the other before it sleeps. A drain (8 a frame in PGR3) costs two wake-ups, the
+// command processor's and then the draw thread's, ~10-20 us each; spinning catches most of them awake (PGR3 port,
+// session 4). Default 2000; 0 = sleep at once, as before.
+const int g_handoffSpin = getenv("REGPU_HANDOFF_SPIN") ? std::max(0, atoi(getenv("REGPU_HANDOFF_SPIN"))) : 2000;
+void WaitHead(uint64_t old)
+{
+    for (int i = 0; i < g_handoffSpin; i++)
+    {
+        if (g_head.load(std::memory_order_acquire) != old)
+            return;
+        _mm_pause();
+    }
+    g_headWaiters.fetch_add(1, std::memory_order_seq_cst);
+    g_head.wait(old, std::memory_order_seq_cst);
+    g_headWaiters.fetch_sub(1, std::memory_order_relaxed);
+}
+void WaitTail(uint64_t old)
+{
+    for (int i = 0; i < g_handoffSpin; i++)
+    {
+        if (g_tail.load(std::memory_order_acquire) != old)
+            return;
+        _mm_pause();
+    }
+    g_tailWaiters.fetch_add(1, std::memory_order_seq_cst);
+    g_tail.wait(old, std::memory_order_seq_cst);
+    g_tailWaiters.fetch_sub(1, std::memory_order_relaxed);
+}
+void PublishHead(uint64_t head)
+{
+    g_head.store(head, std::memory_order_seq_cst);
+    if (g_alwaysNotify || g_headWaiters.load(std::memory_order_seq_cst))
+        g_head.notify_one();
+}
+void PublishTail(uint64_t tail)
+{
+    g_tail.store(tail, std::memory_order_seq_cst);
+    if (g_alwaysNotify || g_tailWaiters.load(std::memory_order_seq_cst))
+        g_tail.notify_all();
+}
 
 // Space for a record of `words` payload words; returns where to write it.
 uint32_t* Begin(uint32_t type, uint32_t words)
@@ -158,17 +226,16 @@ uint32_t* Begin(uint32_t type, uint32_t words)
     {
         const uint64_t pad = kWords - head % kWords;
         while (head + pad - g_tail.load(std::memory_order_acquire) > kWords)
-            g_tail.wait(g_tail.load(std::memory_order_acquire), std::memory_order_acquire);
+            WaitTail(g_tail.load(std::memory_order_acquire));
         g_ring[head % kWords] = (kPad << 24) | uint32_t(pad - 1);
         head += pad;
-        g_head.store(head, std::memory_order_release);
-        g_head.notify_one();
+        PublishHead(head);
     }
     while (head + need - g_tail.load(std::memory_order_acquire) > kWords)
     {
         const uint64_t tail = g_tail.load(std::memory_order_acquire);
         if (head + need - tail > kWords)
-            g_tail.wait(tail, std::memory_order_acquire);
+            WaitTail(tail);
     }
     uint32_t* p = &g_ring[head % kWords];
     p[0] = (type << 24) | words;
@@ -177,37 +244,82 @@ uint32_t* Begin(uint32_t type, uint32_t words)
 
 void End(uint32_t words)
 {
-    const uint64_t head = g_head.load(std::memory_order_relaxed) + words + 1;
-    g_head.store(head, std::memory_order_release);
-    g_head.notify_one();
+    PublishHead(g_head.load(std::memory_order_relaxed) + words + 1);
 }
 
 // Waits until the worker has done everything logged so far.
 std::atomic<uint64_t> g_drains{ 0 }, g_drainWaits{ 0 };
-void Drain()
+// REGPU_PERF: microseconds the command processor waited in drains, by call site (0 COND_WRITE, 1 WAIT_REG_MEM,
+// 2 INTERRUPT, 3 = the time the command-stream interrupt handlers ran; 4 = the interrupt's wait for the fence writes
+// before it, PendingWrites::Drain).
+std::atomic<uint64_t> g_drainUs[5];
+void Drain(int site = 3)
 {
     if (!g_started.load(std::memory_order_acquire))
         return;
     g_drains++;
-    if (g_tail.load(std::memory_order_acquire) != g_head.load(std::memory_order_relaxed))
+    const bool waits = g_tail.load(std::memory_order_acquire) != g_head.load(std::memory_order_relaxed);
+    if (waits)
         g_drainWaits++;
+    const auto t0 = waits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const uint64_t head = g_head.load(std::memory_order_relaxed);
     for (uint64_t tail; (tail = g_tail.load(std::memory_order_acquire)) != head;)
-        g_tail.wait(tail, std::memory_order_acquire);
+        WaitTail(tail);
+    if (waits)
+        g_drainUs[site & 3].fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count()),
+            std::memory_order_relaxed);
 }
 
 bool Active() { return g_enabled && g_started.load(std::memory_order_relaxed); }
 
+// What the draw thread's register file holds (g_file follows exactly these records): register writes that
+// change nothing there are not sent, and a run is cut to its changed words (PERF-PLAN L28 in the FM3 port: FH1R's
+// split command processor records only the ~30% of writes that change a value). The comparison costs the command
+// processor, which has time; the draw thread, the limit on a CPU-bound PC, copies less. Command processor only.
+// REGPU_NO_REG_SKIP=1: every write is sent, as before (live).
+std::vector<uint8_t> g_sent(0x8000 * 4);
+uint64_t g_regWords = 0, g_regWordsSent = 0;
 void LogRegs(uint32_t index, const uint32_t* valuesBE, uint32_t count)
 {
-    uint32_t* p = Begin(kRegs, count + 1);
-    p[0] = index;
-    memcpy(p + 1, valuesBE, size_t(count) * 4);
-    End(count + 1);
+    static LiveSwitch noSkip("REGPU_NO_REG_SKIP");
+    if (uint64_t(index) + count > 0x8000)
+        count = index < 0x8000 ? 0x8000 - index : 0;
+    if (!count)
+        return;
+    uint32_t* const shadow = reinterpret_cast<uint32_t*>(g_sent.data()) + index;
+    uint32_t first = 0, last = count;
+    g_regWords += count;
+    if (!noSkip)
+    {
+        while (first < count && shadow[first] == valuesBE[first])
+            first++;
+        if (first == count)
+            return; // nothing changes
+        while (last > first + 1 && shadow[last - 1] == valuesBE[last - 1])
+            last--;
+    }
+    const uint32_t n = last - first;
+    g_regWordsSent += n;
+    memcpy(shadow + first, valuesBE + first, size_t(n) * 4);
+    uint32_t* p = Begin(kRegs, n + 1);
+    p[0] = index + first;
+    memcpy(p + 1, valuesBE + first, size_t(n) * 4);
+    End(n + 1);
+    // (The clock only every 4096 runs: read per run it was ~2.5% of the command processor.)
+    static auto lastLog = std::chrono::steady_clock::now();
+    static uint32_t sinceCheck = 0;
+    if ((++sinceCheck & 4095) == 0 && std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(30))
+    {
+        lastLog = std::chrono::steady_clock::now();
+        Log("gpu: register words written %llu, sent to the draw thread %llu (%.0f%%)", (unsigned long long)g_regWords,
+            (unsigned long long)g_regWordsSent, 100.0 * double(g_regWordsSent) / double(std::max<uint64_t>(g_regWords, 1)));
+    }
 }
 }
 
 void WriteBackNow(uint32_t address, uint32_t value);
+// Occlusion queries with the draw thread: this frame's queries so far, by their count address (EVENT_WRITE_ZPD).
+std::unordered_map<uint32_t, uint32_t> g_zpdKindCount;
 namespace PendingWrites
 {
 void Add(uint64_t fence, uint32_t address, uint32_t value, bool raw = false);
@@ -222,6 +334,10 @@ void OrderedStore(uint32_t address, uint32_t value);
 // At the segment's end, it is cut at snapshots into pieces of about equal draw counts that
 // are translated on the draw workers into their own command lists, executed in order
 // (RendererRunPieces). REGPU_DRAW_WORKERS=0 turns it off.
+// The draw thread (work::, REGPU_DRAW_THREAD): with draw workers too, it runs the segments below (the
+// command processor only parses and queues), so translation, cut into pieces, overlaps the parsing.
+thread_local bool t_drawThread = false;
+
 namespace seg
 {
 enum : uint32_t { kRegs = 1, kShader, kDraw };
@@ -253,7 +369,7 @@ void TakeSnapshot()
     s.logPos = g_log.size();
     s.drawsBefore = g_draws;
     s.regs.resize(0x8000 * 4); // (type-0 packets address registers up to 0x7FFF)
-    memcpy(s.regs.data(), gpureg::LiveFile(), s.regs.size());
+    memcpy(s.regs.data(), gpureg::File(), s.regs.size()); // (the draw thread's own file there)
     s.vs = g_vs;
     s.ps = g_ps;
     s.vsAddress = g_vsAddress;
@@ -317,12 +433,18 @@ void Replay(size_t first, size_t endPos)
 std::vector<uint32_t> g_sizes, g_lastSizes; // draws of each segment this frame / the last
 uint32_t g_index = 0;                        // the segment the next draw belongs to
 uint32_t g_directDraws = 0;                  // draws of the current segment drawn straight away
+// An occlusion query is counting (between a ZPD start and its pause or end): its draws go straight to the
+// renderer, recorded in stream order on the command processor's list where its D3D query part began (a
+// D3D12 query only counts the draws of its own list; a worker's piece would not be wrapped).
+bool g_query = false;
 constexpr uint32_t kParallelDraws = 2 * 96;  // fewer than this never make two pieces (Flush)
 
 // Whether the current segment's draws go straight to the renderer.
 bool Direct()
 {
     static LiveSwitch logAll("REGPU_LOG_ALL_SEGMENTS");
+    if (g_query)
+        return true;
     return !g_open && !logAll && g_index < g_lastSizes.size() && g_lastSizes[g_index] < kParallelDraws;
 }
 
@@ -358,6 +480,8 @@ void EndFrame()
 // Translates the open segment (on the workers if it is large enough).
 void Flush()
 {
+    if (work::Active() && !t_drawThread)
+        return; // the draw thread owns the segments (it flushes at the records that need it)
     EndSegment(g_open ? g_draws : g_directDraws);
     g_directDraws = 0;
     if (!g_open)
@@ -422,12 +546,15 @@ void Flush()
 
 bool Enabled()
 {
-    static const bool on = RendererDrawWorkers() > 0 && !getenv("REGPU_DRAW_THREAD");
+    // With the draw thread the segments run there; REGPU_DRAW_THREAD_SERIAL=1: the draw thread translates
+    // every draw itself, as before (A/B; read at start).
+    static const bool on = RendererDrawWorkers() > 0 && !(getenv("REGPU_DRAW_THREAD") && getenv("REGPU_DRAW_THREAD_SERIAL"));
     return on;
 }
 }
 
-void SubmitShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress)
+// A shader load on the thread that translates (the command processor, or the draw thread).
+void SegShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress)
 {
     if (seg::Enabled())
     {
@@ -442,12 +569,53 @@ void SubmitShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwo
             return;
         }
     }
+    FrameOnShaderLoad(type, microcodeBE, dwords, guestAddress);
+}
+
+void SubmitShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress)
+{
+    static std::vector<uint32_t> last[2]; // the last load of each type sent to the draw thread
+    static uint32_t lastAddress[2] = {};
     if (!work::Active())
     {
-        FrameOnShaderLoad(type, microcodeBE, dwords, guestAddress);
+        last[0].clear(); // (loads on this thread: the memo no longer says what the draw thread has)
+        last[1].clear();
+        SegShaderLoad(type, microcodeBE, dwords, guestAddress);
         return;
     }
     dwords = std::min<uint32_t>(dwords, 0x10000);
+    // A load that repeats the last one of its type byte for byte changes nothing on the draw thread (its current
+    // shader of that type is already this one): not sent. The draw thread spent ~6% of its time copying and
+    // comparing such loads (FM3, session 24); the comparison here is on the command processor, which has time.
+    // REGPU_NO_SHADER_REPEAT_SKIP=1: every load is sent, as before (live).
+    {
+        static LiveSwitch noSkip("REGPU_NO_SHADER_REPEAT_SKIP");
+        static uint64_t loads = 0, skipped = 0;
+        static auto lastLog = std::chrono::steady_clock::now();
+        const uint32_t t = uint32_t(type);
+        if (t > 1 || noSkip)
+        {
+            last[0].clear();
+            last[1].clear();
+        }
+        else
+        {
+            loads++;
+            if (lastAddress[t] == guestAddress && last[t].size() == dwords && memcmp(last[t].data(), microcodeBE, size_t(dwords) * 4) == 0)
+            {
+                skipped++;
+                if ((skipped & 1023) == 0 && std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(30))
+                {
+                    lastLog = std::chrono::steady_clock::now();
+                    Log("gpu: shader loads: %llu, %llu repeats not sent (%.0f%%)", (unsigned long long)loads, (unsigned long long)skipped,
+                        100.0 * double(skipped) / double(loads));
+                }
+                return;
+            }
+            last[t].assign(microcodeBE, microcodeBE + dwords);
+            lastAddress[t] = guestAddress;
+        }
+    }
     uint32_t* p = work::Begin(work::kShader, dwords + 3);
     p[0] = uint32_t(type);
     p[1] = guestAddress;
@@ -456,6 +624,7 @@ void SubmitShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwo
     work::End(dwords + 3);
 }
 
+void SegDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize);
 void SubmitDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
     // A later tile's draw that the first tile drew for all of them (TileMerge).
@@ -469,6 +638,22 @@ void SubmitDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         g_gpu.droppedDraws++;
         return;
     }
+    if (work::Active())
+    {
+        uint32_t* p = work::Begin(work::kDraw, 3);
+        p[0] = initiator;
+        p[1] = dmaBase;
+        p[2] = dmaSize;
+        work::End(3);
+        return;
+    }
+    SegDraw(initiator, dmaBase, dmaSize);
+}
+
+// A draw on the thread that translates (the command processor, or the draw thread): logged into the open
+// segment, or drawn now.
+void SegDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
+{
     if (seg::Enabled())
     {
         if (RendererIsResolveDraw() || !RendererParallelReady())
@@ -506,56 +691,307 @@ void SubmitDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         RendererTrackTile(seg::g_tile);
         return;
     }
-    if (!work::Active())
+    FrameOnDraw(initiator, dmaBase, dmaSize);
+}
+
+// ---- VR stereo (REGPU_VR=stereo) ---------------------------------------------------------
+// The frame's main view drawn a second time, for the other eye (the design Forza Horizon 1: ReImagined describes; our
+// own code). The draw thread keeps every record from the frame's first main-view draw (the full-width surface: before
+// it come the shadow maps, reflections and the mirror, which both eyes share) to the swap, with the register file and
+// the current shaders as they were at that draw. At the swap the front buffer holds the first eye's picture: it goes to
+// the headset, then the records run again from the saved state for the second eye and that picture follows. The eye is
+// one constant: the main view's perspective geometry moves sideways in clip space by P00 * half the eye distance
+// (hlsl.cpp, renderer.cpp RendererSetStereoEye; post-processing quads and the HUD are flat and stay put). The game's CPU
+// side, its command stream and the guest's view of the GPU run once: the second pass skips fence writes, ordered
+// stores, occlusion queries (and their draws) and resolve write-backs to guest memory.
+// REGPU_VR_SHOW_LEFT=1 (live): the right eye first, so the desktop shows the left one. REGPU_VR_EYE_FLIP=1 (live):
+// the eyes' offsets swapped, for a title that draws its main view mirrored in x (camera +x at clip -x) and turns it
+// back later (FM3 draws its scene turned 180 degrees; the port sets it).
+namespace stereo
+{
+bool Mode()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_VR");
+        return (v && strcmp(v, "stereo") == 0) || TripleMode();
+    }();
+    return on;
+}
+// Triple screen (regpu::triple::SubmitViews): the newest views and when they came; this frame's (BeforeDraw).
+std::mutex g_tripleMutex;
+regpu::triple::View g_tripleIn[3];
+int64_t g_tripleAt = 0; // (g_tripleMutex)
+float g_tripleViews[3][5] = {};
+bool g_checked = false; // this frame's first main-view draw seen (and the frame's choice made)
+bool g_armed = false;   // recording this frame for the second eye
+float g_clip = 0;       // P00 * half the eye distance: the left eye's clip x offset (the right eye's negated)
+int g_firstEye = 0;     // the eye drawn by the game's own pass (0 left)
+std::vector<uint32_t> g_log;            // the records since the first main-view draw (headers included)
+std::vector<uint8_t> g_startFile, g_endFile;
+std::vector<uint32_t> g_shader[2], g_startShader[2]; // the newest shader load of each type (now / at that draw)
+uint32_t g_shaderAddress[2] = {}, g_startShaderAddress[2] = {};
+uint64_t g_frames = 0, g_words = 0;
+constexpr size_t kMaxWords = 24u << 20; // 96 MB: a frame past this is drawn once
+
+float EyeClip(int eye) { return eye == 0 ? g_clip : -g_clip; }
+
+void OnShader(uint32_t type, uint32_t address, const uint32_t* code, uint32_t dwords)
+{
+    if (!Mode() || type > 1)
+        return;
+    g_shader[type].assign(code, code + dwords);
+    g_shaderAddress[type] = address;
+}
+
+// Before a draw record runs: the frame's first main-view draw starts the recording.
+void BeforeDraw()
+{
+    if (!Mode() || g_checked || !RendererMainViewNow())
+        return;
+    g_checked = true;
+    if (TripleMode())
     {
-        FrameOnDraw(initiator, dmaBase, dmaSize);
+        // A frame whose camera reported its fields of view in the last 100 ms (else drawn once, untouched).
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+        {
+            std::lock_guard lock(g_tripleMutex);
+            if (now - g_tripleAt > 100 || g_tripleIn[1].e == 0.0f)
+            {
+                RendererSetTripleView(nullptr, false);
+                return;
+            }
+            // REGPU_TRIPLE_FLIP: a title whose clip x is mirrored (FM3 draws its scene turned 180 degrees): the views
+            // taken in the mirrored convention (b and c change sign).
+            static LiveSwitch flip("REGPU_TRIPLE_FLIP");
+            const float f = flip ? -1.0f : 1.0f;
+            for (int i = 0; i < 3; i++)
+            {
+                const regpu::triple::View& v = g_tripleIn[i];
+                const float out[5] = { v.a, v.b * f, v.c * f, v.d, v.e };
+                memcpy(g_tripleViews[i], out, sizeof(out));
+            }
+        }
+        g_startFile = work::g_file;
+        for (int t = 0; t < 2; t++)
+            g_startShader[t] = g_shader[t], g_startShaderAddress[t] = g_shaderAddress[t];
+        g_log.clear();
+        g_armed = true;
+        RendererSetTripleView(g_tripleViews[1], false); // the game's own pass: the centre screen
         return;
     }
-    uint32_t* p = work::Begin(work::kDraw, 3);
-    p[0] = initiator;
-    p[1] = dmaBase;
-    p[2] = dmaSize;
-    work::End(3);
+    float p00 = 0, half = 0;
+    if (!regpu::xr::StereoFrame(p00, half))
+        return;
+    static LiveSwitch showLeft("REGPU_VR_SHOW_LEFT"), flip("REGPU_VR_EYE_FLIP");
+    g_clip = p00 * half * (flip ? -1.0f : 1.0f);
+    g_firstEye = showLeft ? 1 : 0;
+    g_startFile = work::g_file;
+    for (int t = 0; t < 2; t++)
+        g_startShader[t] = g_shader[t], g_startShaderAddress[t] = g_shaderAddress[t];
+    g_log.clear();
+    g_armed = true;
+    RendererSetStereoEye(EyeClip(g_firstEye));
+}
+
+void Append(const uint32_t* record, uint32_t words)
+{
+    if (!g_armed)
+        return;
+    if (g_log.size() + words > kMaxWords)
+    {
+        g_armed = false; // too long: this frame stays mono (its first pass still has the eye offset)
+        g_log.clear();
+        return;
+    }
+    g_log.insert(g_log.end(), record, record + words);
+}
+
+// The recorded frame drawn again from its first main-view draw's state (fences, ordered stores and occlusion queries
+// with their draws are skipped: the guest saw them once).
+void Replay()
+{
+    memcpy(work::g_file.data(), g_startFile.data(), g_startFile.size());
+    for (int t = 0; t < 2; t++)
+        if (!g_startShader[t].empty())
+            FrameOnShaderLoad(ShaderType(t), g_startShader[t].data(), uint32_t(g_startShader[t].size()), g_startShaderAddress[t]);
+    RendererSetStereoReplay(true);
+    bool inQuery = false;
+    for (size_t i = 0; i < g_log.size();)
+    {
+        const uint32_t* p = &g_log[i];
+        const uint32_t type = p[0] >> 24, words = p[0] & 0xFFFFFF;
+        const uint32_t* a = p + 1;
+        switch (type)
+        {
+        case work::kRegs:
+            memcpy(work::g_file.data() + a[0] * 4, a + 1, size_t(words - 1) * 4);
+            break;
+        case work::kShader:
+            FrameOnShaderLoad(ShaderType(a[0]), a + 3, a[2], a[1]);
+            break;
+        case work::kDraw:
+            if (!inQuery)
+                FrameOnDraw(a[0], a[1], a[2]);
+            break;
+        case work::kQuery:
+            inQuery = a[0] == 0;
+            break;
+        default:
+            break;
+        }
+        i += size_t(words) + 1;
+    }
+    RendererSetStereoReplay(false);
+}
+
+// Triple screen at the swap: the centre (the game's pass) captured, then the left and right screens drawn again turned.
+void TripleAtSwap(uint32_t frontBuffer)
+{
+    RendererTripleCapture(1, frontBuffer);
+    g_endFile = work::g_file;
+    // REGPU_TRIPLE_CENTRE_ONLY=1 (live): the side screens not drawn (their cost; the centre alone, black sides).
+    static LiveSwitch centreOnly("REGPU_TRIPLE_CENTRE_ONLY");
+    if (!centreOnly)
+        for (int side : { 0, 2 })
+        {
+            RendererSetTripleView(g_tripleViews[side], true);
+            Replay();
+            RendererTripleCapture(side, frontBuffer);
+        }
+    RendererSetTripleView(nullptr, false);
+    memcpy(work::g_file.data(), g_endFile.data(), g_endFile.size());
+    g_frames++;
+    g_words += g_log.size();
+    if (g_frames == 1 || g_frames % 3600 == 0)
+        Log("triple: frame %llu: %zu KB of records drawn again for each side screen", (unsigned long long)g_frames, g_log.size() * 4 / 1024);
+}
+
+// At the swap, before the frame is presented: the second eye.
+void AtSwap(uint32_t frontBuffer)
+{
+    const bool armed = g_armed;
+    g_armed = false;
+    g_checked = false;
+    if (!armed)
+    {
+        RendererSetStereoEye(0);
+        RendererSetTripleView(nullptr, false);
+        return;
+    }
+    if (TripleMode())
+    {
+        TripleAtSwap(frontBuffer);
+        return;
+    }
+    RendererStereoCaptureEye(g_firstEye, frontBuffer);
+    // REGPU_VR_NO_SECOND_EYE=1 (live): the records are kept but not drawn again (the second eye's cost; which pass the
+    // desktop shows).
+    static LiveSwitch noSecond("REGPU_VR_NO_SECOND_EYE");
+    if (noSecond)
+    {
+        RendererSetStereoEye(0);
+        return;
+    }
+    g_endFile = work::g_file;
+    RendererSetStereoEye(EyeClip(1 - g_firstEye));
+    Replay();
+    RendererSetStereoEye(0);
+    memcpy(work::g_file.data(), g_endFile.data(), g_endFile.size()); // (the same values: the records ran in full)
+    RendererStereoCaptureEye(1 - g_firstEye, frontBuffer);
+    g_frames++;
+    g_words += g_log.size();
+    if (g_frames == 1 || g_frames % 3600 == 0)
+        Log("vr: stereo frame %llu: %zu KB of records drawn again for the second eye (clip offset %.4f)", (unsigned long long)g_frames,
+            g_log.size() * 4 / 1024, g_clip);
+}
 }
 
 void WorkerLoop()
 {
     SetThreadDescription(GetCurrentThread(), L"gpu draw worker");
+    // REGPU_DRAW_THREAD_PRIORITY=<Win32 level> (start-time; 1 above normal, 2 highest, 15 time critical): the draw thread
+    // (and the replay thread, recorded_list.h) above the title's threads, which a port may map to "highest" (session 33
+    // of the FM3 port: the 1% slowest frames at a frame cap, from the draw thread being pre-empted?).
+    if (const char* p = getenv("REGPU_DRAW_THREAD_PRIORITY"); p && *p)
+        SetThreadPriority(GetCurrentThread(), atoi(p));
     // the port's sampler (PGR4_SAMPLE_THREAD=w) follows this thread
     if (!g_profiledWorker)
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_profiledWorker, 0, FALSE, DUPLICATE_SAME_ACCESS);
     gpureg::t_file = work::g_file.data();
+    t_drawThread = true;
+    const bool timeIdle = LongFramesOn();
     for (;;)
     {
         uint64_t tail = work::g_tail.load(std::memory_order_relaxed);
         uint64_t head;
         while ((head = work::g_head.load(std::memory_order_acquire)) == tail)
-            work::g_head.wait(head, std::memory_order_acquire);
+        {
+            if (seg::g_open)
+                seg::Flush(); // caught up: translate the open segment before waiting
+            if (timeIdle)
+            {
+                const auto w0 = std::chrono::steady_clock::now();
+                work::WaitHead(head);
+                RendererDrawThreadIdle(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
+            }
+            else
+                work::WaitHead(head);
+        }
         // Everything published so far, then let the command processor know.
         while (tail != head)
         {
             const uint32_t* p = &work::g_ring[tail % work::kWords];
             const uint32_t type = p[0] >> 24, words = p[0] & 0xFFFFFF;
             const uint32_t* a = p + 1;
+            if (stereo::g_armed && type != work::kSwap && type != work::kPad)
+                stereo::Append(p, words + 1);
             switch (type)
             {
             case work::kRegs:
                 memcpy(work::g_file.data() + a[0] * 4, a + 1, size_t(words - 1) * 4);
+                if (seg::g_open)
+                    seg::Append(seg::kRegs, a, words);
                 break;
             case work::kShader:
-                FrameOnShaderLoad(ShaderType(a[0]), a + 3, a[2], a[1]);
+                stereo::OnShader(a[0], a[1], a + 3, a[2]);
+                SegShaderLoad(ShaderType(a[0]), a + 3, a[2], a[1]);
                 break;
             case work::kDraw:
-                FrameOnDraw(a[0], a[1], a[2]);
+                stereo::BeforeDraw();
+                if (stereo::g_armed && stereo::g_log.empty())
+                    stereo::Append(p, words + 1); // (the draw that started the recording)
+                SegDraw(a[0], a[1], a[2]);
                 break;
             case work::kSwap:
+                seg::Flush();
+                stereo::AtSwap(a[2]);
+                seg::EndFrame();
+                seg::g_tile = RendererTile{};
+                seg::g_query = false;
                 FrameOnSwap(uint64_t(a[0]) | uint64_t(a[1]) << 32, a[2]);
                 break;
             case work::kWriteBack:
+                seg::Flush(); // a fence: after the draws before it
                 PendingWrites::Add(RendererFenceSubmit(), a[0], a[1]); // after the host GPU, as on the command processor
                 break;
             case work::kStore:
+                seg::Flush();
                 OrderedStore(a[0], a[1]);
+                break;
+            case work::kQuery: // an occlusion query's start (a[0] 0) or end (1: address, place), in stream order
+                if (a[0] == 0)
+                {
+                    // While it counts, its draws are drawn here, on this thread's list (seg::g_query).
+                    if (seg::Enabled() && seg::g_open)
+                        seg::Flush();
+                    RendererOcclusionBegin();
+                    seg::g_query = seg::Enabled() && RendererOcclusionCounting();
+                }
+                else
+                {
+                    RendererOcclusionEndOn(a[1], a[2]);
+                    seg::g_query = false;
+                }
                 break;
             default:
                 break;
@@ -565,12 +1001,10 @@ void WorkerLoop()
             // or it must catch up): every record would cost a wake-up each.
             if (type == work::kWriteBack || type == work::kStore || type == work::kSwap || (tail & 0x3FFF) < words + 1)
             {
-                work::g_tail.store(tail, std::memory_order_release);
-                work::g_tail.notify_all();
+                work::PublishTail(tail);
             }
         }
-        work::g_tail.store(tail, std::memory_order_release);
-        work::g_tail.notify_all();
+        work::PublishTail(tail);
     }
 }
 
@@ -724,9 +1158,14 @@ void WriteBack(uint32_t address, uint32_t value)
         return;
     }
     // With early fences (RendererEarlyFences) the fence lands now; the work before it is still
-    // submitted.
+    // submitted. RendererFenceSubmit already returns 0 then, except for a fence behind a deferred
+    // resolve write-back of this frame: that one still waits for the host GPU and the write-back, so
+    // a title that reads the image on its CPU once it sees the fence finds it written (FM3 compresses
+    // each car's livery that way: zeroing every fence here left the livery as noise or blank).
+    // REGPU_EARLY_FENCES_SKIP_WRITEBACKS=1: every fence at once, as before (A/B).
     const uint64_t fence = RendererFenceSubmit();
-    PendingWrites::Add(RendererEarlyFences() && !RendererTruthfulFences() ? 0 : fence, address, value);
+    static const bool skipWritebacks = getenv("REGPU_EARLY_FENCES_SKIP_WRITEBACKS") != nullptr;
+    PendingWrites::Add(RendererEarlyFences() && skipWritebacks && !RendererTruthfulFences() ? 0 : fence, address, value);
 }
 
 uint32_t ReadBack(uint32_t address)
@@ -812,7 +1251,7 @@ void WriteRegister(uint32_t index, uint32_t value)
 {
     SetReg(index, value);
     WriteLut(index, value);
-    if (seg::g_open)
+    if (!work::Active() && seg::g_open)
     {
         const uint32_t be[2] = { index, __builtin_bswap32(value) };
         seg::Append(seg::kRegs, be, 2);
@@ -850,7 +1289,7 @@ void WriteRegisters(uint32_t index, uint32_t source, uint32_t count)
     if (!lut && (index + count <= SCRATCH_REG0 || index >= SCRATCH_REG0 + 8))
     {
         memcpy(gpureg::LiveFile() + index * 4, GuestPtr<uint8_t>(source), size_t(count) * 4);
-        if (seg::g_open)
+        if (!work::Active() && seg::g_open)
             seg::Append(seg::kRegs, &index, 1, GuestPtr<uint32_t>(source), count);
         if (work::Active())
             work::LogRegs(index, GuestPtr<uint32_t>(source), count);
@@ -938,6 +1377,8 @@ uint32_t ExecutePacket(uint32_t ptr)
     if (g_trace && opcode != 0x10)
         Log("gpu: %08X op %02X count %u: %08X %08X %08X %08X", ptr, opcode, count, arg(0), count > 1 ? arg(1) : 0,
             count > 2 ? arg(2) : 0, count > 3 ? arg(3) : 0);
+    if (opcode == 0x22 || opcode == 0x36)
+        g_gpu.windowUnion = false;
     switch (opcode)
     {
     case 0x64: // XE_SWAP: 'SWAP', front buffer physical address, width, height
@@ -1033,20 +1474,52 @@ uint32_t ExecutePacket(uint32_t ptr)
         const bool end = (c[4] == finished && c[5] == finished) || (c[2] == finished && c[3] == finished);
         static int logged = 0;
         static LiveSwitch traceZpd("REGPU_TRACE_ZPD"); // (a getenv per query was ~1% of the command processor)
-        if (logged < 12 && traceZpd)
+        if (!traceZpd)
+            logged = 0; // (12 more each time it is switched on)
+        else if (logged < 12)
         {
             logged++;
-            Log("zpd: %08X %08X %08X %08X %08X %08X %08X %08X%s", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], end ? " (end)" : "");
+            Log("zpd: %08X %08X %08X %08X %08X %08X %08X %08X%s, RB_SAMPLE_COUNT_CTL %08X", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
+                end ? " (end)" : "", gpureg::Get(0x2324));
         }
-        // Real counts when draws are recorded here in stream order (not with the draw thread
-        // or workers, whose lists the query would not wrap): the sun flare fades behind trees.
+        // Real counts when draws are recorded here in stream order (not with the draw thread, whose
+        // list the query would not wrap): the sun flare fades behind trees. With draw workers the open
+        // logged segment is translated first and, while the query counts, its draws go straight to the
+        // renderer (seg::g_query); between a query's tile spans (RendererOcclusionBegin: pause/resume)
+        // and outside queries the workers go on. REGPU_NO_WORKER_QUERIES=1: with workers every query
+        // answers the fixed 1000, as before (A/B: no sun flare).
         static LiveSwitch fake("REGPU_FAKE_OCCLUSION"); // A/B: the old fixed answer
-        const bool real = !fake && !work::Active() && !seg::Enabled();
+        static LiveSwitch noWorkerQueries("REGPU_NO_WORKER_QUERIES");
+        const bool real = !fake && !((seg::Enabled() || work::Active()) && noWorkerQueries);
         uint32_t samples = 1000, total = 1000;
-        if (real && !end)
+        // With the draw thread: answered here from earlier frames, recorded there in stream order (its draws are
+        // translated there). This frame's queries to each address are counted here (cleared at the swap).
+        if (real && work::Active())
+        {
+            uint32_t rec[3] = { 0, 0, 0 };
+            if (end)
+            {
+                const uint32_t kindOrder = g_zpdKindCount[counts]++;
+                if (!RendererOcclusionAnswer(samples, total, counts, kindOrder))
+                    samples = total = 1000; // no result yet: fully visible
+                rec[0] = 1, rec[1] = counts, rec[2] = kindOrder;
+            }
+            memcpy(work::Begin(work::kQuery, 3), rec, sizeof(rec));
+            work::End(3);
+        }
+        else if (real && !end)
+        {
+            if (seg::Enabled() && seg::g_open)
+                seg::Flush();
             RendererOcclusionBegin();
+            seg::g_query = seg::Enabled() && RendererOcclusionCounting();
+        }
         else if (real && !RendererOcclusionEnd(samples, total, counts))
             samples = total = 1000; // no result yet (the first frames): fully visible
+        // (With the draw thread its kQuery record ends it there: the command processor runs ahead, and clearing
+        // it here sent the query's draws to the workers' lists before the draw thread got to them: no sun flare.)
+        if (end && !work::Active())
+            seg::g_query = false;
         memset(c, 0, 8 * 4);
         if (end)
         {
@@ -1071,7 +1544,7 @@ uint32_t ExecutePacket(uint32_t ptr)
             seg::Flush();
         const uint32_t info = arg(0);
         if (info & 0x10) // a memory poll may read a fence the worker writes
-            work::Drain();
+            work::Drain(0);
         const uint32_t value = (info & 0x10) ? ReadBack(arg(1)) : Reg(arg(1));
         if (WaitCompare(info & 7, value & arg(3), arg(2)))
         {
@@ -1090,8 +1563,52 @@ uint32_t ExecutePacket(uint32_t ptr)
             seg::Flush();
         // A memory poll may wait for a fence the worker writes: let it catch up, unless the
         // condition already holds (most waits are for values the title set).
-        if ((info & 0x10) && !WaitCompare(info & 7, ReadBack(arg(1)) & arg(3), arg(2)))
-            work::Drain();
+        // REGPU_NO_WAIT_DRAIN=1 (live, test): no drain here; the wait polls while the draw thread runs on.
+        static LiveSwitch noWaitDrain("REGPU_NO_WAIT_DRAIN");
+        const bool holdsNow = !(info & 0x10) || WaitCompare(info & 7, ReadBack(arg(1)) & arg(3), arg(2));
+        // REGPU_VBLANK_ON_WAIT: the vblank asked for before the drain, so its round trip (the vblank thread, the
+        // handler on the interrupt thread) overlaps the draw thread's catching up instead of following it (PGR3 port:
+        // the drains here were ~89% of the command processor's time in a race). REGPU_VBLANK_KICK_AFTER_DRAIN=1: after.
+        static LiveSwitch kickAfterDrain("REGPU_VBLANK_KICK_AFTER_DRAIN");
+        if (!holdsNow && !kickAfterDrain && VblankOnWait())
+            SetEvent(VblankKickEvent());
+        if (!holdsNow && !noWaitDrain)
+        {
+            const auto d0 = std::chrono::steady_clock::now();
+            work::Drain(1);
+            // REGPU_PERF: the drained waits by address (every 2 s, the top 6): microseconds drained, how many, and how
+            // many still did not hold after the drain.
+            static LiveSwitch perfDrains("REGPU_PERF");
+            if (perfDrains)
+            {
+                struct D
+                {
+                    uint64_t us = 0, n = 0, after = 0;
+                    uint32_t ref = 0;
+                };
+                static std::map<uint32_t, D> byAddress;
+                static auto lastLog = Clock::now();
+                D& d = byAddress[arg(1)];
+                d.us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - d0).count());
+                d.n++, d.ref = arg(2);
+                d.after += !WaitCompare(info & 7, ReadBack(arg(1)) & arg(3), arg(2));
+                if (Clock::now() - lastLog > std::chrono::seconds(2))
+                {
+                    lastLog = Clock::now();
+                    std::vector<std::pair<uint64_t, uint32_t>> top;
+                    for (auto& [a, x] : byAddress)
+                        top.push_back({ x.us, a });
+                    std::sort(top.rbegin(), top.rend());
+                    for (size_t i = 0; i < top.size() && i < 6; i++)
+                    {
+                        const D& x = byAddress[top[i].second];
+                        Log("perf: drained for WAIT_REG_MEM mem %08X (fn %u ref %08X): %.1f ms, %llu times, %llu still waiting after", top[i].second,
+                            info & 7, x.ref, x.us / 1000.0, (unsigned long long)x.n, (unsigned long long)x.after);
+                    }
+                    byAddress.clear();
+                }
+            }
+        }
         g_gpu.waitingOn = arg(1);
         g_gpu.waitingRef = arg(2);
         g_gpu.waitingInfo = info;
@@ -1099,12 +1616,21 @@ uint32_t ExecutePacket(uint32_t ptr)
         // spin, then yield, then sleep.
         const auto start = Clock::now();
         static const int spinMs = getenv("REGPU_CP_SPIN_MS") ? atoi(getenv("REGPU_CP_SPIN_MS")) : 100;
+        auto lastKick = start - std::chrono::seconds(1);
         for (int tries = 0;; tries++)
         {
             const uint32_t value = (info & 0x10) ? ReadBack(arg(1)) : Reg(arg(1));
             if (WaitCompare(info & 7, value & arg(3), arg(2)))
                 break;
             const auto waited = Clock::now() - start;
+            // (REGPU_VBLANK_ON_WAIT: after ~5 us, and again every 50 us while it still waits: a swap at interval 2
+            // needs two vblanks.)
+            if ((info & 0x10) && waited > std::chrono::microseconds(5) && Clock::now() - lastKick > std::chrono::microseconds(50) &&
+                VblankOnWait())
+            {
+                lastKick = Clock::now();
+                SetEvent(VblankKickEvent());
+            }
             if (waited > std::chrono::seconds(2))
             {
                 LOG_ONCE("gpu: WAIT_REG_MEM on %08X never satisfied; continuing", arg(1));
@@ -1126,16 +1652,24 @@ uint32_t ExecutePacket(uint32_t ptr)
             if (perf)
             {
                 // Time per wait target, logged every 2 s.
-                static std::map<std::pair<uint32_t, uint32_t>, uint64_t> byTarget;
+                // (with the last reference and mask, how many waits, and how many found it not holding yet)
+                struct Target
+                {
+                    uint64_t us = 0, n = 0, blocked = 0;
+                    uint32_t ref = 0, mask = 0;
+                };
+                static std::map<std::pair<uint32_t, uint32_t>, Target> byTarget;
                 static auto lastLog = Clock::now();
-                byTarget[{ arg(1) | ((info & 0x10) ? 0x80000000u : 0), info & 7 }] += uint64_t(us);
+                Target& t = byTarget[{ arg(1) | ((info & 0x10) ? 0x80000000u : 0), info & 7 }];
+                t.us += uint64_t(us), t.n++, t.blocked += us > 0, t.ref = arg(2), t.mask = arg(3);
                 if (Clock::now() - lastLog > std::chrono::seconds(2))
                 {
                     lastLog = Clock::now();
                     for (auto& [key, total] : byTarget)
-                        if (total > 20000)
-                            Log("perf: CP waited %llu ms on %s %08X (fn %u)", (unsigned long long)(total / 1000), (key.first >> 31) ? "mem" : "reg",
-                                key.first & 0x7FFFFFFF, key.second);
+                        if (total.us > 20000)
+                            Log("perf: CP waited %llu ms on %s %08X (fn %u, ref %08X mask %08X; %llu waits, %llu took 1 us or more)",
+                                (unsigned long long)(total.us / 1000), (key.first >> 31) ? "mem" : "reg", key.first & 0x7FFFFFFF, key.second, total.ref,
+                                total.mask, (unsigned long long)total.n, (unsigned long long)total.blocked);
                     byTarget.clear();
                 }
             }
@@ -1151,10 +1685,19 @@ uint32_t ExecutePacket(uint32_t ptr)
         break;
     }
     case 0x54: // INTERRUPT: cpu mask
+    {
         seg::Flush();
-        work::Drain(); // after the draws before it, like the hardware
+        // REGPU_NO_INTERRUPT_DRAIN=1 (live, test): the handler runs without waiting for the draw thread.
+        static LiveSwitch noInterruptDrain("REGPU_NO_INTERRUPT_DRAIN");
+        if (!noInterruptDrain)
+            work::Drain(2); // after the draws before it, like the hardware
         if (!NoFenceOrder())
+        {
+            const auto t0 = std::chrono::steady_clock::now();
             PendingWrites::Drain(); // and after the fence writes before it
+            work::g_drainUs[4].fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count()),
+                std::memory_order_relaxed);
+        }
         for (uint32_t cpu = 0; cpu < 6; cpu++)
         {
             if ((arg(0) >> cpu) & 1)
@@ -1162,11 +1705,15 @@ uint32_t ExecutePacket(uint32_t ptr)
                 // Synchronous, like the hardware: the handler runs on this
                 // thread before the command processor reads on.
                 g_gpu.interruptsRaised++;
+                const auto h0 = std::chrono::steady_clock::now();
                 DispatchInterrupt(*t_cpContext, 1, cpu);
+                work::g_drainUs[3].fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - h0).count()),
+                    std::memory_order_relaxed);
                 g_gpu.interruptsHandled++;
             }
         }
         break;
+    }
     case 0x60: // SET_BIN_MASK_LO
         g_gpu.binMask = (g_gpu.binMask & 0xFFFFFFFF00000000ull) | arg(0);
         break;
@@ -1197,7 +1744,31 @@ uint32_t ExecutePacket(uint32_t ptr)
             const uint32_t type = (arg(0) >> 16) & 0xFF;
             index = (arg(0) & 0x7FF) + (type < 5 ? bases[type] : 0);
         }
+        // REGPU_WINDOW_FIXUP_UNION (start time): a title whose tiling the host forced to one tile (FM3: one guest
+        // tile, src/hooks/one_tile.cpp) still runs command buffers recorded for several tiles. Their per-tile window
+        // fixups (predicated SET_CONSTANTs of the window offset and scissor, one per tile) all run outside a tiling
+        // pass (bin select all ones), and the last tile's would win: rows 512-719 only, shifted. Outside a tiling
+        // pass they make one window instead: offset 0, the union of the tiles' scissors.
+        static const bool windowUnion = getenv("REGPU_WINDOW_FIXUP_UNION") != nullptr;
+        const bool unionHere = windowUnion && (header & 1) && opcode == 0x2D && index <= 0x2080 && index + count - 1 > 0x2082 &&
+            (g_gpu.binSelect & 0xFFFFFFFFull) == 0xFFFFFFFFull;
+        const uint32_t lastTl = Reg(0x2081), lastBr = Reg(0x2082);
         WriteRegisters(index, data + 4, count - 1);
+        if (unionHere)
+        {
+            uint32_t tl = Reg(0x2081), br = Reg(0x2082);
+            if (g_gpu.windowUnion)
+            {
+                auto lo = [](uint32_t a, uint32_t b, uint32_t shift) { return std::min((a >> shift) & 0x7FFF, (b >> shift) & 0x7FFF) << shift; };
+                auto hi = [](uint32_t a, uint32_t b, uint32_t shift) { return std::max((a >> shift) & 0x7FFF, (b >> shift) & 0x7FFF) << shift; };
+                tl = (tl & 0x80000000u) | lo(tl, lastTl, 0) | lo(tl, lastTl, 16);
+                br = (br & 0x80000000u) | hi(br, lastBr, 0) | hi(br, lastBr, 16);
+            }
+            WriteRegister(0x2080, 0);
+            WriteRegister(0x2081, tl);
+            WriteRegister(0x2082, br);
+            g_gpu.windowUnion = true;
+        }
         break;
     }
     case 0x2F: // LOAD_ALU_CONSTANT: address, offset/type, size (dwords)
@@ -1420,6 +1991,7 @@ void CommandProcessorLoop(PPCContext& ctx)
     if (work::g_enabled)
     {
         memcpy(work::g_file.data(), gpureg::LiveFile(), work::g_file.size());
+        memcpy(work::g_sent.data(), gpureg::LiveFile(), work::g_sent.size()); // (what the draw thread has)
         std::thread worker(WorkerLoop);
         static HANDLE workerHandle = nullptr;
         DuplicateHandle(GetCurrentProcess(), worker.native_handle(), GetCurrentProcess(), &workerHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
@@ -1437,8 +2009,12 @@ void CommandProcessorLoop(PPCContext& ctx)
                     uint64_t busy = 0;
                     if (workerHandle && GetThreadTimes(workerHandle, &c, &e, &k, &u))
                         busy = (uint64_t(k.dwHighDateTime) << 32 | k.dwLowDateTime) + (uint64_t(u.dwHighDateTime) << 32 | u.dwLowDateTime);
-                    Log("perf: draw worker: %.0f%% busy, %llu drains (%llu waited) in 2 s", (busy - lastBusy) / 1e7 / 2.0 * 100.0,
-                        (unsigned long long)work::g_drains.exchange(0), (unsigned long long)work::g_drainWaits.exchange(0));
+                    Log("perf: draw worker: %.0f%% busy, %llu drains (%llu waited) in 2 s; waited ms: cond write %.1f, "
+                        "wait reg mem %.1f, interrupt %.1f, interrupt handlers (run, not waited) %.1f, interrupt's fence writes %.1f",
+                        (busy - lastBusy) / 1e7 / 2.0 * 100.0,
+                        (unsigned long long)work::g_drains.exchange(0), (unsigned long long)work::g_drainWaits.exchange(0),
+                        work::g_drainUs[0].exchange(0) / 1000.0, work::g_drainUs[1].exchange(0) / 1000.0, work::g_drainUs[2].exchange(0) / 1000.0,
+                        work::g_drainUs[3].exchange(0) / 1000.0, work::g_drainUs[4].exchange(0) / 1000.0);
                     lastBusy = busy;
                 }
             }
@@ -1466,17 +2042,51 @@ void CommandProcessorLoop(PPCContext& ctx)
         static std::chrono::steady_clock::time_point idleSince, logSince = std::chrono::steady_clock::now();
         static double idleSeconds = 0;
         static bool idle = false;
+        // REGPU_CP_IDLE_SLEEP_US=<n> (read twice a second, so live): once the ring has been empty for n
+        // microseconds, wait ~100 us at a time on a high-resolution timer instead of spinning on Sleep(0).
+        // Under a frame cap the CP is idle most of each frame and the spin holds a whole core; a title that
+        // queues work within n us of the last (uncapped) never reaches the sleep. 0 or unset: spin as before.
+        static std::chrono::steady_clock::time_point emptySince, sleepCheck;
+        static bool empty = false;
+        static int sleepAfterUs = 0;
         if (g_gpu.rptr == wptr)
         {
             seg::Flush(); // nothing more queued: translate what there is
+            const auto now = std::chrono::steady_clock::now();
             if (perf && !idle)
             {
                 idle = true;
-                idleSince = std::chrono::steady_clock::now();
+                idleSince = now;
             }
-            Sleep(0);
+            if (!empty)
+            {
+                empty = true;
+                emptySince = now;
+            }
+            if (now >= sleepCheck)
+            {
+                sleepCheck = now + std::chrono::milliseconds(500);
+                const char* v = getenv("REGPU_CP_IDLE_SLEEP_US");
+                const int us = v ? atoi(v) : 0;
+                if (us != sleepAfterUs)
+                    Log("gpu: command processor idle wait: %s%d us", us > 0 ? "sleeps after " : "spins (", us > 0 ? us : 0);
+                sleepAfterUs = us;
+            }
+            if (sleepAfterUs > 0 && now - emptySince >= std::chrono::microseconds(sleepAfterUs))
+            {
+                thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+                LARGE_INTEGER due;
+                due.QuadPart = -1000; // 100 us, relative, in 100 ns units
+                if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+                    WaitForSingleObject(timer, INFINITE);
+                else
+                    Sleep(0);
+            }
+            else
+                Sleep(0);
             continue;
         }
+        empty = false;
         if (perf)
         {
             const auto now = std::chrono::steady_clock::now();
@@ -1545,6 +2155,9 @@ uint32_t FrameCap()
     uint32_t c = s.maxFps;
     if (s.vsync)
         c = std::min(c, refresh);
+    // VR headset pacing (render/xr.h PaceCap): the headset's display rate while a session runs.
+    if (const uint32_t pace = regpu::xr::PaceCap())
+        c = std::min(c, pace);
     c = std::max(c, 30u);
     static std::atomic<uint32_t> logged{ 0 };
     if (logged.exchange(c) != c)
@@ -1562,13 +2175,31 @@ void VblankLoop()
         // keeps game time by the clock, not by frames, so vblanks run at twice the frame cap
         // (120-720 Hz) and the limiter in VdSwap sets the frame rate for both.
         static const char* fixedHz = getenv("REGPU_VBLANK_HZ");
-        const int hz = fixedHz ? std::clamp(atoi(fixedHz), 30, 1000) : std::clamp(int(FrameCap()) * 2, 120, 720);
+        // (REGPU_VBLANK_HZ up to 4000: a title that presents on vblank boundaries waits less for the next one at
+        // high rates, with ReGPU's limiter holding the frame cap.)
+        const int hz = fixedHz ? std::clamp(atoi(fixedHz), 30, 4000) : std::clamp(int(FrameCap()) * 2, 120, 720);
         const int64_t defaultUs = int64_t(1000000 / hz);
         // A host that owns the video mode (driver::SetRefreshRate) sets the rate instead.
         const int64_t hostUs = g_vblankUs.load(std::memory_order_relaxed);
         next += std::chrono::microseconds(hostUs ? hostUs : defaultUs);
         static LiveSwitch coarse("REGPU_COARSE_SLEEP"); // A/B: the old 1 ms sleeps
-        if (coarse)
+        if (VblankOnWait())
+        {
+            // The tick or a kick from the command processor (VblankOnWait), whichever comes first; after a kick the
+            // next tick is a full period away. (No spinning: the kicks set the pace when it matters.)
+            thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            const auto left = std::chrono::duration_cast<std::chrono::microseconds>(next - Clock::now()).count();
+            if (left > 0)
+            {
+                LARGE_INTEGER due;
+                due.QuadPart = -int64_t(left) * 10;
+                SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0);
+                const HANDLE handles[2] = { timer, VblankKickEvent() };
+                if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0 + 1)
+                    next = Clock::now();
+            }
+        }
+        else if (coarse)
             std::this_thread::sleep_until(next);
         else
             PreciseSleepUntil(next, 200);
@@ -1627,9 +2258,14 @@ namespace
 // The command processor reached a swap: the frame so far goes to the screen.
 void PresentSwap(uint64_t frame, uint32_t frontBuffer)
 {
-    seg::Flush();
-    seg::EndFrame();
-    seg::g_tile = RendererTile{};
+    if (!work::Active()) // (else at the draw thread's swap record)
+    {
+        seg::Flush();
+        seg::EndFrame();
+        seg::g_tile = RendererTile{};
+        seg::g_query = false; // (the renderer ends a query still open at the swap)
+    }
+    g_zpdKindCount.clear();
     if (work::Active())
     {
         uint32_t* p = work::Begin(work::kSwap, 3);
@@ -1696,6 +2332,17 @@ void PaceSwap(uint64_t frame)
         next = std::max(next, now) + std::chrono::microseconds(minFrameUs);
     }
 }
+}
+
+// (For the presenter's pacing, render/presenter.cpp.)
+uint32_t RegpuFrameCap() { return FrameCap(); }
+
+void regpu::triple::SubmitViews(const View (&views)[3])
+{
+    std::lock_guard lock(stereo::g_tripleMutex);
+    for (int i = 0; i < 3; i++)
+        stereo::g_tripleIn[i] = views[i];
+    stereo::g_tripleAt = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
 }
 
 void regpu::SetFrameLimit(uint32_t maxFps, bool vsync)

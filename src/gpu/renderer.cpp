@@ -8,6 +8,9 @@
 // skipped; render-target configuration (EDRAM surfaces, MSAA, tiles) comes
 // next.
 
+#if REGPU_MESHOPT
+#include <meshoptimizer.h>
+#endif
 #include <algorithm>
 #include <bit>
 #include <immintrin.h>
@@ -16,6 +19,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -36,10 +40,20 @@
 #include <wrl/client.h>
 
 #include "gpu/hlsl.h"
+#include "gpu/xess.h"
 #include "gpu/dlss.h"
 #include "gpu/fsr3.h"
 #include "gpu/recorded_list.h"
+#include "render/xr.h"
 #include "fsr1_cs.h"
+#include "postaa_cs.h"
+#if REGPU_POSTAA_FILTERS
+#include "postaa_fxaa_cs.h"
+#include "postaa_smaa_cs.h"
+#include "postaa_cmaa2_cs.h"
+#include "AreaTex.h"
+#include "SearchTex.h"
+#endif
 #include <DirectXPackedVector.h>
 #include "live_switch.h"
 #include "settings.h"
@@ -50,11 +64,18 @@
 #include "kernel/thread.h"
 #include "debug.h"
 #include "log.h"
+#include "regpu/driver.h"
 #include "png.h"
 #include "render/presenter.h"
 #include "gpu/renderer.h"
 #include "gpu/shader_scan.h"
 #include "gpu/resolve_pack.h"
+
+// REGPU_DXC (dxc.cpp, global): DXIL from DXC instead of FXC's DXBC, cached apart (.dxil).
+bool DxcEnabled();
+bool DxcFor(bool pixel); // (both stages or neither: D3D12 refuses mixed DXBC/DXIL pipelines)
+HRESULT DxcCompileShader(const std::string& hlsl, bool pixel, ID3DBlob** code, std::string* errors);
+std::string DxcCacheTag(); // "-<hash of REGPU_DXC_ARGS>" or ""
 
 using Microsoft::WRL::ComPtr;
 
@@ -64,6 +85,19 @@ std::atomic<bool> g_gameWidescreen{ false }; // regpu::SetGameWidescreen
 namespace
 {
 constexpr UINT kWidth = 1280, kHeight = 720;
+// The guest frame: the size of the picture the title draws its main view at and hands to the display. 1280x720 for
+// most titles (kWidth x kHeight, which also stay the 16:9 display shape: OutputWide); PGR3's races draw 1024x600 (a
+// 2x MSAA surface of pitch 1040, the console's scaler stretched it to the screen) while its menus draw 1280x720. The
+// swap takes the size of the front buffer the title resolved (RendererNoteFrontBuffer) and the next frame uses it,
+// so the main view fills the output at its own scale (1440p: 2.5 x 2.4 for 1024x600) instead of being scaled from
+// 720 rows and shown centred. REGPU_FIXED_FRAME_SIZE=1 (live, from the next swap): always 1280x720, as before.
+std::atomic<uint32_t> g_frameWidth{ kWidth }, g_frameHeight{ kHeight };
+std::atomic<uint32_t> g_frameRoomHeight{ kHeight }; // the smallest frame height seen: the EDRAM surfaces' rows (SurfaceHeight)
+std::atomic<uint32_t> g_frameRequest{ 0 };          // width << 16 | height asked by the swap (ApplyFrameSize), 0 none
+inline uint32_t FrameW() { return g_frameWidth.load(std::memory_order_relaxed); }
+inline uint32_t FrameH() { return g_frameHeight.load(std::memory_order_relaxed); }
+// The frame's surface pitch: its width rounded up to EDRAM tiles (80 pixels; PGR3's 1024 -> 1040).
+inline uint32_t FramePitch() { return (FrameW() + 79) / 80 * 80; }
 // Output size (RenderSize: REGPU_RESOLUTION or REGPU_RENDER_SCALE). Everything else
 // (registers, scissors, resolve and clear rectangles, shader constants) stays in the game's
 // own pixels; only the D3D calls scale. Vertically that is output height / 720. A pass at
@@ -74,12 +108,23 @@ constexpr UINT kWidth = 1280, kHeight = 720;
 // all read the same pitch, so they agree.
 // (Changed while the game runs by regpu::SetOutputSize, applied between frames: ApplyOutputSize.)
 std::atomic<uint32_t> g_outputWidth{ 0 }, g_outputHeight{ 0 };
+// Bumped by every change to what the pass sizes and scales depend on besides the surface registers (output size,
+// scene scale, the tall pass, the native MSAA table): PassScales' memo compares it instead of each input.
+std::atomic<uint32_t> g_passEpoch{ 0 };
+void BumpPassEpoch() { g_passEpoch.fetch_add(1, std::memory_order_relaxed); }
+// The debug shot's width: the shown picture's (three screens in triple mode, else the render width).
+uint32_t OutputWidth();
+uint32_t DumpWidth() { return ::TripleMode() ? OutputWidth() * 3 : OutputWidth(); }
+uint32_t g_dumpWidth = 0; // the last shot's (set where it is copied)
+uint32_t g_dumpHeight = 0; // ... and height (a front buffer smaller than the output: PGR3's 1024x600 races)
+
 void LoadOutputSize()
 {
     uint32_t w, h;
     RenderSize(w, h);
     g_outputWidth = w;
     g_outputHeight = h;
+    BumpPassEpoch();
 }
 uint32_t OutputWidth()
 {
@@ -92,6 +137,18 @@ uint32_t OutputHeight()
     if (!g_outputHeight.load(std::memory_order_relaxed))
         LoadOutputSize();
     return g_outputHeight.load(std::memory_order_relaxed);
+}
+// The swap's front buffer (guest size): a frame size for the next frame (ApplyFrameSize) when it differs. Only the
+// shapes a display scaler takes (640x360 .. 1280x720).
+void NoteFrontBuffer(uint32_t width, uint32_t height)
+{
+    static LiveSwitch fixed("REGPU_FIXED_FRAME_SIZE");
+    if (fixed)
+        width = kWidth, height = kHeight;
+    if (width < 640 || width > kWidth || height < 360 || height > kHeight)
+        return;
+    if (width != FrameW() || height != FrameH())
+        g_frameRequest.store(width << 16 | height, std::memory_order_relaxed);
 }
 // Upscaling: the 3D scene of a frame renders at this fraction of the output (1 otherwise);
 // after the scene is upscaled (UpscaleScene), the rest of the frame renders at full size.
@@ -115,6 +172,8 @@ struct Upscale
     bool tried = false, ready = false;
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> easu, rcas, depthCopy, gamma, enhance, view;
+    ComPtr<ID3D12PipelineState> gammaDraw; // the gamma pass as a draw into the back buffer (GradeIntoBackBuffer)
+    ComPtr<ID3D12PipelineState> bilinear;  // REGPU_UPSCALE_BILINEAR: one bilinear pass instead of EASU + RCAS
     // This frame's motion and depth were handed to the upscaler, at this render size (ViewFrontBuffer).
     bool viewValid = false;
     uint32_t viewWidth = 0, viewHeight = 0;
@@ -160,8 +219,60 @@ struct Upscale
     // upscaler drops its history (EvaluateTemporal). cutSamples/cutHits count this frame's comparisons.
     uint32_t cutSamples = 0, cutHits = 0;
     bool cut = false;
-    std::unordered_map<uint64_t, DrawConstants> constants;
-    std::unordered_map<uint64_t, uint32_t> occurrences;
+    // Flat open-addressing tables (FM3 port, session 36): two std::unordered_map lookups a draw and a per-frame clear of
+    // ~3,300 nodes were ~4% of the draw thread with FSR 3 at 1440p. Occurrences carry their frame instead of a clear.
+    struct MotionTable
+    {
+        struct Slot
+        {
+            uint64_t key = 0; // 0 = empty (keys are forced odd)
+            uint32_t occFrame = 0, occ = 0;
+            DrawConstants c;
+        };
+        std::vector<Slot> slots;
+        size_t used = 0;
+        Slot& At(uint64_t key)
+        {
+            key |= 1;
+            if (slots.empty() || (used + 1) * 2 > slots.size())
+                Grow();
+            const size_t mask = slots.size() - 1;
+            for (size_t i = (key * 0x9E3779B97F4A7C15ull) >> 20 & mask;; i = (i + 1) & mask)
+            {
+                Slot& e = slots[i];
+                if (e.key == key)
+                    return e;
+                if (!e.key)
+                {
+                    e.key = key;
+                    used++;
+                    return e;
+                }
+            }
+        }
+        // Doubles, dropping draws not seen for a while (as the old map's sweep every 600 frames did).
+        void Grow(uint32_t frame = 0)
+        {
+            std::vector<Slot> old = std::move(slots);
+            size_t live = 0;
+            for (const Slot& e : old)
+                live += e.key && e.c.frame + 600 >= frame;
+            slots.assign(std::max<size_t>(8192, size_t(1) << (64 - __builtin_clzll(uint64_t(live * 4 + 1)))), Slot{});
+            used = 0;
+            const size_t mask = slots.size() - 1;
+            for (const Slot& e : old)
+                if (e.key && e.c.frame + 600 >= frame)
+                {
+                    size_t i = (e.key * 0x9E3779B97F4A7C15ull) >> 20 & mask;
+                    while (slots[i].key)
+                        i = (i + 1) & mask;
+                    slots[i] = e;
+                    used++;
+                }
+        }
+    };
+    MotionTable occurrences; // by draw (before its occurrence): how often it came up this frame
+    MotionTable constants;   // by draw and occurrence: its constants' addresses
     uint32_t constantsFrame = 0;
 } g_upscale;
 
@@ -189,7 +300,20 @@ void SetNativeMsaa(uint32_t key, uint32_t msaa)
     // Read first: written at every draw, the slot's cache line bounced between the draw workers.
     std::atomic<uint32_t>& slot = NativeSlot(key);
     if (slot.load(std::memory_order_relaxed) != (key << 2 | msaa) && slot.exchange(key << 2 | msaa, std::memory_order_relaxed) != (key << 2 | msaa))
+    {
         g_nativeMsaaGeneration.fetch_add(1, std::memory_order_relaxed);
+        BumpPassEpoch();
+    }
+}
+// The same for the textured draws into 64-bit colour formats only (RB_COLOR_INFO format 5 16_16_16_16, 7 16_16_16_16
+// FLOAT, 12 2_10_10_10_FLOAT_AS_16_16_16_16, 15 32_32_FLOAT): a 64-bit target and a 32-bit pass can share a base and row
+// width (FM3 port, session 40).
+std::atomic<uint32_t> g_nativeMsaa64[0x1000]; // key << 2 | MSAA mode
+std::atomic<uint32_t>& NativeSlot64(uint32_t key) { return g_nativeMsaa64[(key ^ key >> 12) & 0xFFF]; }
+bool Color64Bpp()
+{
+    const uint32_t f = (gpureg::Get(0x2001 /* RB_COLOR_INFO */) >> 16) & 0xF;
+    return f == 5 || f == 7 || f == 12 || f == 15;
 }
 // The same, for depth surfaces: the MSAA layout each depth EDRAM base and row width (in samples)
 // is drawn in. A title can reset a 1x pass's stencil through a 4x view that only shares the depth
@@ -227,20 +351,80 @@ uint32_t BigPassSizeUncached()
     if (const int native = ForeignNativeMsaa(); native >= 0)
         pitch = pitch * MsaaAcross((gpureg::Get(0x2000) >> 16) & 3) / MsaaAcross(uint32_t(native));
     static LiveSwitch off("REGPU_NO_BIG_PASS");
-    return !off && pitch > kWidth ? std::min<uint32_t>(2048, pitch * 64 / 65) : 0;
+    // The pass is the surface's own width, at most 2048. (pitch * 64 / 65 fitted the 2080-pitch 2048-wide strips the
+    // FM2 port met first, but cut every narrower big pass short: FM3's 1400-wide 4x vinyl side views became 1378-wide
+    // images, so the vinyl regions sampled them stretched by 22 columns, and the 1440-pitch 1416-wide regions became
+    // 1329 wide: small uncovered spots at the edges of the car's vinyls.) 2080 still gives 2048.
+    // REGPU_BIG_PASS_6465=1: pitch * 64 / 65 as before (A/B, from the next pass).
+    static LiveSwitch padded("REGPU_BIG_PASS_6465");
+    return !off && pitch > FramePitch() ? std::min<uint32_t>(2048, padded ? pitch * 64 / 65 : pitch) : 0;
 }
-// Asked several times per draw (PassWidth, PassHeight, ScaleX, ScaleY): the answer only changes
-// with the surface registers or the layout table.
-uint32_t BigPassSize()
+// The pass sizes and scales (BigPassSize ... ScaleX) are asked ~25 times a draw, nested: each answer depends only on
+// the surface registers, the layout table, the tall pass, the output size and the scene scale, so all of them are
+// worked out together once and kept per thread until one of those changes (FM3 port, session 25: the separate
+// memos and their re-checks were ~8% of the draw thread). Defined below (PassScales).
+struct PassScaleSnapshot
 {
-    struct Memo { uint32_t surface = ~0u, color = ~0u, generation = ~0u, result = 0; };
-    thread_local Memo memo;
-    const uint32_t surface = gpureg::Get(0x2000), color = gpureg::Get(0x2001) & 0xFFF, generation = g_nativeMsaaGeneration.load(std::memory_order_relaxed);
-    if (surface != memo.surface || color != memo.color || generation != memo.generation)
-        memo = { surface, color, generation, BigPassSizeUncached() };
-    return memo.result;
+    uint32_t surface = ~0u, color = ~0u, generation = ~0u, tallInfo = ~0u, tallHeight = ~0u, tallKey = ~0u, outW = ~0u, outH = ~0u, epoch = ~0u;
+    uint64_t drawId = 0; // the draw (t_passDrawId) it was last checked in
+    float scene = -1;
+    uint32_t big = 0, width = 0, height = 0;
+    float passScale = 1, scaleY = 1, scaleWide = 1, scaleX = 1;
+};
+[[gnu::always_inline]] inline const PassScaleSnapshot& PassScales();
+// Which other parts of the constant blocks a shader's code reads (TranslatedShader::readsBools ...), from its final
+// HLSL past the preamble: the names it would read them by. A false match only writes a part it doesn't need.
+void ScanBlockUse(TranslatedShader& info)
+{
+    const std::string& h = info.hlsl;
+    const size_t from = std::min(info.bodyStart, h.size());
+    auto has = [&](const char* t) { return h.find(t, from) != std::string::npos; };
+    info.readsBools = has("vb") || has("pb") || has("BoolConstant");
+    info.readsLoops = has("vl[") || has("pl[");
+    info.readsFetchLayout = has("vfl") || has("VFetchK") || has("VMerge");
+    info.readsUser = has("vuser");
 }
-uint32_t PassWidth() { const uint32_t big = BigPassSize(); return big ? big : kWidth; }
+// Renumbers the float constants a shader reads (vc[N] / pc[N], literal indices past the preamble) to their rank in
+// its constant mask, so a draw writes them packed (TranslatedShader::packedConstants). A shader with relative
+// addressing reads all 256 (its mask is full) and keeps its numbering. REGPU_NO_PACKED_CONSTANTS=1 (start-time:
+// the shaders are compiled one way) keeps every shader's numbering.
+void PackConstants(TranslatedShader& info, bool pixel)
+{
+    static const bool off = getenv("REGPU_NO_PACKED_CONSTANTS") != nullptr;
+    const auto& m = info.constantMask;
+    if (off || (m[0] & m[1] & m[2] & m[3]) == ~0ull)
+        return;
+    uint8_t rank[256];
+    for (uint32_t i = 0, n = 0; i < 256; i++)
+        rank[i] = uint8_t(n), n += (m[i >> 6] >> (i & 63)) & 1;
+    std::string& h = info.hlsl;
+    const char* name = pixel ? "pc[" : "vc[";
+    std::string out;
+    out.reserve(h.size());
+    size_t from = std::min(info.bodyStart, h.size());
+    out.append(h, 0, from);
+    for (size_t at; (at = h.find(name, from)) != std::string::npos;)
+    {
+        const bool standalone = at == 0 || !(isalnum(uint8_t(h[at - 1])) || h[at - 1] == '_');
+        size_t d = at + 3, e = d;
+        while (e < h.size() && isdigit(uint8_t(h[e])))
+            e++;
+        out.append(h, from, d - from);
+        if (standalone && e > d && e < h.size() && h[e] == ']')
+        {
+            const uint32_t index = uint32_t(atoi(h.c_str() + d)) & 255;
+            out += std::to_string(rank[index]);
+            from = e;
+        }
+        else
+            from = d;
+    }
+    out.append(h, from, std::string::npos);
+    h = std::move(out);
+    info.packedConstants = true;
+}
+uint32_t BigPassSize() { return PassScales().big; }
+uint32_t PassWidth() { return PassScales().width; }
 // Another MSAA view of the tall pass's EDRAM: a title can clear the stencil of its 1x
 // 1024x1024 target through a 4x view (480x512, pitch 520) while a layer is being moved.
 bool TallView()
@@ -249,13 +433,14 @@ bool TallView()
     const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
     return !off && g_tallHeight && surface != g_tallInfo && ((surface ^ g_tallInfo) >> 16 & 3) && LayoutKey(surface) == g_tallKey;
 }
-uint32_t PassHeight()
+uint32_t PassHeightOf(uint32_t big)
 {
-    if (const uint32_t big = BigPassSize())
+    if (big)
         return big;
     const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
-    return g_tallHeight && (surface == g_tallInfo || TallView()) ? g_tallHeight : kHeight;
+    return g_tallHeight && (surface == g_tallInfo || TallView()) ? g_tallHeight : FrameH();
 }
+uint32_t PassHeight() { return PassScales().height; }
 // Guest rows the host EDRAM surfaces hold at full scale. A 1024-row pass (a 1024x1024 shadow
 // atlas drawn as one tall pass) used to be squeezed into the 720 rows of the output: at a 720p
 // render size FH1's four shadow cascades had 70% of the console's resolution (720x720 for its
@@ -274,7 +459,9 @@ uint32_t TallScaleRoom() { return std::max<uint32_t>(1, (OutputHeight() + kHeigh
 uint32_t SurfaceWidth() { return std::max(OutputWidth(), TallScaleRoom() * kWidth); }
 uint32_t SurfaceHeight()
 {
-    return std::max(uint32_t((uint64_t(OutputHeight()) * SurfaceRows() + kHeight - 1) / kHeight), TallScaleRoom() * SurfaceRows());
+    // (Rows for the smallest guest frame seen: a 600-row frame scales 1.2x more than a 720-row one.)
+    const uint32_t room = g_frameRoomHeight.load(std::memory_order_relaxed);
+    return std::max(uint32_t((uint64_t(OutputHeight()) * SurfaceRows() + room - 1) / room), TallScaleRoom() * SurfaceRows());
 }
 
 // A tall pass (a shadow atlas) is drawn at a whole number of host texels per guest texel: titles move
@@ -284,41 +471,123 @@ uint32_t SurfaceHeight()
 // up when the surfaces hold it (rounded down to 1x at 1080p the near shadows still shimmered a little
 // and distant ones more, at the console's own resolution), else down.
 // REGPU_FRACTIONAL_TALL_SCALE=1: the output's scale as before (A/B).
-float IntegerTallScale(float passScale)
+float IntegerTallScale(float passScale, uint32_t big, uint32_t passHeight)
 {
     static LiveSwitch fractional("REGPU_FRACTIONAL_TALL_SCALE");
-    if (fractional || BigPassSize() || PassHeight() <= kHeight)
+    if (fractional || big || passHeight <= FrameH())
         return passScale;
-    const float total = float(OutputHeight()) / float(kHeight) * g_sceneScale * passScale;
+    const float total = float(OutputHeight()) / float(FrameH()) * g_sceneScale * passScale;
     if (total <= 1.0f)
         return passScale;
     const uint32_t pitch = gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF;
     const float up = std::ceil(total - 1e-3f);
-    const bool fits = up * float(PassHeight()) <= float(SurfaceHeight()) && up * float(pitch) <= float(SurfaceWidth());
+    const bool fits = up * float(passHeight) <= float(SurfaceHeight()) && up * float(pitch) <= float(SurfaceWidth());
     return passScale * (fits ? up : std::floor(total + 1e-3f)) / total;
 }
 
-float PassScale()
+// REGPU_HELPER_SCALE=<0.1-1> (start-time): passes narrower than the screen (reflection and environment maps,
+// a title's other small off-screen images) are drawn at that share of the output's scale, below the console's
+// own resolution if need be: their images come out softer. Not big passes (wider than the screen, squeezed
+// already) or tall ones (shadow atlases). 1 (default): as before.
+float HelperScale()
 {
-    // (Asked for every scaled coordinate: memoised on what it depends on.)
-    struct Memo { uint32_t surface = ~0u, color = ~0u, generation = ~0u, tallInfo = ~0u, tallHeight = ~0u, output = ~0u; float scene = -1; float result = 1; };
-    thread_local Memo memo;
-    const uint32_t surface = gpureg::Get(0x2000), color = gpureg::Get(0x2001) & 0xFFF, generation = g_nativeMsaaGeneration.load(std::memory_order_relaxed);
-    if (surface != memo.surface || color != memo.color || generation != memo.generation || g_tallInfo != memo.tallInfo || g_tallHeight != memo.tallHeight ||
-        OutputHeight() != memo.output || g_sceneScale != memo.scene)
-        memo = { surface, color, generation, g_tallInfo, g_tallHeight, OutputHeight(), g_sceneScale,
-            IntegerTallScale(std::min(float(kWidth) / float(PassWidth()), float(SurfaceRows()) / float(PassHeight()))) };
-    return memo.result;
+    static const float scale = getenv("REGPU_HELPER_SCALE") ? std::clamp(float(atof(getenv("REGPU_HELPER_SCALE"))), 0.1f, 1.0f) : 1.0f;
+    return scale;
 }
-float ScaleY() { return float(OutputHeight()) / float(kHeight) * g_sceneScale * PassScale(); }
-float ScaleWide() { return float(OutputWidth()) / float(kWidth) * g_sceneScale * PassScale(); }
-bool WidePass() { return (gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF) == kWidth; }
-float ScaleX() { return WidePass() ? ScaleWide() : ScaleY(); }
+
+bool HelperPassOf(uint32_t big)
+{
+    const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
+    return (surface & 0x3FFF) < FrameW() && !big && !(g_tallHeight && (surface == g_tallInfo || TallView()));
+}
+bool HelperPass() { return HelperPassOf(BigPassSize()); }
+
+float HelperPassScale(float passScale, uint32_t big)
+{
+    return HelperScale() < 1.0f && HelperPassOf(big) ? passScale * HelperScale() : passScale;
+}
+
+// The main view's pass: the frame's pitch (1280; PGR3's 1024-wide races 1024..1040).
+bool WidePass()
+{
+    const uint32_t pitch = gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF;
+    return pitch >= FrameW() && pitch <= FramePitch();
+}
+// VR stereo (gpu.cpp stereo::): the eye being drawn, as a clip-space x offset (0: none).
+float g_stereoClipX = 0.0f;
+bool g_stereoReplay = false; // the second eye's pass (no write-backs to guest memory)
+// Triple screen (FM3 port, session 39): the pass's view (RendererSetTripleView) and the triple-wide picture.
+float g_tripleView[5] = {}; // a b c d e of this pass (RendererSetTripleView), e 0 = off
+bool g_tripleSide = false;
+bool g_tripleReady = false; // all three screens captured this frame (the swap shows g_tripleImage)
+ComPtr<ID3D12Resource> g_tripleImage, g_tripleScreen[3];
+// REGPU_NO_PASS_SNAPSHOT=1: worked out at every call (A/B, live).
+LiveSwitch g_passNoSnapshot("REGPU_NO_PASS_SNAPSHOT"), g_passFullCheck("REGPU_PASS_SNAPSHOT_FULL_CHECK");
+// Inside DrawImpl: a number for the draw this thread is translating (0 outside one). A draw's surface registers can't
+// change while it is translated (the draw thread reads its own register copy, written between draws), so once the
+// memo is checked in a draw, later asks in it compare only the pass epoch (FM3 session 31: PassScales ~7.5% of the
+// draw thread at ~25 asks a draw). REGPU_PASS_SNAPSHOT_PER_CALL=1: the registers are read at every ask (A/B, live).
+thread_local uint64_t t_passDrawId = 0;
+LiveSwitch g_passPerCall("REGPU_PASS_SNAPSHOT_PER_CALL");
+// (Experimental branch, FM3 port session 45: the asks were ~5% of the draw thread as calls; the check that answers almost
+// all of them is now a small function the compiler inlines into each caller, the rest a separate one.)
+thread_local PassScaleSnapshot t_passSnapshot;
+[[gnu::noinline]] const PassScaleSnapshot& PassScalesSlow();
+[[gnu::always_inline]] inline const PassScaleSnapshot& PassScales()
+{
+    const PassScaleSnapshot& s = t_passSnapshot;
+    if (t_passDrawId && s.drawId == t_passDrawId && s.epoch == g_passEpoch.load(std::memory_order_relaxed) && !g_passPerCall)
+        return s;
+    return PassScalesSlow();
+}
+const PassScaleSnapshot& PassScalesSlow()
+{
+    PassScaleSnapshot& s = t_passSnapshot;
+    thread_local PassScaleSnapshot fresh;
+    // Asked ~25 times a draw: the memo is checked against the surface registers and the pass epoch (g_passEpoch:
+    // every other input bumps it), not each input (that check was ~7% of the draw thread, FM3 session 30).
+    // REGPU_PASS_SNAPSHOT_FULL_CHECK=1 compares every input again (A/B, live).
+    const uint32_t surface = gpureg::Get(0x2000), color = gpureg::Get(0x2001) & 0xFFF, epoch = g_passEpoch.load(std::memory_order_relaxed);
+    if (!g_passFullCheck && !g_passNoSnapshot && surface == s.surface && color == s.color && epoch == s.epoch && s.outH)
+    {
+        s.drawId = t_passDrawId;
+        return s;
+    }
+    const uint32_t generation = g_nativeMsaaGeneration.load(std::memory_order_relaxed);
+    const uint32_t outW = g_outputWidth.load(std::memory_order_relaxed), outH = g_outputHeight.load(std::memory_order_relaxed);
+    if (!g_passNoSnapshot && surface == s.surface && color == s.color && generation == s.generation && g_tallInfo == s.tallInfo &&
+        g_tallHeight == s.tallHeight && g_tallKey == s.tallKey && outW == s.outW && outH == s.outH && outH && g_sceneScale == s.scene)
+    {
+        s.epoch = epoch, s.drawId = g_passFullCheck ? 0 : t_passDrawId;
+        return s;
+    }
+    PassScaleSnapshot& n = g_passNoSnapshot ? fresh : s;
+    n.epoch = epoch;
+    n.drawId = g_passNoSnapshot || g_passFullCheck ? 0 : t_passDrawId;
+    n.surface = surface, n.color = color, n.generation = generation, n.tallInfo = g_tallInfo, n.tallHeight = g_tallHeight, n.tallKey = g_tallKey;
+    n.outW = OutputWidth(), n.outH = OutputHeight(), n.scene = g_sceneScale;
+    n.big = BigPassSizeUncached();
+    const uint32_t frameW = FrameW(), frameH = FrameH();
+    n.width = n.big ? n.big : frameW;
+    n.height = PassHeightOf(n.big);
+    n.passScale = HelperPassScale(IntegerTallScale(std::min(float(frameW) / float(n.width), float(SurfaceRows()) / float(n.height)), n.big, n.height), n.big);
+    n.scaleY = float(n.outH) / float(frameH) * n.scene * n.passScale;
+    n.scaleWide = float(n.outW) / float(frameW) * n.scene * n.passScale;
+    n.scaleX = WidePass() ? n.scaleWide : n.scaleY;
+    return n;
+}
+float PassScale() { return PassScales().passScale; }
+float ScaleY() { return PassScales().scaleY; }
+float ScaleWide() { return PassScales().scaleWide; }
+float ScaleX() { return PassScales().scaleX; }
 LONG HostX(LONG v) { return LONG(std::lround(double(v) * ScaleX())); }
 LONG HostY(LONG v) { return LONG(std::lround(double(v) * ScaleY())); }
 D3D12_RECT ToHost(const D3D12_RECT& r)
 {
-    return { HostX(r.left), HostY(r.top), HostX(r.right), HostY(r.bottom) };
+    const PassScaleSnapshot& p = PassScales(); // (one ask, not four)
+    auto x = [&](LONG v) { return LONG(std::lround(double(v) * p.scaleX)); };
+    auto y = [&](LONG v) { return LONG(std::lround(double(v) * p.scaleY)); };
+    return { x(r.left), y(r.top), x(r.right), y(r.bottom) };
 }
 
 // Wider than 16:9: the output is `wide` times as wide as 16:9 for its height. The view
@@ -345,6 +614,12 @@ UINT64 kRingSize = 64ull << 20;
 constexpr UINT64 kRingMax = 2048ull << 20;
 std::atomic<UINT64> g_ringWant{ 0 };
 UINT64 g_ringPeak = 0;
+// What each ring allocation holds (REGPU_TRACE_RING_KINDS).
+enum RingKind { RingOther, RingConstants, RingIndexList, RingVertexUpload, RingVertexArena, RingIndexBuffer, RingTexture, kRingKinds };
+std::atomic<uint64_t> g_ringKindBytes[kRingKinds], g_ringKindCount[kRingKinds];
+bool g_traceRingKinds = false; // REGPU_TRACE_RING_KINDS, read at each frame start (the counts cost ~2% of the draw thread)
+UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256, RingKind kind = RingOther);
+std::atomic<uint64_t> g_ringGeneration{ 0 }; // counts ring resets (RingAlloc's chunks)
 constexpr UINT kDescriptorsPerFrame = 8192; // per frame: ring + guest memory views, then resolve-blit views
 constexpr UINT kBindless = 1u << 16;      // permanent texture descriptors (0 null 2D, 1 null cube)
 constexpr UINT kBindlessBase = kDescriptorsPerFrame * 3;
@@ -354,6 +629,19 @@ constexpr UINT kMaxSurfaces = 64; // EDRAM bases with host surfaces
 // Samples per pixel of the scene surfaces (anti-aliasing, Settings::msaa). The blits that
 // read them use multisampled shaders when this is above 1.
 uint32_t g_msaa = 1;
+uint32_t g_msaaQuality = 0; // EQAA (Config::eqaa): the MSAA quality level of the surfaces and their pipelines
+// REGPU_A2M_AS_TEST=1 (live): alpha to mask is a plain alpha test (alpha >= 0.5) at one sample: no
+// dither, the cut-out as D3D's single-sample coverage makes it; =2 also replaces the coverage of a
+// multisampled target (soft cut-out edges become hard). Off: as the console.
+bool A2mAsTest()
+{
+    static LiveSwitch a2m("REGPU_A2M_AS_TEST");
+    if (!a2m)
+        return false;
+    static const bool always = getenv("REGPU_A2M_AS_TEST") && atoi(getenv("REGPU_A2M_AS_TEST")) >= 2;
+    return g_msaa == 1 || always;
+}
+
 constexpr uint32_t RB_SURFACE_INFO = 0x2000, RB_COLOR_INFO = 0x2001, RB_DEPTH_INFO = 0x2002;
 // Buffers that change (UI quads, particles) are all under 3 KB (REGPU_TRACE_MIDSIZE); REGPU_DIRECT_FETCH_KB
 // overrides. (16 KB while fences were written at record time; since they wait for the host GPU, 4 KB.)
@@ -396,6 +684,7 @@ struct CompiledShader
 {
     enum State { Pending, Ready, Failed };
     std::atomic<int> state{ Pending }; // set by the compile worker
+    bool loadFirst = false;              // the compile worker tries the disk cache first (FetchVariantOf)
     uint64_t hash = 0, cacheKey = 0;
     bool pixel = false;
     std::vector<uint32_t> ucodeBE; // saved to the shader cache once a pipeline uses it
@@ -403,6 +692,7 @@ struct CompiledShader
     TranslatedShader info;
     const CompiledShader* hlslSource = nullptr; // canonical variants: the shader whose code (and HLSL) this reuses
     mutable const CompiledShader* motion = nullptr; // its motion-vector variant, once looked up
+    mutable const CompiledShader* noKill = nullptr; // pixel shaders: the variant without the alpha test (NoKillShader)
     uint32_t tag = 0; // the game's mark for this shader (Host::rewriteShader), passed to Host::onDraw
     bool IsReady() const { return state.load(std::memory_order_acquire) == Ready; }
 };
@@ -434,6 +724,9 @@ struct CachedTexture
     uint32_t width = 0, height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM; // cubes: matches their faces
     bool native = false; // block-compressed on the GPU: the shader applies the fetch swizzle
+    // The texture budget's size of `resource` (GetResourceAllocationInfo, asked once per resource: TextureBudgetBytes).
+    const ID3D12Resource* budgetFor = nullptr;
+    uint64_t budgetBytes = 0;
 };
 
 // A resolve destination backed by a host texture: fetches of this guest
@@ -456,7 +749,15 @@ struct ResolvedTexture
     uint64_t memHash = 0, memChecked = 0;
     bool stale = false;
     uint32_t guestBpp = 4; // bytes per pixel of the guest image: the hash covers only its memory
+    uint32_t copyPitch = 0; // the copy's row width (RB_COPY_DEST_PITCH): its memory is tiled across this, rounded to 32
     uint32_t guestFormat = 0; // the copy's destination format (RB_COPY_DEST_INFO bits 7-12)
+    uint32_t guestNumber = 0; // the copy's destination number format (bits 13-15: 0 unsigned fraction, 1 signed, 2 uint, 3 sint)
+    // Written back to memory (WriteResolveToGuest, QueueDeferredWriteback), with this RB_COPY_DEST_INFO: resolves later drawn
+    // into it (ResolveIntoEnclosing) write their rectangle of it too, so memory keeps every part of it.
+    bool writtenBack = false;
+    uint32_t writebackInfo = 0;
+    uint64_t usedFrame = 0; // renderer frame it was last looked up (ResolveCurrent) or resolved: the cache release sweep
+    uint64_t sweepChecked = 0; // renderer frame the sweep last hashed its memory and kept it
     bool plain8888 = false; // copied from a k_8_8_8_8 surface to a k_8_8_8_8 image: its bytes aren't gamma (see the gamma-signed fetches)
     // The title resolves differently sized images (bloom chain) to one address within a
     // frame: keep earlier sizes here and swap them in rather than recreating them.
@@ -481,6 +782,12 @@ struct FrameResources
     ComPtr<ID3D12Resource> ring;
     uint8_t* ringCpu = nullptr;
     UINT64 ringSize = 0; // this slot's ring (grows, see RingAlloc)
+    // REGPU_GPU_UPLOAD_RING (live): the same ring in a GPU upload heap (VRAM the CPU writes through resizable BAR),
+    // swapped with `ring` at the frame start; made only when the device reports GPU upload heaps.
+    ComPtr<ID3D12Resource> ringAlt;
+    uint8_t* ringAltCpu = nullptr;
+    UINT64 ringAltSize = 0;
+    bool ringInVram = false;
     std::atomic<UINT64> ringUsed{ 0 }; // draw workers allocate concurrently
     // Guest ranges already uploaded this frame: (address << 32 | bytes) -> (offset, sample hash).
     std::unordered_map<uint64_t, std::pair<UINT64, uint64_t>> uploads;
@@ -531,6 +838,7 @@ struct PipelineKey
     uint64_t vs, ps;
     uint32_t blend, depth, stencilMaskMode, flags;
     uint32_t biasScale = 0, biasOffset = 0; // polygon offset (float bits), 0 when off
+    uint32_t fetchMask = 0; // REGPU_FETCH_VARIANTS: the pixel shader's plain-fetch variant for these slots (FetchVariantOf)
     bool operator==(const PipelineKey&) const = default;
 };
 // A polygon offset (float bits) rounded to 4 mantissa bits (within 3%): pipelines keyed by it. PGR4
@@ -571,6 +879,7 @@ struct PipelineKeyHash
         h ^= (uint64_t(k.blend) << 32 | k.depth) * 0xC2B2AE3D27D4EB4Full;
         h ^= (uint64_t(k.stencilMaskMode) << 32 | k.flags) * 0x165667B19E3779F9ull;
         h ^= (uint64_t(k.biasScale) << 32 | k.biasOffset) * 0x9E3779B97F4A7C15ull;
+        h ^= uint64_t(k.fetchMask) * 0xD6E8FEB86659FD93ull;
         return size_t(h ^ (h >> 29));
     }
 };
@@ -628,6 +937,8 @@ struct Renderer
     ComPtr<ID3D12PipelineState> depthPackBlit;            // depth and stencil -> the guest's D24S8 words as RGBA8
     ComPtr<ID3D12PipelineState> colorBlit8, colorBlit16;  // colour -> 8888 / RGBA16F, scaled
     ComPtr<ID3D12PipelineState> depthBlitMs[9], colorBlitMs8[9], colorBlitMs16[9]; // the same from multisampled surfaces, by sample count
+    ComPtr<ID3D12PipelineState> colorBlit10, colorBlitMs10[9]; // colour -> R10G10B10A2 (REGPU_COPIES_1010102)
+    ComPtr<ID3D12Resource> resolveScratch; // REGPU_RESOLVE_TWO_STEP: the colour surface averaged to 1x (BlitResolve)
     // EDRAM surfaces: one host colour and one host depth target per EDRAM base
     // (RB_COLOR_INFO / RB_DEPTH_INFO bits 0-11), so passes that the title
     // places at different EDRAM offsets do not overwrite each other.
@@ -636,6 +947,8 @@ struct Renderer
         ComPtr<ID3D12Resource> resource;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_RENDER_TARGET;
         D3D12_CPU_DESCRIPTOR_HANDLE view{};
+        uint64_t lastFrame = 0; // the frame that last selected it (EvictSurfaces)
+        UINT slot = 0;          // its view in the RTV/DSV heap
     };
     std::unordered_map<uint32_t, Surface> colorSurfaces, depthSurfaces;
     ComPtr<ID3D12Resource> readback;
@@ -749,6 +1062,7 @@ namespace
 // Shared caches used by draws on several threads (see DrawContext).
 std::recursive_mutex g_shaderMutex;  // shaders, pipelines, the compiler's maps
 std::recursive_mutex g_textureMutex; // textures, cubes, mip chains, bindless, texture memory, index arena
+std::map<uint32_t, std::pair<uint64_t, uint64_t>> g_expandedFormats; // guest formats decoded to RGBA8: uploads, bytes (FM3 port session 43)
 uint32_t g_zeroedEdramBase = ~0u; // EDRAM base a depth clear to zero has just emptied (BindSurfaces)
 std::mutex g_surfaceMutex;           // EDRAM surfaces
 // Parallel segments: texture uploads and copies a worker makes go to this list, executed
@@ -874,6 +1188,18 @@ const char* g_waitWhat = "?";
 thread_local bool g_drawSamplesResolve = false;
 // REGPU_PERF: GPU time per frame from timestamps at the start and end of each frame's list.
 ComPtr<ID3D12QueryHeap> g_timestamps;
+// REGPU_PERF_LITE=1 (start-time): the light performance log (PerfLite below). No per-draw work: the draw thread
+// pushes one record a frame into a lock-free queue and a log thread does the sums and the writing. It uses the same
+// two GPU timestamps a frame as REGPU_PERF for the GPU time.
+// (Read on first use, not at static init, so a host can set it from its settings before the first frame.)
+bool PerfLiteOn()
+{
+    static const bool on = getenv("REGPU_PERF_LITE") != nullptr && strcmp(getenv("REGPU_PERF_LITE"), "0") != 0;
+    return on;
+}
+double g_liteGpuMs = 0; // GPU ms summed over timed frames (draw thread only)
+uint64_t g_liteGpuFrames = 0;
+uint64_t g_perfDrawsLogged = 0; // draws counted in g_perf windows already reset (a running total for PerfLite)
 
 // REGPU_GPU_PASSES=1: GPU time per pass (between render target switches and resolves),
 // summed by pass and logged every 2 s, to find where GPU time goes.
@@ -890,6 +1216,33 @@ struct PassMarkInfo
 };
 std::vector<PassMarkInfo> g_passMarks[3];
 uint32_t g_passDraws = 0;
+
+// REGPU_GPU_PASSES=2 (overdraw): also D3D12 pipeline statistics around every draw, summed by pass and by pixel
+// shader and logged with the pass times: pixel shader invocations (after early depth rejection), so a pass's
+// invocations over its pixels is how often each pixel was shaded. Draw workers' draws are not counted (run with
+// REGPU_DRAW_WORKERS=0 for a whole frame).
+const bool g_gpuStats = [] {
+    const char* v = getenv("REGPU_GPU_PASSES");
+    return v && atoi(v) >= 2;
+}();
+constexpr UINT kStatDraws = 8192;
+ComPtr<ID3D12QueryHeap> g_statQueries;
+ComPtr<ID3D12Resource> g_statReadback;
+struct StatDraw
+{
+    uint32_t ps;   // pixel shader hash (low 32 bits)
+    uint32_t pass; // index into g_statPassNames
+};
+std::vector<StatDraw> g_statDraws[3];
+std::vector<std::string> g_statPassNames{ "(before the first pass)" };
+std::map<std::string, uint32_t> g_statPassIds;
+uint32_t g_statPass = 0;
+struct StatTotal
+{
+    uint64_t psInvocations = 0, vsInvocations = 0, primitives = 0, draws = 0;
+};
+std::map<uint32_t, StatTotal> g_statByPass, g_statByShader;
+uint64_t g_statFrames = 0;
 
 // Occlusion queries (EVENT_WRITE_ZPD: the sun flare's visibility). Each guest query becomes a
 // D3D12 one; the guest gets the result of the same query (by order in the frame) from the
@@ -916,10 +1269,14 @@ std::vector<int64_t> g_occlusionResult;              // by order in the frame: h
 std::vector<int64_t> g_occlusionCoverage;            // by order in the frame: host samples covered, -1 none
 std::map<std::pair<uint64_t, UINT>, std::pair<int64_t, int64_t>> g_occlusionByKind; // address, place: passed, covered (-1 none)
 std::unordered_map<uint64_t, UINT> g_occlusionKindCount; // this frame's queries so far, by address
+// g_occlusionByKind, g_occlusionResult/Coverage: written at a frame slot's reuse by the recording thread, read
+// by the command processor when the draw thread records (RendererOcclusionAnswer).
+std::mutex g_occlusionResultLock;
 OcclusionParts g_occlusionCurrent;
 uint64_t g_occlusionFrame = ~0ull;
 UINT g_occlusionCount = 0, g_occlusionIndex = 0, g_occlusionOrder = 0, g_occlusionOrders = 0; // D3D queries used, open one, guest order, guest queries
 bool g_occlusionOpen = false;
+bool g_occlusionPaused = false; // a guest query between its counting spans (RendererOcclusionBegin: predicated tiles)
 std::map<std::string, std::pair<double, uint64_t>> g_passTotals; // ms, draws
 uint64_t g_passFrames = 0;
 ComPtr<ID3D12Resource> g_timestampReadback;
@@ -934,7 +1291,43 @@ struct FrameEvents
     uint32_t waits = 0, pipelines = 0, created = 0;
     double section[8] = {};     // draw path sections (see Section), ms
     double worstDrawMs = 0;     // the single slowest draw
+    // Long-frame log (LongFramesOn): textures uploaded this frame (new / changed), their source bytes and time.
+    uint32_t texNew = 0, texChanged = 0;
+    uint64_t texBytes = 0;
+    double texMs = 0;
+    double texCreateMs = 0;     // of texMs: creating texture resources (CreateTexture, cube resources)
+    double texMaxMs = 0;        // the slowest upload, described in texMax
+    char texMax[64] = {};
 } g_frameEvents;
+// One texture upload for the long-frame log: counted, and kept as the frame's slowest if it is.
+void NoteTextureUpload(bool isNew, size_t bytes, double ms, const char* what, uint32_t w, uint32_t h, uint32_t mips)
+{
+    (isNew ? g_frameEvents.texNew : g_frameEvents.texChanged)++;
+    g_frameEvents.texBytes += bytes;
+    g_frameEvents.texMs += ms;
+    if (ms > g_frameEvents.texMaxMs)
+    {
+        g_frameEvents.texMaxMs = ms;
+        snprintf(g_frameEvents.texMax, sizeof(g_frameEvents.texMax), "%s %ux%u %u mips %s", what, w, h, mips, isNew ? "new" : "changed");
+    }
+}
+// The long-frame log (REGPU_LONG_FRAMES, session 33 of the FM3 port): every frame that takes over twice the recent
+// average is logged with what the renderer did in it (see PerfLite). On with the light performance log
+// (REGPU_PERF_LITE) unless REGPU_LONG_FRAMES=0; REGPU_LONG_FRAMES=1 turns it on alone. Start-time.
+bool PerfLiteOn();
+bool LongFramesEnabled()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_LONG_FRAMES");
+        if (v)
+            return strcmp(v, "0") != 0;
+        return PerfLiteOn();
+    }();
+    return on;
+}
+double g_drawIdleMs = 0; // draw thread waiting for the command processor this frame (RendererDrawThreadIdle)
+double g_fenceWaitMs = 0; // host GPU fence waits on the thread that ends frames (summed; WaitFenceValue)
+thread_local bool t_countFenceWaits = false; // set on the thread that runs RendererOnSwap
 void CountCreate(const char* what)
 {
     g_created[what]++;
@@ -946,7 +1339,12 @@ const bool g_dumpHlsl = getenv("REGPU_DUMP_HLSL") != nullptr;
 // Texture memory: textures are placed in large heaps instead of each getting a committed
 // resource (its own heap). Creating a committed resource costs the driver milliseconds,
 // which showed as hitches whenever new textures streamed in on the road ahead. Blocks are
-// 64 KB multiples, reused by size once the GPU is done with the texture that held them.
+// 64 KB multiples, given back once the GPU is done with the texture that held them.
+// FM3 port session 46 (renderer cache growth): blocks came back only for a texture of exactly the same size, and a
+// heap was never released, so a long session grew to 16 heaps (2 GB) while the textures in them stayed ~1 GB (the
+// texture budget). Now each heap keeps its free ranges (offset -> size, neighbours merged), a texture takes the
+// smallest range it fits across all heaps, and a heap with no texture left is released (one empty heap is kept;
+// REGPU_KEEP_TEXTURE_HEAPS=1, live: none released). REGPU_OLD_TEXTURE_POOL=1 (start-time): the old allocator.
 struct TexturePool
 {
     static constexpr uint64_t kHeapBytes = 128ull << 20;
@@ -955,16 +1353,83 @@ struct TexturePool
         ID3D12Heap* heap = nullptr;
         uint64_t offset = 0, size = 0;
     };
-    std::vector<ComPtr<ID3D12Heap>> heaps;
-    uint64_t used = kHeapBytes; // in heaps.back()
-    std::map<uint64_t, std::vector<Block>> free; // by size
+    struct Heap
+    {
+        ComPtr<ID3D12Heap> heap;
+        std::map<uint64_t, uint64_t> free; // offset -> size (the new allocator)
+        uint64_t live = 0;                 // bytes of textures in it (the new allocator)
+    };
+    std::vector<Heap> heaps;
+    uint64_t freeBytes = 0, released = 0; // the new allocator: free bytes in all heaps, heaps released so far
+    uint64_t used = kHeapBytes; // in heaps.back() (the old allocator)
+    std::unordered_map<uint64_t, std::vector<Block>> free; // by size (the old allocator)
     std::unordered_map<ID3D12Resource*, Block> live;
     std::deque<std::pair<uint64_t, Block>> retired; // frame retired, block
+    // The next heap, made on another thread once the current one is three-quarters used: making a 128 MB heap on
+    // the draw thread cost a few ms mid-race (session 33 of the FM3 port). REGPU_NO_HEAP_AHEAD=1 (live): made when
+    // needed, as before.
+    std::future<ComPtr<ID3D12Heap>> ahead;
 } g_texturePool;
 
+// A block back to the pool (its texture gone and done on the GPU, or never placed).
+void FreeTextureBlock(const TexturePool::Block& block)
+{
+    TexturePool& pool = g_texturePool;
+    static const bool oldPool = getenv("REGPU_OLD_TEXTURE_POOL") != nullptr;
+    if (oldPool)
+    {
+        pool.free[block.size].push_back(block);
+        return;
+    }
+    auto h = std::find_if(pool.heaps.begin(), pool.heaps.end(), [&](const TexturePool::Heap& x) { return x.heap.Get() == block.heap; });
+    if (h == pool.heaps.end())
+        return;
+    // Merged with the free ranges next to it.
+    uint64_t offset = block.offset, size = block.size;
+    auto next = h->free.lower_bound(offset);
+    if (next != h->free.end() && next->first == offset + size)
+    {
+        size += next->second;
+        next = h->free.erase(next);
+    }
+    if (next != h->free.begin())
+        if (auto prev = std::prev(next); prev->first + prev->second == offset)
+        {
+            offset = prev->first;
+            size += prev->second;
+            h->free.erase(prev);
+        }
+    h->free.emplace(offset, size);
+    h->live -= block.size;
+    pool.freeBytes += block.size;
+    // A heap with no texture left goes, unless it is the only empty one (kept for the next textures). Its placed
+    // resources were all released once their frames were done (ReclaimTextureBlocks waits past kFrames).
+    static LiveSwitch keepHeaps("REGPU_KEEP_TEXTURE_HEAPS");
+    if (h->live == 0 && !keepHeaps)
+    {
+        const size_t empty = size_t(std::count_if(pool.heaps.begin(), pool.heaps.end(), [](const TexturePool::Heap& x) { return x.live == 0; }));
+        if (empty > 1)
+        {
+            pool.freeBytes -= TexturePool::kHeapBytes;
+            pool.released++;
+            pool.heaps.erase(h);
+        }
+    }
+}
+
 // A texture in the pool (or committed, if it does not fit a heap). Starts in `state`.
+bool LongFramesEnabled();
 ComPtr<ID3D12Resource> CreateTexture(const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state, const char* kind)
 {
+    struct CreateTime // (for the long-frame log)
+    {
+        std::chrono::steady_clock::time_point start = LongFramesEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~CreateTime()
+        {
+            if (start != std::chrono::steady_clock::time_point{})
+                g_frameEvents.texCreateMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        }
+    } createTime;
     static LiveSwitch committed("REGPU_COMMITTED_TEXTURES"); // A/B
     TexturePool& pool = g_texturePool;
     const D3D12_RESOURCE_ALLOCATION_INFO info = g_r.device->GetResourceAllocationInfo(0, 1, &desc);
@@ -973,50 +1438,79 @@ ComPtr<ID3D12Resource> CreateTexture(const D3D12_RESOURCE_DESC& desc, D3D12_RESO
     if (!committed && size <= TexturePool::kHeapBytes && info.Alignment <= 0x10000)
     {
         TexturePool::Block block;
-        auto& list = pool.free[size];
-        if (!list.empty())
+        static const bool oldPool = getenv("REGPU_OLD_TEXTURE_POOL") != nullptr;
+        auto makeHeap = [] {
+            D3D12_HEAP_DESC hd{};
+            hd.SizeInBytes = TexturePool::kHeapBytes;
+            hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+            hd.Alignment = 0x10000;
+            hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+            ComPtr<ID3D12Heap> heap;
+            Check(g_r.device->CreateHeap(&hd, IID_PPV_ARGS(&heap)), "CreateHeap(textures)");
+            return heap;
+        };
+        static LiveSwitch noAhead("REGPU_NO_HEAP_AHEAD");
+        if (!oldPool)
+        {
+            // The smallest free range it fits, in any heap.
+            TexturePool::Heap* best = nullptr;
+            std::map<uint64_t, uint64_t>::iterator bestRange;
+            for (TexturePool::Heap& h : pool.heaps)
+                for (auto it = h.free.begin(); it != h.free.end(); ++it)
+                    if (it->second >= size && (!best || it->second < bestRange->second))
+                    {
+                        best = &h;
+                        bestRange = it;
+                    }
+            if (!best)
+            {
+                ComPtr<ID3D12Heap> heap = pool.ahead.valid() ? pool.ahead.get() : nullptr;
+                if (!heap)
+                    heap = makeHeap();
+                CountCreate("texture heap");
+                pool.heaps.push_back({ heap, { { 0, TexturePool::kHeapBytes } }, 0 });
+                pool.freeBytes += TexturePool::kHeapBytes;
+                best = &pool.heaps.back();
+                bestRange = best->free.begin();
+            }
+            const uint64_t offset = bestRange->first, rangeSize = bestRange->second;
+            best->free.erase(bestRange);
+            if (rangeSize > size)
+                best->free.emplace(offset + size, rangeSize - size);
+            best->live += size;
+            pool.freeBytes -= size;
+            block = { best->heap.Get(), offset, size };
+            // The next heap made ahead, once less than a quarter of a heap is free.
+            if (!noAhead && !pool.ahead.valid() && pool.freeBytes < TexturePool::kHeapBytes / 4)
+                pool.ahead = std::async(std::launch::async, makeHeap);
+        }
+        else if (auto& list = pool.free[size]; !list.empty())
         {
             block = list.back();
             list.pop_back();
-        }
-        else if (auto larger = pool.free.lower_bound(size); [&] {
-                     // A free block of a bigger size, split: blocks reused only by exact size left heaps of
-                     // sizes nothing asked for any more, and new heaps kept coming under a steady budget.
-                     while (larger != pool.free.end() && larger->second.empty())
-                         ++larger;
-                     return larger != pool.free.end();
-                 }())
-        {
-            block = larger->second.back();
-            larger->second.pop_back();
-            if (block.size > size)
-                pool.free[block.size - size].push_back({ block.heap, block.offset + size, block.size - size });
-            block.size = size;
         }
         else
         {
             if (pool.used + size > TexturePool::kHeapBytes)
             {
-                D3D12_HEAP_DESC hd{};
-                hd.SizeInBytes = TexturePool::kHeapBytes;
-                hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
-                hd.Alignment = 0x10000;
-                hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
-                ComPtr<ID3D12Heap> heap;
-                Check(g_r.device->CreateHeap(&hd, IID_PPV_ARGS(&heap)), "CreateHeap(textures)");
+                ComPtr<ID3D12Heap> heap = pool.ahead.valid() ? pool.ahead.get() : nullptr;
+                if (!heap)
+                    heap = makeHeap();
                 CountCreate("texture heap");
-                pool.heaps.push_back(heap);
+                pool.heaps.push_back({ heap, {}, 0 });
                 pool.used = 0;
             }
-            block = { pool.heaps.back().Get(), pool.used, size };
+            block = { pool.heaps.back().heap.Get(), pool.used, size };
             pool.used += size;
+            if (!noAhead && !pool.ahead.valid() && pool.used > TexturePool::kHeapBytes / 4 * 3)
+                pool.ahead = std::async(std::launch::async, makeHeap);
         }
         if (SUCCEEDED(g_r.device->CreatePlacedResource(block.heap, block.offset, &desc, state, nullptr, IID_PPV_ARGS(&r))))
         {
             pool.live[r.Get()] = block;
             return r;
         }
-        pool.free[size].push_back(block);
+        FreeTextureBlock(block);
     }
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1048,7 +1542,7 @@ void ReclaimTextureBlocks()
     auto& retired = g_texturePool.retired;
     while (!retired.empty() && retired.front().first + kFrames + 2 < g_r.frame)
     {
-        g_texturePool.free[retired.front().second.size].push_back(retired.front().second);
+        FreeTextureBlock(retired.front().second);
         retired.pop_front();
     }
 }
@@ -1056,6 +1550,13 @@ void ReclaimTextureBlocks()
 // Bumped by every resolve: the per-slot texture bindings below are only reused while no
 // resolve has changed what an address maps to.
 uint64_t g_resolveEpoch = 0;
+// The cache release sweep (BeginFrameIfNeeded, session 46): (renderer frame, ms) every 64 frames, and what it released.
+std::deque<std::pair<uint64_t, uint64_t>> g_frameClock;
+uint64_t GuestImageHash(uint32_t base, uint32_t width, uint32_t height, uint32_t bpp);
+struct CacheRelease
+{
+    uint64_t resolved = 0, spares = 0, cubes = 0, mipChains = 0;
+} g_cacheRelease;
 uint64_t g_resolveSerial = 0; // counts resolves: what a mip chain was assembled from
 
 // The constants a texture fetch slot produced for the previous draw: draws usually bind
@@ -1343,7 +1844,29 @@ uint64_t ContentHash(const uint8_t* data, size_t bytes, size_t stride = 256)
     if (fullHash)
         stride = 4;
     uint64_t h = mix(0xCBF29CE484222325ull, bytes);
-    for (size_t i = 0; i + 4 <= bytes; i += stride)
+    // Four independent chains, joined at the end: one chain is a multiply's latency per sample (~6 cycles), the
+    // draw thread's single largest helper in PGR3 (vertex uploads hashed ~3,000 times a frame). Values are only
+    // compared within a run. REGPU_SERIAL_CONTENT_HASH=1: one chain, as before (A/B).
+    static LiveSwitch serial("REGPU_SERIAL_CONTENT_HASH");
+    size_t i = 0;
+    if (!serial)
+    {
+        uint64_t h1 = 0x9E3779B97F4A7C15ull, h2 = 0xC2B2AE3D27D4EB4Full, h3 = 0x165667B19E3779F9ull;
+        for (; i + 3 * stride + 4 <= bytes; i += 4 * stride)
+        {
+            uint32_t v0, v1, v2, v3;
+            memcpy(&v0, data + i, 4);
+            memcpy(&v1, data + i + stride, 4);
+            memcpy(&v2, data + i + 2 * stride, 4);
+            memcpy(&v3, data + i + 3 * stride, 4);
+            h = mix(h, v0);
+            h1 = mix(h1, v1);
+            h2 = mix(h2, v2);
+            h3 = mix(h3, v3);
+        }
+        h = mix(mix(mix(h, h1), h2), h3);
+    }
+    for (; i + 4 <= bytes; i += stride)
     {
         uint32_t v;
         memcpy(&v, data + i, 4);
@@ -1528,6 +2051,36 @@ D3D12_GPU_DESCRIPTOR_HANDLE Gpu(ID3D12DescriptorHeap* heap, UINT index, UINT str
     return h;
 }
 
+bool g_gpuUploadHeap = false; // GPU upload heaps reported and allowed (see the ring set-up)
+bool g_uma = false, g_cacheCoherentUma = false; // the GPU shares system memory (Init, D3D12_FEATURE_ARCHITECTURE1)
+
+ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state);
+
+// An upload ring in a GPU upload heap, mapped (write-combined: the CPU only writes it); null if the driver refuses.
+ComPtr<ID3D12Resource> CreateGpuUploadRing(UINT64 size, uint8_t*& cpu)
+{
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_GPU_UPLOAD;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = size;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> r;
+    const HRESULT hr = g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r));
+    if (FAILED(hr) || FAILED(r->Map(0, nullptr, reinterpret_cast<void**>(&cpu))))
+    {
+        Log("renderer: GPU upload heap ring of %llu MB failed (0x%08X): ring stays in system memory", (unsigned long long)(size >> 20), unsigned(hr));
+        cpu = nullptr;
+        return nullptr;
+    }
+    CountCreate("buffer");
+    return r;
+}
+
 ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state)
 {
     D3D12_HEAP_PROPERTIES hp{};
@@ -1595,10 +2148,11 @@ bool PhysicalHeapAliasesGuest(ID3D12Device* d, ID3D12Resource* physical)
 // Depth resolves: a depth-stencil buffer can only be copied whole, so the
 // resolve rectangle is drawn into an R32_FLOAT texture by a tiny pass that
 // reads the depth buffer at the same pixel.
-// DLSS, FSR 3 or FSR 4: the scene is reconstructed over several frames (motion vectors, jitter).
+// DLSS, FSR 3, FSR 4 or XeSS: the scene is reconstructed over several frames (motion vectors, jitter).
 bool TemporalUpscalerChosen(const Settings& st)
 {
-    return st.upscaler == Settings::Upscaler::Dlss || st.upscaler == Settings::Upscaler::Fsr3 || st.upscaler == Settings::Upscaler::Fsr4;
+    return st.upscaler == Settings::Upscaler::Dlss || st.upscaler == Settings::Upscaler::Fsr3 || st.upscaler == Settings::Upscaler::Fsr4 ||
+        st.upscaler == Settings::Upscaler::Xess;
 }
 
 // The highest sample count up to `want` the device supports for the colour and depth formats (1 when none).
@@ -1632,6 +2186,20 @@ void InitDepthBlit()
     // for both the colour and depth formats (1 when none).
     g_msaa = SupportedMsaa(GetSettings().msaa);
     Log("renderer: anti-aliasing %ux (setting %u)", g_msaa, GetSettings().msaa);
+    // EQAA (Config::eqaa, FM3 port session 36): AMD offers more coverage than colour samples as MSAA quality levels
+    // above 0. The levels the device reports are logged either way; with eqaa the highest one both formats have.
+    g_msaaQuality = 0;
+    if (g_msaa > 1)
+    {
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS colour{ kColorFormat, g_msaa }, depth{ DXGI_FORMAT_D32_FLOAT_S8X24_UINT, g_msaa };
+        d->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &colour, sizeof colour);
+        d->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &depth, sizeof depth);
+        const UINT levels = std::min(colour.NumQualityLevels, depth.NumQualityLevels);
+        if (GetSettings().eqaa && levels > 1)
+            g_msaaQuality = levels - 1;
+        Log("renderer: MSAA quality levels at %ux: colour %u, depth %u%s", g_msaa, colour.NumQualityLevels, depth.NumQualityLevels,
+            GetSettings().eqaa ? (g_msaaQuality ? " (EQAA on: the highest, hardware resolves)" : " (EQAA asked for: not offered)") : "");
+    }
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     range.NumDescriptors = 2; // (t1: the depth pack's stencil plane; the other blits read t0 only)
@@ -1641,7 +2209,7 @@ void InitDepthBlit()
     params[0].DescriptorTable.pDescriptorRanges = &range;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[1].Constants.Num32BitValues = 7;
+    params[1].Constants.Num32BitValues = 10;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
     rs.NumParameters = 2;
@@ -1655,8 +2223,7 @@ void InitDepthBlit()
     static const char kSource[] = R"(
 Texture2D<float> depthTex : register(t0);
 Texture2D<float4> colorTex : register(t0);
-// srcRow: the surface row the image's first written row comes from (a band of a taller image, BlitResolve).
-cbuffer Blit : register(b0) { float scale; uint swapRB; uint clampDest; float destMin; float destMax; uint toGamma; int srcRow; };
+cbuffer Blit : register(b0) { float scale; uint swapRB; uint clampDest; float destMin; float destMax; uint toGamma; float2 srcStep; float2 srcOrigin; };
 // Xenia's LinearToPWLGamma: what a k_8_8_8_8_GAMMA surface holds in memory.
 float LinearToPWLGamma(float l)
 {
@@ -1681,7 +2248,7 @@ float4 vs(uint id : SV_VertexID) : SV_Position
 }
 float ps(float4 pos : SV_Position) : SV_Target
 {
-    return depthTex.Load(int3(int2(pos.x, pos.y - srcRow), 0));
+    return depthTex.Load(int3(int2(pos.xy * srcStep + srcOrigin), 0));
 }
 Texture2D<uint2> stencilTex : register(t1);
 // 20e4 (D24FS8): 4-bit exponent biased by 15, 20-bit mantissa, [0, 2).
@@ -1696,14 +2263,16 @@ uint Encode20e4(float v)
 }
 float4 psPack(float4 pos : SV_Position) : SV_Target
 {
-    float z = depthTex.Load(int3(int2(pos.x, pos.y - srcRow), 0));
-    uint st = stencilTex.Load(int3(int2(pos.x, pos.y - srcRow), 0)).g;
+    float z = depthTex.Load(int3(int2(pos.xy * srcStep + srcOrigin), 0));
+    uint st = stencilTex.Load(int3(int2(pos.xy * srcStep + srcOrigin), 0)).g;
     uint d = swapRB != 0 ? Encode20e4(z) : uint(round(saturate(z) * 16777215.0));
     return float4(float(st & 0xFFu), float(d & 0xFFu), float((d >> 8) & 0xFFu), float(d >> 16)) / 255.0;
 }
+// The source pixel: the destination's own (step 1, origin 0), or scaled and offset for a resolve into another image.
+int2 Src(float4 pos) { return int2(pos.xy * srcStep + srcOrigin); }
 float4 psColor(float4 pos : SV_Position) : SV_Target
 {
-    float4 c = colorTex.Load(int3(int2(pos.x, pos.y - srcRow), 0)) * scale;
+    float4 c = colorTex.Load(int3(Src(pos), 0)) * scale;
     if (clampDest) c = clamp(c, destMin, destMax);
     if (toGamma & 1u) c.rgb = float3(LinearToPWLGamma(c.r), LinearToPWLGamma(c.g), LinearToPWLGamma(c.b));
     if (toGamma & 2u) c.a = round(saturate(c.a) * 3.0) / 3.0; // a 2-bit alpha destination (k_2_10_10_10)
@@ -1744,6 +2313,8 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
     Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlit8)), "CreateGraphicsPipelineState(colour blit 8)");
     pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlit16)), "CreateGraphicsPipelineState(colour blit 16)");
+    pd.RTVFormats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
+    Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlit10)), "CreateGraphicsPipelineState(colour blit 10)");
     // The same passes reading a multisampled surface, for each supported sample count (regpu::SetMsaa can
     // change it while the game runs): depth takes sample 0, colour averages all samples.
     for (uint32_t samples = 2; samples <= 8; samples *= 2)
@@ -1753,8 +2324,7 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
         const std::string msSource = "#define SAMPLES " + std::to_string(samples) + R"(
 Texture2DMS<float, SAMPLES> depthMs : register(t0);
 Texture2DMS<float4, SAMPLES> colorMs : register(t0);
-// srcRow: the surface row the image's first written row comes from (a band of a taller image, BlitResolve).
-cbuffer Blit : register(b0) { float scale; uint swapRB; uint clampDest; float destMin; float destMax; uint toGamma; int srcRow; };
+cbuffer Blit : register(b0) { float scale; uint swapRB; uint clampDest; float destMin; float destMax; uint toGamma; float2 srcStep; float2 srcOrigin; };
 // Xenia's LinearToPWLGamma: what a k_8_8_8_8_GAMMA surface holds in memory.
 float LinearToPWLGamma(float l)
 {
@@ -1779,13 +2349,14 @@ float4 vs(uint id : SV_VertexID) : SV_Position
 }
 float ps(float4 pos : SV_Position) : SV_Target
 {
-    return depthMs.Load(int2(pos.x, pos.y - srcRow), 0);
+    return depthMs.Load(int2(pos.xy * srcStep + srcOrigin), 0);
 }
 float4 psColor(float4 pos : SV_Position) : SV_Target
 {
     float4 c = 0;
+    const int2 src = int2(pos.xy * srcStep + srcOrigin);
     [unroll] for (int i = 0; i < SAMPLES; i++)
-        c += colorMs.Load(int2(pos.x, pos.y - srcRow), i);
+        c += colorMs.Load(src, i);
     c = c / SAMPLES * scale;
     if (clampDest) c = clamp(c, destMin, destMax);
     if (toGamma & 1u) c.rgb = float3(LinearToPWLGamma(c.r), LinearToPWLGamma(c.g), LinearToPWLGamma(c.b));
@@ -1806,6 +2377,8 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
         Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlitMs8[samples])), "CreateGraphicsPipelineState(colour blit ms 8)");
         pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlitMs16[samples])), "CreateGraphicsPipelineState(colour blit ms 16)");
+        pd.RTVFormats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
+        Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlitMs10[samples])), "CreateGraphicsPipelineState(colour blit ms 10)");
     }
 }
 
@@ -1815,6 +2388,30 @@ void InitPipelineLibrary(ID3D12Device* device);
 // init and, when that fails, again at a few frames after (FrameBegin): under ReXGlue the heap calls
 // can fail with E_INVALIDARG at init and succeed later (FH1 TU4 on one PC: about half its runs on
 // the copy path, 7 ms a frame of vertex copies). REGPU_NO_MAP_RETRY=1: init only.
+// With the vertex arena (REGPU_VERTEX_ARENA) the GPU's heap is opened over a view of guest physical memory of its own,
+// not the guest's 0xA0000000 view: Windows refuses to change the protection of a view a D3D12 heap was opened on
+// (VirtualProtect: error 87), and the arena's write watch makes the guest's views read-only. The same memory, so
+// zero-copy fetches still see every write. REGPU_GUEST_VIEW_HEAP=1: the guest's view as before.
+bool VertexArenaWanted()
+{
+    static const bool on = getenv("REGPU_VERTEX_ARENA") && strcmp(getenv("REGPU_VERTEX_ARENA"), "0") != 0;
+    return on;
+}
+
+void* HeapViewAddress()
+{
+    static void* const view = [] {
+        void* v = nullptr;
+        if (VertexArenaWanted() && !getenv("REGPU_GUEST_VIEW_HEAP") && RegpuPhysicalSection())
+        {
+            v = MapViewOfFile(static_cast<HANDLE>(RegpuPhysicalSection()), FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0x20000000);
+            Log("renderer: guest memory heap over a view of its own: %s", v ? "mapped" : "failed, the guest's view instead");
+        }
+        return v ? v : static_cast<void*>(GuestPtr(0xA0000000));
+    }();
+    return view;
+}
+
 void MapGuestMemory(ID3D12Device* d)
 {
     // A title can make a page of physical memory no-access (FH1 TU4 guards the page after its
@@ -1853,12 +2450,15 @@ void MapGuestMemory(ID3D12Device* d)
     } restore{ guarded };
     ComPtr<ID3D12Device13> d13;
     HRESULT hr = getenv("REGPU_FORCE_DEVICE3") ? E_NOINTERFACE : d->QueryInterface(IID_PPV_ARGS(&d13)); // (REGPU_FORCE_DEVICE3: test the fallback)
+    // (A heap over the file mapping would lock every view: not with the vertex arena's own view.)
+    const bool ownView = HeapViewAddress() != GuestPtr(0xA0000000);
     if (SUCCEEDED(hr))
-        hr = d13->OpenExistingHeapFromFileMapping(RegpuPhysicalSection(), IID_PPV_ARGS(&g_r.physicalHeap));
+        hr = ownView ? E_INVALIDARG : d13->OpenExistingHeapFromFileMapping(RegpuPhysicalSection(), IID_PPV_ARGS(&g_r.physicalHeap));
     if (FAILED(hr) && d13)
     {
-        Log("renderer: OpenExistingHeapFromFileMapping failed %08X; trying the view address", unsigned(hr));
-        hr = d13->OpenExistingHeapFromAddress1(GuestPtr(0xA0000000), 0x20000000, IID_PPV_ARGS(&g_r.physicalHeap));
+        if (!ownView)
+            Log("renderer: OpenExistingHeapFromFileMapping failed %08X; trying the view address", unsigned(hr));
+        hr = d13->OpenExistingHeapFromAddress1(HeapViewAddress(), 0x20000000, IID_PPV_ARGS(&g_r.physicalHeap));
 }
 // Older runtimes (Windows 10, older drivers) have no ID3D12Device13, but ID3D12Device3 (Windows 10
 // 1709+) opens a heap over the whole allocation an address is in: the 512 MB view of guest
@@ -1872,7 +2472,7 @@ if (FAILED(hr))
         Log("renderer: mapping guest memory: OpenExistingHeapFromAddress1 failed %08X; trying ID3D12Device3", unsigned(hr));
     ComPtr<ID3D12Device3> d3;
     if (SUCCEEDED(hr = d->QueryInterface(IID_PPV_ARGS(&d3))))
-        hr = d3->OpenExistingHeapFromAddress(GuestPtr(0xA0000000), IID_PPV_ARGS(&g_r.physicalHeap));
+        hr = d3->OpenExistingHeapFromAddress(HeapViewAddress(), IID_PPV_ARGS(&g_r.physicalHeap));
     if (SUCCEEDED(hr))
         Log("renderer: guest memory opened through ID3D12Device3, %llu MB", (unsigned long long)(g_r.physicalHeap->GetDesc().SizeInBytes >> 20));
     else
@@ -1920,10 +2520,94 @@ bool AnisoFromFetch()
     return fromFetch;
 }
 
+// N4 (FM3 port session 43, Intel's D3D12 guidance): REGPU_ROOTSIG_11=1 (start-time) serializes the main root
+// signatures as version 1.1, so the root CBVs (b0/b1: per-draw constants in the upload ring, written before the draw
+// is recorded and never changed while the list runs) are DATA_STATIC_WHILE_SET_AT_EXECUTE, which lets a driver
+// prefetch or fold them. Every descriptor table keeps 1.0's meaning (descriptors and data volatile: the guest-memory
+// view changes under the GPU, bindless slots are rewritten). Same results; measure on the GPU in question.
+HRESULT SerializeRootSignatureFor(const D3D12_ROOT_SIGNATURE_DESC& rs, ComPtr<ID3DBlob>& blob, ComPtr<ID3DBlob>& error)
+{
+    static const bool v11 = getenv("REGPU_ROOTSIG_11") && atoi(getenv("REGPU_ROOTSIG_11")) != 0;
+    if (!v11)
+        return D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
+    std::vector<D3D12_ROOT_PARAMETER1> params(rs.NumParameters);
+    std::vector<std::vector<D3D12_DESCRIPTOR_RANGE1>> ranges(rs.NumParameters);
+    for (UINT i = 0; i < rs.NumParameters; i++)
+    {
+        const D3D12_ROOT_PARAMETER& a = rs.pParameters[i];
+        D3D12_ROOT_PARAMETER1& b = params[i];
+        b.ParameterType = a.ParameterType;
+        b.ShaderVisibility = a.ShaderVisibility;
+        if (a.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+        {
+            for (UINT r = 0; r < a.DescriptorTable.NumDescriptorRanges; r++)
+            {
+                const D3D12_DESCRIPTOR_RANGE& x = a.DescriptorTable.pDescriptorRanges[r];
+                D3D12_DESCRIPTOR_RANGE1 y{};
+                y.RangeType = x.RangeType;
+                y.NumDescriptors = x.NumDescriptors;
+                y.BaseShaderRegister = x.BaseShaderRegister;
+                y.RegisterSpace = x.RegisterSpace;
+                y.OffsetInDescriptorsFromTableStart = x.OffsetInDescriptorsFromTableStart;
+                y.Flags = x.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER ? D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                                                                              : D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+                ranges[i].push_back(y);
+            }
+            b.DescriptorTable.NumDescriptorRanges = UINT(ranges[i].size());
+            b.DescriptorTable.pDescriptorRanges = ranges[i].data();
+        }
+        else if (a.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+            b.Constants = a.Constants;
+        else
+        {
+            b.Descriptor.ShaderRegister = a.Descriptor.ShaderRegister;
+            b.Descriptor.RegisterSpace = a.Descriptor.RegisterSpace;
+            b.Descriptor.Flags = a.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV ? D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE
+                                                                                    : D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
+        }
+    }
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC v{};
+    v.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    v.Desc_1_1.NumParameters = rs.NumParameters;
+    v.Desc_1_1.pParameters = params.data();
+    v.Desc_1_1.NumStaticSamplers = rs.NumStaticSamplers;
+    v.Desc_1_1.pStaticSamplers = rs.pStaticSamplers;
+    v.Desc_1_1.Flags = rs.Flags;
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        Log("renderer: root signatures as version 1.1 (root constant buffers static while set: REGPU_ROOTSIG_11)");
+    }
+    return D3D12SerializeVersionedRootSignature(&v, &blob, &error);
+}
+
 void Init()
 {
     g_r.device = RenderDevice();
     g_r.queue = RenderQueue();
+    // N2 (FM3 port session 43, Intel iGPU leads): a GPU sharing system memory (UMA: every integrated GPU). The idea was
+    // that the vertex arena's "VRAM" copy is the same RAM again, a pure extra copy; measured on the Ryzen 9800X3D's
+    // Radeon iGPU (720p frozen grid) turning it off cost 65 -> 51 fps: the driver puts the arena in its dedicated
+    // carve-out, which the GPU reads faster than guest memory mapped in place. So it stays; REGPU_UMA_NO_ARENA=1
+    // (start-time) turns it off on a UMA GPU, for tests on Intel (no carve-out). Read before the arena's switches are
+    // first looked at (the heap view below, the first frame).
+    {
+        D3D12_FEATURE_DATA_ARCHITECTURE1 arch{};
+        if (SUCCEEDED(g_r.device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, &arch, sizeof(arch))))
+        {
+            g_uma = arch.UMA;
+            g_cacheCoherentUma = arch.CacheCoherentUMA;
+        }
+        Log("renderer: memory architecture %s%s", g_uma ? "UMA (shared system memory)" : "discrete (own video memory)",
+            g_cacheCoherentUma ? ", cache-coherent" : "");
+        if (g_uma && getenv("REGPU_UMA_NO_ARENA") && atoi(getenv("REGPU_UMA_NO_ARENA")) != 0 && getenv("REGPU_VERTEX_ARENA") &&
+            strcmp(getenv("REGPU_VERTEX_ARENA"), "0") != 0)
+        {
+            _putenv_s("REGPU_VERTEX_ARENA", "0");
+            Log("renderer: vertex arena off on a UMA GPU (REGPU_UMA_NO_ARENA)");
+        }
+    }
     // REGPU_D3D12_STACKS=1 (with REGPU_D3D12_DEBUG): each debug-layer error is logged when it
     // happens, with the stack of the call that made it (the first 3 of each kind).
     if (getenv("REGPU_D3D12_STACKS"))
@@ -2048,9 +2732,11 @@ void Init()
         WriteSamplerBank(0, -1);
     }
     ComPtr<ID3DBlob> blob, error;
-    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
+    if (FAILED(SerializeRootSignatureFor(rs, blob, error)))
         Fatal("renderer: root signature: %s", error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
     Check(d->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_r.rootSignature)), "CreateRootSignature");
+    if (const char* dumpRs = getenv("REGPU_DUMP_ROOTSIG")) // the root signature as a file, for offline shader analysis (Radeon GPU Analyzer --rs-bin; the FM3 port's tools/rga_shaders.ps1)
+        if (FILE* f = fopen(dumpRs, "wb")) { fwrite(blob->GetBufferPointer(), 1, blob->GetBufferSize(), f); fclose(f); }
     // Motion-vector pipelines: the same plus b2, last frame's vertex constants of the draw.
     params[rs.NumParameters].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[rs.NumParameters].Descriptor.ShaderRegister = 2;
@@ -2058,7 +2744,7 @@ void Init()
     rs.NumParameters++;
     blob.Reset();
     error.Reset();
-    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
+    if (FAILED(SerializeRootSignatureFor(rs, blob, error)))
         Fatal("renderer: motion root signature: %s", error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
     Check(d->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_r.motionRootSignature)),
         "CreateRootSignature(motion)");
@@ -2101,13 +2787,25 @@ void Init()
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.blitRtvHeap)), "CreateDescriptorHeap(blit rtv)");
     InitDepthBlit();
-    g_r.readback = CreateBuffer(UINT64((OutputWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    g_r.readback = CreateBuffer(UINT64((DumpWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
     kRingSize = (getenv("REGPU_RING_MB") ? std::clamp<UINT64>(UINT64(atoi(getenv("REGPU_RING_MB"))), 16, 2048)
         // (128 MB with the zero-copy mapping, not 64: new vertex buffers are copied for their first 16 frames,
         // and the frame a world loads in filled 64 MB and dropped draws until the ring had grown.)
         : regpu::GetConfig().uploadRingMB ? std::clamp<UINT64>(regpu::GetConfig().uploadRingMB, 16, 2048) : g_r.physical && !getenv("REGPU_NO_DIRECT_FETCH") ? 128 : 384) << 20;
     Log("renderer: upload ring %llu MB per frame", (unsigned long long)(kRingSize >> 20));
+    // GPU upload heaps (D3D12 OPTIONS16; true only with resizable BAR / Smart Access Memory on): the upload ring
+    // (per-draw constants, vertex and texture uploads) can live in VRAM instead of system memory. A second ring per
+    // frame slot is made there for the live A/B REGPU_GPU_UPLOAD_RING (REGPU_NO_GPU_UPLOAD_RING=1: not made).
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS16 o16{};
+        const bool queried = SUCCEEDED(d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &o16, sizeof(o16)));
+        g_gpuUploadHeap = queried && o16.GPUUploadHeapSupported;
+        Log("renderer: GPU upload heaps %s (resizable BAR %s)", !queried ? "unknown (OPTIONS16 not reported)" : g_gpuUploadHeap ? "supported" : "not supported",
+            g_gpuUploadHeap ? "on" : "off or unsupported");
+        if (getenv("REGPU_NO_GPU_UPLOAD_RING"))
+            g_gpuUploadHeap = false;
+    }
     for (UINT i = 0; i < kFrames; i++)
     {
         FrameResources& f = g_r.frames[i];
@@ -2115,6 +2813,14 @@ void Init()
         f.ring = CreateBuffer(kRingSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
         f.ringSize = kRingSize;
+        // (The other place's ring is made when REGPU_GPU_UPLOAD_RING first asks for it, and the one it replaces is
+        // released: FM3 port session 43, both kept 3 x 128 MB of RAM for a live switch. REGPU_KEEP_BOTH_RINGS=1: as before.)
+        if (g_gpuUploadHeap && getenv("REGPU_KEEP_BOTH_RINGS"))
+        {
+            if (!(f.ringAlt = CreateGpuUploadRing(kRingSize, f.ringAltCpu)))
+                g_gpuUploadHeap = false;
+            f.ringAltSize = f.ringAlt ? kRingSize : 0;
+        }
         f.descriptorBase = i * kDescriptorsPerFrame;
     }
     Check(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_r.frames[0].allocator.Get(), nullptr, IID_PPV_ARGS(&g_r.realList)),
@@ -2132,6 +2838,8 @@ void Init()
 double g_gpuWaitSeconds = 0; // CP thread blocked on the host GPU (frame resources)
 
 FrameResources& Frame() { return g_r.frames[g_r.frameIndex]; }
+bool g_asyncFrameEnded = false; // the last frame's end was queued on the replay thread (REGPU_ASYNC_PRESENT)
+ID3D12GraphicsCommandList* AcquireList();
 
 // A new output resolution (regpu::SetOutputSize), taken at the start of a frame with the host GPU idle:
 // the EDRAM surfaces (made at the output size on first use) are dropped and come back at the new size,
@@ -2140,6 +2848,7 @@ FrameResources& Frame() { return g_r.frames[g_r.frameIndex]; }
 // Every frame in flight may still use the old surfaces and pipelines: waits for them.
 void WaitGpuIdle()
 {
+    g_r.recorder.Real(); // (a frame end queued on the replay thread presents there: REGPU_ASYNC_PRESENT)
     if (const UINT64 last = g_r.nextFence - 1; g_r.fence->GetCompletedValue() < last)
     {
         g_r.fence->SetEventOnCompletion(last, g_r.fenceEvent);
@@ -2180,7 +2889,7 @@ void ApplyOutputSize()
     st.height = h;
     LoadOutputSize();
     DropSurfaces();
-    g_r.readback = CreateBuffer(UINT64((OutputWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    g_r.readback = CreateBuffer(UINT64((DumpWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     g_upscale.depth.Reset();
     g_upscale.motion.Reset();
     g_upscale.reactive.Reset();
@@ -2189,6 +2898,30 @@ void ApplyOutputSize()
     g_upscale.reset = true;
     PresenterResize(OutputWidth(), OutputHeight());
     Log("renderer: output %ux%u (live)", OutputWidth(), OutputHeight());
+}
+
+// A new guest frame size (NoteFrontBuffer), taken at the start of a frame like a new output size. The EDRAM surfaces
+// hold the rows of the smallest frame seen (SurfaceHeight); a smaller one drops them, and they come back taller.
+void ApplyFrameSize()
+{
+    const uint32_t request = g_frameRequest.exchange(0);
+    if (!request || !g_r.ok)
+        return;
+    const uint32_t w = request >> 16, h = request & 0xFFFF;
+    if (w == FrameW() && h == FrameH())
+        return;
+    const bool taller = h < g_frameRoomHeight.load(std::memory_order_relaxed);
+    if (taller)
+    {
+        WaitGpuIdle();
+        g_frameRoomHeight = h;
+        DropSurfaces();
+    }
+    g_frameWidth = w;
+    g_frameHeight = h;
+    BumpPassEpoch();
+    Log("renderer: guest frame %ux%u (pitch %u): scale %.3f x %.3f%s", w, h, FramePitch(), double(OutputWidth()) / w, double(OutputHeight()) / h,
+        taller ? ", EDRAM surfaces remade taller" : "");
 }
 
 // A new anti-aliasing sample count (regpu::SetMsaa), taken at the start of a frame with the host GPU idle:
@@ -2224,15 +2957,38 @@ void TransitionColor(D3D12_RESOURCE_STATES to);
 bool TemporalInit();
 void BeginTemporalFrame();
 
+std::map<std::pair<bool, uint32_t>, uint64_t> g_releasedSurfaces; // EvictSurfaces: the frame each base was released
+std::set<std::pair<bool, uint32_t>> g_keptSurfaces;                 // ... and those never to release again
+uint64_t SurfaceIdleFrames();
 Renderer::Surface& GetSurface(bool depth, uint32_t base)
 {
     std::lock_guard surfaceLock(g_surfaceMutex);
     auto& map = depth ? g_r.depthSurfaces : g_r.colorSurfaces;
     if (auto it = map.find(base); it != map.end())
+    {
+        it->second.lastFrame = g_r.frame;
         return it->second;
+    }
     if (map.size() >= kMaxSurfaces)
         return map.begin()->second; // out of views: share one (should not happen)
+    // The lowest view slot no surface holds (EvictSurfaces frees slots in the middle).
+    uint64_t usedSlots = 0;
+    for (auto& [b, other] : map)
+        usedSlots |= 1ull << other.slot;
+    UINT index = 0;
+    while (usedSlots >> index & 1)
+        index++;
+    if (auto r = g_releasedSurfaces.find({ depth, base }); r != g_releasedSurfaces.end() && g_r.frame - r->second < 4 * SurfaceIdleFrames())
+    {
+        // A base drawn to again soon after its release (FM3: a depth base used every ~16 s in a race) stays from now
+        // on: making a full-size surface costs a few ms in that frame. (Menus coming back after a race are released
+        // again.)
+        g_keptSurfaces.insert({ depth, base });
+        Log("renderer: EDRAM %s surface at base %03X came back after its release: kept from now on", depth ? "depth" : "colour", base);
+    }
     Renderer::Surface& s = map[base];
+    s.slot = index;
+    s.lastFrame = g_r.frame;
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC td{};
@@ -2242,8 +2998,8 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
     td.DepthOrArraySize = 1;
     td.MipLevels = 1;
     td.SampleDesc.Count = g_msaa;
+    td.SampleDesc.Quality = g_msaaQuality;
     D3D12_CLEAR_VALUE cv{};
-    const UINT index = UINT(map.size() - 1);
     if (depth)
     {
         td.Format = DXGI_FORMAT_R32G8X24_TYPELESS; // float depth (the title uses D24FS8, reverse-Z); typeless for resolves
@@ -2277,8 +3033,43 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
     return s;
 }
 
+// EDRAM surfaces no pass selected for kSurfaceIdleFrames frames are released (FM3 port, session 33, VRAM): every base
+// a title ever drew to kept a full-size host surface (at 4K 4x 3840x3072, 377 MB each): FM3 had 33 (22 colour, 11
+// depth; 12.4 GB) after its menus and loading screens, while a race uses 11. A base drawn to again later gets a new
+// surface (cleared: EDRAM content isn't kept that long by the titles seen so far). REGPU_KEEP_SURFACES=1 (live): keep.
+constexpr uint64_t kSurfaceIdleFrames = 3600; // (10 s at the 360 cap: loading screens run fast and came back to bases after 600)
+uint64_t SurfaceIdleFrames() { return kSurfaceIdleFrames; }
+void EvictSurfaces()
+{
+    static LiveSwitch keep("REGPU_KEEP_SURFACES");
+    if (keep || g_r.frame % 60)
+        return;
+    std::lock_guard surfaceLock(g_surfaceMutex);
+    for (int d = 0; d < 2; d++)
+    {
+        auto& map = d ? g_r.depthSurfaces : g_r.colorSurfaces;
+        const uint32_t bound = d ? C().depthBase : C().colorBase;
+        for (auto it = map.begin(); it != map.end();)
+        {
+            if (it->first != bound && it->second.lastFrame + kSurfaceIdleFrames < g_r.frame && !g_keptSurfaces.count({ d == 1, it->first }))
+            {
+                g_releasedSurfaces[{ d == 1, it->first }] = g_r.frame;
+                Log("renderer: EDRAM %s surface at base %03X released (unused for %llu frames)", d ? "depth" : "colour", it->first,
+                    (unsigned long long)(g_r.frame - it->second.lastFrame));
+                Frame().garbage.push_back(std::move(it->second.resource)); // (released when the GPU is done with this frame)
+                it = map.erase(it);
+            }
+            else
+                ++it;
+        }
+    }
+}
+
 // Binds the surfaces for the current RB_COLOR_INFO / RB_DEPTH_INFO bases
 // (the list must be open).
+ID3D12Resource* VertexCacheBeginFrame(); // the vertex arena for t1 this frame, or none (VertexArena)
+void FlushVertexCopies();
+extern bool g_vertexCacheThisFrame;
 FrameResources& Frame();
 
 void PassMark(const char* fmt, uint32_t a, uint32_t b)
@@ -2294,8 +3085,58 @@ void PassMark(const char* fmt, uint32_t a, uint32_t b)
     g_passDraws = 0;
     PassMarkInfo m{};
     snprintf(m.label, sizeof(m.label), fmt, a, b);
+    if (g_gpuStats && (strncmp(m.label, "pass ", 5) == 0 || strncmp(m.label, "resolve", 7) == 0 || strncmp(m.label, "frame", 5) == 0))
+    {
+        auto [it, fresh] = g_statPassIds.try_emplace(m.label, uint32_t(g_statPassNames.size()));
+        if (fresh)
+            g_statPassNames.push_back(m.label);
+        g_statPass = it->second;
+    }
     C().list->EndQuery(g_passQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * kPassMarks + UINT(marks.size()));
     marks.push_back(m);
+}
+
+// REGPU_TRACE_SURFACE_USE=1 (live; FM3 port, session 33, VRAM): what the draws use of each host EDRAM surface (the
+// largest scissor corner in host pixels, the guest MSAA modes, whether colour writes / depth or stencil are on),
+// logged every 600 frames: which full-size surfaces could be smaller or 1x.
+struct SurfaceUse
+{
+    LONG right = 0, bottom = 0;
+    uint32_t msaaModes = 0, draws = 0, active = 0;
+};
+std::mutex g_surfaceUseMutex;
+std::map<std::pair<bool, uint32_t>, SurfaceUse> g_surfaceUse;
+LiveSwitch g_traceSurfaceUse("REGPU_TRACE_SURFACE_USE");
+void TraceSurfaceUse(const D3D12_RECT& r)
+{
+    if (!g_traceSurfaceUse)
+        return;
+    const uint32_t msaa = (gpureg::Get(RB_SURFACE_INFO) >> 16) & 3;
+    const bool colourOn = (gpureg::Get(0x2104 /* RB_COLOR_MASK */) & 0xF) != 0;
+    const bool depthOn = (gpureg::Get(0x2200 /* RB_DEPTHCONTROL */) & 0x7) != 0; // stencil, z, z write
+    std::lock_guard lock(g_surfaceUseMutex);
+    for (int d = 0; d < 2; d++)
+    {
+        SurfaceUse& u = g_surfaceUse[{ d == 1, d ? C().depthBase : C().colorBase }];
+        u.right = std::max(u.right, r.right);
+        u.bottom = std::max(u.bottom, r.bottom);
+        u.msaaModes |= 1u << msaa;
+        u.draws++;
+        u.active += (d ? depthOn : colourOn) ? 1 : 0;
+    }
+}
+void LogSurfaceUse()
+{
+    static uint64_t next = 0;
+    if (!g_traceSurfaceUse || g_r.frame < next)
+        return;
+    next = g_r.frame + 600;
+    std::lock_guard lock(g_surfaceUseMutex);
+    Log("surface use: %zu surfaces of %ux%u x%u (draws since the last line; corner in host pixels)", g_surfaceUse.size(), SurfaceWidth(), SurfaceHeight(), g_msaa);
+    for (auto& [k, u] : g_surfaceUse)
+        Log("surface use: %s %06X corner %ld,%ld guest msaa modes %X draws %u writing %u", k.first ? "depth " : "colour", k.second, u.right, u.bottom,
+            u.msaaModes, u.draws, u.active);
+    g_surfaceUse.clear();
 }
 
 void SelectSurfaces(bool force)
@@ -2346,6 +3187,7 @@ UINT BindlessIndexLocked(ID3D12Resource* resource, DXGI_FORMAT format, uint32_t 
 // its initialisation guard on every draw (dozens a draw).
 LiveSwitch g_sw_REGPU_ALL_CONSTANTS("REGPU_ALL_CONSTANTS");
 LiveSwitch g_sw_REGPU_ASYNC_SHADERS("REGPU_ASYNC_SHADERS");
+LiveSwitch g_sw_REGPU_ENCLOSING_GUESS("REGPU_ENCLOSING_GUESS"); // ResolveIntoEnclosing: the old matching rules (live)
 LiveSwitch g_sw_REGPU_CONSTANTS_BY_COUNT("REGPU_CONSTANTS_BY_COUNT");
 LiveSwitch g_sw_REGPU_CONSTANTS_IN_RING("REGPU_CONSTANTS_IN_RING");
 LiveSwitch g_sw_REGPU_DEPTH_ALPHATEST_ALL("REGPU_DEPTH_ALPHATEST_ALL");
@@ -2375,6 +3217,9 @@ LiveSwitch g_sw_REGPU_OLD_CLEAR_SHIFT("REGPU_OLD_CLEAR_SHIFT");
 LiveSwitch g_sw_REGPU_TEXTURE_CHECK_EVERY4("REGPU_TEXTURE_CHECK_EVERY4");
 LiveSwitch g_sw_REGPU_TEXTURE_CHECK_STAGGER("REGPU_TEXTURE_CHECK_STAGGER");
 LiveSwitch g_sw_REGPU_TRACE_CONSTANTS_USED("REGPU_TRACE_CONSTANTS_USED");
+LiveSwitch g_sw_REGPU_CONSTANT_REUSE("REGPU_CONSTANT_REUSE");
+LiveSwitch g_sw_REGPU_NO_WIDE_INDEX_VIEWS("REGPU_NO_WIDE_INDEX_VIEWS");
+LiveSwitch g_sw_REGPU_TRACE_CONSTANT_BYTES("REGPU_TRACE_CONSTANT_BYTES");
 LiveSwitch g_sw_REGPU_TRACE_MIDSIZE("REGPU_TRACE_MIDSIZE");
 LiveSwitch g_sw_REGPU_TRACE_TEXCHANGE("REGPU_TRACE_TEXCHANGE");
 LiveSwitch g_sw_REGPU_TRACE_TILES("REGPU_TRACE_TILES");
@@ -2425,6 +3270,8 @@ UINT BindlessIndexLocked(ID3D12Resource* resource, DXGI_FORMAT format, uint32_t 
     srv.Format = format;
     srv.Shader4ComponentMapping = format == DXGI_FORMAT_BC4_UNORM
         ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 0, 0, 0) // DXT5A: its one channel in all four
+        : format == DXGI_FORMAT_R8_UNORM // k_8 kept as one channel (GetTextureLocked): (v, v, v, 1) as its RGBA8 expansion
+        ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 0, 0, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1)
         : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     if (kind == 1)
     {
@@ -2463,96 +3310,6 @@ void EvictBindless()
     }
 }
 
-// Textures not sampled for a while go, oldest first, once they pass a budget: the cache is keyed by guest address,
-// and a title streaming textures to new addresses otherwise grows it until video memory runs out (PGR4: 280,000
-// textures after an hour, CreateHeap out of memory). An evicted texture comes back as a fresh upload.
-// The budget is 1 GB (the console has 512 MB for everything; a scene's textures fit well within it, decoded or not):
-// REGPU_TEXTURE_BUDGET_MB overrides it; REGPU_NO_TEXTURE_EVICT: never.
-void EvictTextures()
-{
-    if (g_r.frame % 64 != 0)
-        return;
-    static LiveSwitch noEvict("REGPU_NO_TEXTURE_EVICT");
-    if (noEvict)
-        return;
-    static const uint64_t budget = [] {
-        if (const char* s = getenv("REGPU_TEXTURE_BUDGET_MB"))
-            return strtoull(s, nullptr, 10) << 20;
-        return 1024ull << 20;
-    }();
-    std::lock_guard textureLock(g_textureMutex);
-    struct Candidate
-    {
-        uint64_t lastUsed;
-        decltype(g_r.textures)::iterator it;
-        uint64_t bytes;
-    };
-    std::vector<Candidate> candidates;
-    uint64_t total = 0;
-    for (auto it = g_r.textures.begin(); it != g_r.textures.end(); ++it)
-    {
-        if (!it->second.resource)
-            continue;
-        const auto block = g_texturePool.live.find(it->second.resource.Get());
-        const uint64_t bytes = block != g_texturePool.live.end() ? block->second.size : g_r.device->GetResourceAllocationInfo(0, 1, &static_cast<const D3D12_RESOURCE_DESC&>(it->second.resource->GetDesc())).SizeInBytes;
-        total += bytes;
-        // Not this frame's or the last few seconds': those are the scene in view.
-        if (it->second.checkedFrame + 300 < g_r.frame)
-            candidates.push_back({ it->second.checkedFrame, it, bytes });
-    }
-    static uint64_t lastSize = 0;
-    if (g_r.frame >= lastSize + 3600)
-    {
-        lastSize = g_r.frame;
-        Log("renderer: textures %llu MB in %zu, %zu texture heaps", (unsigned long long)(total >> 20), g_r.textures.size(), g_texturePool.heaps.size());
-        const auto bytesOf = [](ID3D12Resource* r) -> uint64_t {
-            return r ? g_r.device->GetResourceAllocationInfo(0, 1, &static_cast<const D3D12_RESOURCE_DESC&>(r->GetDesc())).SizeInBytes : 0;
-        };
-        const auto cacheBytes = [&](const auto& map) {
-            uint64_t n = 0;
-            for (const auto& [key, t] : map)
-                n += bytesOf(t.resource.Get());
-            return n >> 20;
-        };
-        uint64_t resolved = 0, spares = 0;
-        for (const auto& [key, t] : g_r.resolved)
-        {
-            resolved += bytesOf(t.resource.Get()) + bytesOf(t.packed.Get());
-            for (const auto& spare : t.spares)
-                spares += bytesOf(spare.resource.Get());
-        }
-        uint64_t used = 0;
-        ComPtr<IDXGIFactory4> factory;
-        ComPtr<IDXGIAdapter3> adapter;
-        DXGI_QUERY_VIDEO_MEMORY_INFO info{};
-        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapterByLuid(g_r.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))) &&
-            SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
-            used = info.CurrentUsage;
-        Log("renderer: video memory %llu MB; resolved %llu MB in %zu, spares %llu MB, cubes %llu MB in %zu, volumes %llu MB in %zu, mip chains %llu MB in %zu, bindless %zu",
-            (unsigned long long)(used >> 20), (unsigned long long)(resolved >> 20), g_r.resolved.size(), (unsigned long long)(spares >> 20), (unsigned long long)cacheBytes(g_r.cubes),
-            g_r.cubes.size(), (unsigned long long)cacheBytes(g_r.volumes), g_r.volumes.size(), (unsigned long long)cacheBytes(g_r.mipChains), g_r.mipChains.size(), g_r.bindless.size());
-    }
-    if (total <= budget)
-        return;
-    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.lastUsed < b.lastUsed; });
-    size_t evicted = 0;
-    for (const Candidate& c : candidates)
-    {
-        if (total <= budget)
-            break;
-        RetireTexture(std::move(c.it->second.resource));
-        g_r.textures.erase(c.it);
-        total -= c.bytes;
-        evicted++;
-    }
-    static uint64_t lastLog = 0;
-    if (g_r.frame >= lastLog + 3600)
-    {
-        lastLog = g_r.frame;
-        Log("renderer: evicted %zu textures, %llu MB in %zu left", evicted, (unsigned long long)(total >> 20), g_r.textures.size());
-    }
-}
-
 // Waits for the queue fence to reach a value, on an event of the calling thread: one shared event let two waiting
 // threads steal each other's wake-up, and the loser sat out its whole timeout (FM4 port: 2 s stalls in a race).
 void WaitFenceValue(UINT64 value, DWORD timeoutMs)
@@ -2561,6 +3318,16 @@ void WaitFenceValue(UINT64 value, DWORD timeoutMs)
     if (g_r.fence->GetCompletedValue() >= value)
         return;
     g_r.fence->SetEventOnCompletion(value, event);
+    // (Every fence wait on the draw thread, for the long-frame log; the frame-start one is also its "gpu wait".)
+    struct CountFence
+    {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~CountFence()
+        {
+            if (t_countFenceWaits)
+                g_fenceWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        }
+    } countFence;
     if (WaitForSingleObject(event, timeoutMs) == WAIT_TIMEOUT && timeoutMs != INFINITE)
         Log("perf: a fence wait timed out after %lu ms (value %llu, completed %llu)", timeoutMs, (unsigned long long)value,
             (unsigned long long)g_r.fence->GetCompletedValue());
@@ -2579,6 +3346,7 @@ void BeginFrameIfNeeded()
     }
     f.garbage.clear();
     ApplyOutputSize(); // (a new resolution: between frames)
+    ApplyFrameSize();  // (a new guest frame size: the same)
     ApplyMsaa();
     void FinishDeferredWritebacks(UINT frameIndex);
     FinishDeferredWritebacks(UINT(&f - g_r.frames)); // this slot's previous frame has completed
@@ -2591,6 +3359,7 @@ void BeginFrameIfNeeded()
         const D3D12_RANGE range{ size_t(frameIndex) * kOcclusionPerFrame * 8, size_t(frameIndex + 1) * kOcclusionPerFrame * 8 };
         if (SUCCEEDED(g_occlusionReadback->Map(0, &range, reinterpret_cast<void**>(&counts))))
         {
+            std::lock_guard resultLock(g_occlusionResultLock);
             for (const OcclusionParts& q : g_occlusionPending[frameIndex])
             {
                 if (g_occlusionResult.size() <= q.order)
@@ -2612,7 +3381,9 @@ void BeginFrameIfNeeded()
         }
         g_occlusionPending[frameIndex].clear();
     }
-    if (perf && !g_timestamps)
+    void HyperCullCollect(UINT frameIndex);
+    HyperCullCollect(frameIndex);
+    if ((perf || PerfLiteOn()) && !g_timestamps)
     {
         D3D12_QUERY_HEAP_DESC qd{};
         qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
@@ -2627,6 +3398,75 @@ void BeginFrameIfNeeded()
         qd.Count = kPassMarks * kFrames;
         g_r.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_passQueries));
         g_passReadback = CreateBuffer(8ull * kPassMarks * kFrames, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (g_gpuStats)
+        {
+            D3D12_QUERY_HEAP_DESC sd{};
+            sd.Type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS;
+            sd.Count = kStatDraws * kFrames;
+            g_r.device->CreateQueryHeap(&sd, IID_PPV_ARGS(&g_statQueries));
+            g_statReadback = CreateBuffer(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) * kStatDraws * kFrames, D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+            Log("gpu stats: pipeline statistics per draw on (REGPU_GPU_PASSES=2)%s", g_statQueries ? "" : ": query heap failed");
+        }
+    }
+    if (g_gpuStats && g_statReadback && !g_statDraws[frameIndex].empty())
+    {
+        // This slot's previous frame has completed (as for the pass times below): add up its draws.
+        auto& draws = g_statDraws[frameIndex];
+        D3D12_QUERY_DATA_PIPELINE_STATISTICS* q = nullptr;
+        const size_t stride = sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS);
+        const D3D12_RANGE range{ size_t(frameIndex) * kStatDraws * stride, (size_t(frameIndex) * kStatDraws + draws.size()) * stride };
+        if (SUCCEEDED(g_statReadback->Map(0, &range, reinterpret_cast<void**>(&q))))
+        {
+            const D3D12_QUERY_DATA_PIPELINE_STATISTICS* s = q + size_t(frameIndex) * kStatDraws;
+            for (size_t i = 0; i < draws.size(); i++)
+                for (StatTotal* t : { &g_statByPass[draws[i].pass], &g_statByShader[draws[i].ps] })
+                {
+                    t->psInvocations += s[i].PSInvocations;
+                    t->vsInvocations += s[i].VSInvocations;
+                    t->primitives += s[i].CPrimitives;
+                    t->draws++;
+                }
+            const D3D12_RANGE none{ 0, 0 };
+            g_statReadback->Unmap(0, &none);
+            g_statFrames++;
+        }
+        draws.clear();
+        static auto lastStatLog = std::chrono::steady_clock::now();
+        if (std::chrono::steady_clock::now() - lastStatLog > std::chrono::seconds(2) && g_statFrames)
+        {
+            lastStatLog = std::chrono::steady_clock::now();
+            uint64_t sum = 0;
+            for (auto& [pass, t] : g_statByPass)
+                sum += t.psInvocations;
+            const double n = double(g_statFrames);
+            Log("gpu stats: %.0f pixel shader invocations/frame over %llu frames (%.2f per output pixel at %ux%u)", double(sum) / n,
+                (unsigned long long)g_statFrames, double(sum) / n / double(std::max(1u, OutputWidth() * OutputHeight())), OutputWidth(), OutputHeight());
+            auto top = [&](std::map<uint32_t, StatTotal>& m, bool passes) {
+                std::vector<std::pair<uint64_t, uint32_t>> order;
+                for (auto& [k, t] : m)
+                    order.push_back({ t.psInvocations, k });
+                std::sort(order.rbegin(), order.rend());
+                for (size_t i = 0; i < order.size() && i < 20; i++)
+                {
+                    const StatTotal& t = m[order[i].second];
+                    char name[64];
+                    if (passes)
+                        snprintf(name, sizeof(name), "%s", order[i].second < g_statPassNames.size() ? g_statPassNames[order[i].second].c_str() : "?");
+                    else
+                        snprintf(name, sizeof(name), "ps %08X", order[i].second);
+                    Log("gpu stats: %12.0f ps inv  %10.0f vs inv  %8.0f prims  %6.1f draws  %s", double(t.psInvocations) / n, double(t.vsInvocations) / n,
+                        double(t.primitives) / n, double(t.draws) / n, name);
+                }
+            };
+            Log("gpu stats: by pass");
+            top(g_statByPass, true);
+            Log("gpu stats: by pixel shader");
+            top(g_statByShader, false);
+            g_statByPass.clear();
+            g_statByShader.clear();
+            g_statFrames = 0;
+        }
     }
     if (g_gpuPasses && g_passMarks[frameIndex].size() > 1)
     {
@@ -2673,7 +3513,7 @@ void BeginFrameIfNeeded()
         }
     }
     g_passMarks[frameIndex].clear();
-    if (perf && f.timed && g_timestampReadback)
+    if ((perf || PerfLiteOn()) && f.timed && g_timestampReadback)
     {
         // This slot's previous frame has completed (waited for above).
         uint64_t* t = nullptr;
@@ -2690,19 +3530,31 @@ void BeginFrameIfNeeded()
                 g_gpuFrameMs += ms;
                 g_gpuFrameMaxMs = std::max(g_gpuFrameMaxMs, ms);
                 g_gpuFrames++;
+                g_liteGpuMs += ms;
+                g_liteGpuFrames++;
             }
         }
         f.timed = false;
     }
-    f.allocator->Reset();
     f.poolUsed = 0;
-    g_r.recorder.Rebind(g_r.realList.Get()); // (a pool list may have continued last frame)
-    C().list->Reset(f.allocator.Get(), nullptr);
+    if (g_asyncFrameEnded)
+    {
+        // Last frame ended on the replay thread (REGPU_ASYNC_PRESENT): its list is closed there; this frame records
+        // into a pool list of its own slot, without waiting for that (Rebind would).
+        g_asyncFrameEnded = false;
+        g_r.recorder.Switch(AcquireList());
+    }
+    else
+    {
+        g_r.recorder.Rebind(g_r.realList.Get()); // (a pool list may have continued last frame)
+        f.allocator->Reset();
+        C().list->Reset(f.allocator.Get(), nullptr);
+    }
     // This frame's scene phase and scale (see UpscaleScene).
     {
         const Settings& st = GetSettings();
         const bool temporalChosen = TemporalUpscalerChosen(st);
-        // DLSS and FSR 3/4 anti-alias the image themselves; with MSAA as well the device was removed at the first
+        // DLSS, FSR 3/4 and XeSS anti-alias the image themselves; with MSAA as well the device was removed at the first
         // scene resolve (FM2), and FSR 4 crashed at context creation with 4x (FM4). The scene surfaces are 1x
         // while one is chosen at the start or with SetMsaa; one chosen live with MSAA on waits for that.
         const bool temporalUpscaler = temporalChosen && g_msaa == 1;
@@ -2712,31 +3564,415 @@ void BeginFrameIfNeeded()
         g_upscale.switchedThisFrame = false;
         g_upscale.fullResolveBase = ~0u;
         static LiveSwitch anyFrame("REGPU_TEMPORAL_ANY_FRAME");
-        g_scenePhase = st.upscaler != Settings::Upscaler::Off && (temporalUpscaler || scale < 1.0f) && g_r.frame >= g_upscale.retryFrame &&
-            (!temporalUpscaler || ((g_upscale.sceneOk || anyFrame) && TemporalInit()));
-        g_temporal = g_scenePhase && temporalUpscaler;
+        // Anti-aliasing filters (session 36) need the scene's end too: TAA the temporal path (not with DLSS/FSR 3, which
+        // do their own), FXAA/SMAA/CMAA 2 the plain one.
+        const bool taa = st.postAA == Settings::PostAA::Taa && !temporalUpscaler;
+        const bool filter = st.postAA != Settings::PostAA::Off && st.postAA != Settings::PostAA::Taa;
+        const bool upscale = st.upscaler != Settings::Upscaler::Off && (temporalUpscaler || scale < 1.0f);
+        // VR stereo draws the scene twice from the same commands: the upscalers' and filters' per-frame state (history,
+        // jitter, the scene's end) would run twice too, so they are off with it.
+        static const bool stereo = [] {
+            const char* v = getenv("REGPU_VR");
+            const bool on = v && strcmp(v, "stereo") == 0;
+            if (on)
+                Log("vr: stereo: upscalers and anti-aliasing filters are off");
+            return on;
+        }();
+        g_scenePhase = !stereo && !TripleMode() && (upscale || taa || filter) && g_r.frame >= g_upscale.retryFrame && (!(temporalUpscaler || taa) || ((!temporalUpscaler || g_upscale.sceneOk || anyFrame) && TemporalInit()));
+        g_temporal = g_scenePhase && (temporalUpscaler || taa);
         g_sceneScale = g_scenePhase ? scale : 1.0f;
+        BumpPassEpoch();
         if (g_temporal)
             BeginTemporalFrame();
     }
     PassMark("frame start %u%u", 0, 0);
-    if (perf && g_timestamps)
+    if ((perf || PerfLiteOn()) && g_timestamps)
         C().list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2);
+    // REGPU_TRACE_RING_KINDS: what fills the upload ring, KB a frame by kind (RingKind), every 120 frames.
+    static LiveSwitch traceKinds("REGPU_TRACE_RING_KINDS");
+    g_traceRingKinds = traceKinds;
+    if (g_traceRingKinds)
+    {
+        static uint64_t lastFrame = 0;
+        if (g_r.frame >= lastFrame + 120)
+        {
+            const double frames = double(g_r.frame - lastFrame);
+            lastFrame = g_r.frame;
+            uint64_t k[kRingKinds], n[kRingKinds];
+            for (int i = 0; i < kRingKinds; i++)
+                k[i] = g_ringKindBytes[i].exchange(0), n[i] = g_ringKindCount[i].exchange(0);
+            Log("ring kinds (KB a frame / allocations a frame): constants %.0f/%.0f, index lists %.0f/%.0f, vertex uploads %.0f/%.0f, vertex arena %.0f/%.0f, "
+                "index buffers %.0f/%.0f, textures %.0f/%.0f, other %.0f/%.0f",
+                k[RingConstants] / 1024.0 / frames, n[RingConstants] / frames, k[RingIndexList] / 1024.0 / frames, n[RingIndexList] / frames,
+                k[RingVertexUpload] / 1024.0 / frames, n[RingVertexUpload] / frames, k[RingVertexArena] / 1024.0 / frames, n[RingVertexArena] / frames,
+                k[RingIndexBuffer] / 1024.0 / frames, n[RingIndexBuffer] / frames, k[RingTexture] / 1024.0 / frames, n[RingTexture] / frames,
+                k[RingOther] / 1024.0 / frames, n[RingOther] / frames);
+        }
+    }
+    // Texture budget (FM3 port session 43, after PGR4's and FM2's caps): the texture cache never let go of a texture, so
+    // it only grew over a session (every track and car seen). Every 64 frames, when the 2D textures together pass
+    // REGPU_TEXTURE_BUDGET_MB (default 1024; 0 = no limit), the ones unused longest (none used in the last 600 frames)
+    // are released until they are under 90% of it. A released texture is decoded again if it is drawn again. On an
+    // integrated GPU every texture is system RAM.
+    if (g_r.frame % 64 == 0)
+    {
+        static const uint64_t budget = uint64_t(getenv("REGPU_TEXTURE_BUDGET_MB") ? std::max(0, atoi(getenv("REGPU_TEXTURE_BUDGET_MB"))) : 1024) << 20;
+        if (budget)
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_textureMutex);
+            struct Old
+            {
+                uint64_t frame, key, bytes;
+            };
+            std::vector<Old> old;
+            uint64_t total = 0;
+            // Each texture's size is asked of the driver once and kept (PGR3 port, session 5): asking for every texture each
+            // time (thousands of GetResourceAllocationInfo calls on the draw thread, under the texture mutex) made every
+            // 64th frame ~3 ms longer (PGR3 1440p race at a 360 cap: ~4 long frames a second, p99 6-8 ms; with the
+            // budget off 0.2 and 4.4 ms). REGPU_TEXTURE_BUDGET_ASK_ALL=1 (live): asked every time, as before.
+            static LiveSwitch askAll("REGPU_TEXTURE_BUDGET_ASK_ALL");
+            for (auto& [key, t] : g_r.textures)
+            {
+                if (!t.resource)
+                    continue;
+                if (t.budgetFor != t.resource.Get() || askAll)
+                {
+                    const D3D12_RESOURCE_DESC d = t.resource->GetDesc();
+                    t.budgetBytes = g_r.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+                    t.budgetFor = t.resource.Get();
+                }
+                const uint64_t b = t.budgetBytes;
+                total += b;
+                if (t.checkedFrame == ~0ull || t.checkedFrame + 600 < g_r.frame)
+                    old.push_back({ t.checkedFrame == ~0ull ? 0 : t.checkedFrame, key, b });
+            }
+            if (total > budget && !old.empty())
+            {
+                std::sort(old.begin(), old.end(), [](const Old& a, const Old& b) { return a.frame < b.frame; });
+                uint64_t freed = 0;
+                size_t n = 0;
+                for (const Old& o : old)
+                {
+                    if (total - freed <= budget / 10 * 9)
+                        break;
+                    auto it = g_r.textures.find(o.key);
+                    RetireTexture(std::move(it->second.resource));
+                    g_r.textures.erase(it);
+                    freed += o.bytes;
+                    n++;
+                }
+                Log("renderer: texture budget %llu MB: %zu unused textures released (%.0f MB; %.0f MB left)", (unsigned long long)(budget >> 20), n,
+                    freed / 1048576.0, (total - freed) / 1048576.0);
+            }
+        }
+    }
+    // Cache release (FM3 port session 46): resolved images, cubes and mip chains were kept for the whole session. A 2 h
+    // session on the iGPU (four tracks) grew resolved images 71 -> 571 MB (1,883 MB with their spares), cubes to
+    // 196 MB, mip chains to 110 MB. Every 64 frames, what has not been used for 60 s and 1,800 frames goes:
+    //  - a resolved image's spare sizes (not with REGPU_HYPER_RESOLVE_BY_SIZE, which reads them);
+    //  - a resolved image whose guest memory has changed since it was resolved (the title reused the memory: the image
+    //    is never returned again), or that was written back to memory and unused for 120 s (memory holds it). One
+    //    not written back whose memory is unchanged is kept: it is the only copy (the console's memory would hold it);
+    //  - cubes and mip chains (put together again from their faces or levels on the next use).
+    // At most 16 memory hashes a sweep. REGPU_NO_CACHE_RELEASE=1 (live): nothing released.
+    if (g_r.frame % 64 == 0)
+    {
+        const uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        g_frameClock.push_back({ g_r.frame, nowMs });
+        if (g_frameClock.size() > 8192)
+            g_frameClock.pop_front();
+        // Seconds since a frame, at least (a frame before the oldest stamp kept: at least that stamp's age).
+        auto ageSeconds = [&](uint64_t frame) -> double {
+            if (frame == ~0ull)
+                return 1e9;
+            auto it = std::lower_bound(g_frameClock.begin(), g_frameClock.end(), frame, [](const auto& e, uint64_t f) { return e.first < f; });
+            if (it == g_frameClock.end())
+                return 0.0;
+            return double(nowMs - it->second) / 1000.0;
+        };
+        // REGPU_CACHE_RELEASE_SECONDS=<s> (debug, read every sweep, live through the debug server's "env"): the 60 s
+        // threshold (the 120 s one scales with it, and 1,800 frames to 30 a second), to stress the rules in a test.
+        double scale = 1.0;
+        if (const char* e = getenv("REGPU_CACHE_RELEASE_SECONDS"); e && *e)
+            scale = std::max(0.5, atof(e)) / 60.0;
+        const uint64_t minFrames = uint64_t(1800 * scale);
+        auto unused = [&](uint64_t frame, double seconds) {
+            return (frame == ~0ull || frame + minFrames < g_r.frame) && ageSeconds(frame) >= seconds * scale;
+        };
+        static LiveSwitch noRelease("REGPU_NO_CACHE_RELEASE");
+        if (!noRelease)
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_textureMutex);
+            static const bool bySize = getenv("REGPU_HYPER_RESOLVE_BY_SIZE") && atoi(getenv("REGPU_HYPER_RESOLVE_BY_SIZE")) != 0;
+            // At most 8 images (spares count) and 8 cubes or mip chains a sweep: ~170 released in one frame (a track
+            // left 60 s ago) made a 94 ms frame, all of them destroyed at once when the frame came round again.
+            int hashes = 0, images = 0, others = 0;
+            for (auto it = g_r.resolved.begin(); it != g_r.resolved.end() && images < 8;)
+            {
+                ResolvedTexture& r = it->second;
+                if (!bySize)
+                    for (auto sp = r.spares.begin(); sp != r.spares.end() && images < 8;)
+                        if (unused(std::max(sp->frame == ~0ull ? 0 : sp->frame, sp->usedFrame), 60.0))
+                        {
+                            Frame().garbage.push_back(std::move(sp->resource));
+                            if (sp->packed)
+                                Frame().garbage.push_back(std::move(sp->packed));
+                            sp = r.spares.erase(sp);
+                            g_cacheRelease.spares++;
+                            images++;
+                        }
+                        else
+                            ++sp;
+                const uint64_t last = std::max(r.frame == ~0ull ? 0 : r.frame, r.usedFrame);
+                bool drop = false;
+                if (r.spares.empty() && images < 8 && unused(last, 60.0))
+                {
+                    if (!r.resource || r.stale)
+                        drop = true;
+                    else if (hashes < 16 && r.sweepChecked + 3600 < g_r.frame)
+                    {
+                        hashes++;
+                        r.sweepChecked = g_r.frame; // (kept ones are looked at again after 3,600 frames, not every sweep)
+                        if (GuestImageHash(it->first, r.width, r.height, r.guestBpp) != r.memHash)
+                            drop = true; // (ResolveCurrent would call it stale at its next look)
+                        else if (r.writtenBack && unused(last, 120.0))
+                            drop = true;
+                    }
+                }
+                if (drop)
+                {
+                    if (r.resource)
+                        Frame().garbage.push_back(std::move(r.resource));
+                    if (r.packed)
+                        Frame().garbage.push_back(std::move(r.packed));
+                    it = g_r.resolved.erase(it);
+                    g_cacheRelease.resolved++;
+                    images++;
+                }
+                else
+                    ++it;
+            }
+            for (auto* map : { &g_r.cubes, &g_r.mipChains })
+                for (auto it = map->begin(); it != map->end() && others < 8;)
+                    if (it->second.resource && unused(it->second.checkedFrame, 60.0))
+                    {
+                        others++;
+                        RetireTexture(std::move(it->second.resource));
+                        (map == &g_r.cubes ? g_cacheRelease.cubes : g_cacheRelease.mipChains)++;
+                        it = map->erase(it);
+                    }
+                    else
+                        ++it;
+        }
+    }
+    // FM3 port session 43 (less RAM for 8 GB PCs): every 30 s, what the renderer holds on the GPU (on an integrated GPU
+    // that is system RAM too), from each resource's description. REGPU_NO_MEMORY_REPORT=1: no line.
+    {
+        static auto next = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        static const bool off = getenv("REGPU_NO_MEMORY_REPORT") != nullptr;
+        if (!off && std::chrono::steady_clock::now() >= next)
+        {
+            next = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            auto bytes = [](ID3D12Resource* r) -> uint64_t {
+                if (!r)
+                    return 0;
+                const D3D12_RESOURCE_DESC d = r->GetDesc();
+                return g_r.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+            };
+            // Cached textures' sizes are asked once per resource and kept (as the texture budget's, PGR3 session 5: the walk
+            // asking the driver for every texture made this report's frame ~3.5 ms longer every 30 s).
+            static LiveSwitch askAll("REGPU_TEXTURE_BUDGET_ASK_ALL");
+            auto cached = [&](CachedTexture& t) -> uint64_t {
+                if (t.budgetFor != t.resource.Get() || askAll)
+                    t.budgetBytes = bytes(t.resource.Get()), t.budgetFor = t.resource.Get();
+                return t.budgetBytes;
+            };
+            auto sum = [&](auto& map, uint64_t& n) {
+                uint64_t b = 0;
+                for (auto& [k, t] : map)
+                    if (t.resource)
+                        b += cached(t), n++;
+                return b;
+            };
+            uint64_t nTex = 0, nCube = 0, nVol = 0, nMip = 0, nRes = 0, nSurf = 0, nOld = 0;
+            const uint64_t tex = sum(g_r.textures, nTex), cube = sum(g_r.cubes, nCube), vol = sum(g_r.volumes, nVol), mips = sum(g_r.mipChains, nMip);
+            uint64_t res = 0, surf = 0, oldBytes = 0, spareBytes = 0, staleBytes = 0, nSpare = 0;
+            for (const auto& [k, r] : g_r.resolved)
+            {
+                if (r.resource)
+                {
+                    const uint64_t b = bytes(r.resource.Get());
+                    res += b, nRes++;
+                    if (r.stale)
+                        staleBytes += b;
+                }
+                for (const ResolvedTexture& sp : r.spares)
+                    if (sp.resource)
+                    {
+                        const uint64_t b = bytes(sp.resource.Get());
+                        res += b, nRes++, spareBytes += b, nSpare++;
+                    }
+            }
+            for (auto* m : { &g_r.colorSurfaces, &g_r.depthSurfaces })
+                for (const auto& [k, sf] : *m)
+                    if (sf.resource)
+                        surf += bytes(sf.resource.Get()), nSurf++;
+            for (auto& [k, t] : g_r.textures)
+                if (t.resource && t.checkedFrame + 1800 < g_r.frame)
+                    oldBytes += cached(t), nOld++;
+            uint64_t rings = 0;
+            for (UINT i = 0; i < kFrames; i++)
+                rings += g_r.frames[i].ringSize * (g_r.frames[i].ringAlt ? 2 : 1);
+            const double mb = 1024.0 * 1024.0;
+            Log("renderer memory: textures %.0f MB (%llu; %.0f MB in %llu not used for 30 s), cubes %.0f MB (%llu), 3D %.0f MB (%llu), mip chains %.0f MB (%llu), "
+                "resolved images %.0f MB (%llu), EDRAM surfaces %.0f MB (%llu), texture heaps %zu x 128 MB, upload rings %.0f MB",
+                tex / mb, (unsigned long long)nTex, oldBytes / mb, (unsigned long long)nOld, cube / mb, (unsigned long long)nCube, vol / mb,
+                (unsigned long long)nVol, mips / mb, (unsigned long long)nMip, res / mb, (unsigned long long)nRes, surf / mb, (unsigned long long)nSurf,
+                g_texturePool.heaps.size(), rings / mb);
+            {
+                uint64_t live = 0;
+                for (const TexturePool::Heap& h : g_texturePool.heaps)
+                    live += h.live;
+                Log("renderer memory: texture heaps %.0f MB used, %.0f MB free, %llu released; resolved images: spares %.0f MB (%llu), stale %.0f MB; "
+                    "released so far: %llu resolved images, %llu spares, %llu cubes, %llu mip chains",
+                    live / mb, g_texturePool.freeBytes / mb, (unsigned long long)g_texturePool.released, spareBytes / mb, (unsigned long long)nSpare,
+                    staleBytes / mb, (unsigned long long)g_cacheRelease.resolved, (unsigned long long)g_cacheRelease.spares,
+                    (unsigned long long)g_cacheRelease.cubes, (unsigned long long)g_cacheRelease.mipChains);
+            }
+            std::string expanded;
+            {
+                std::lock_guard<std::recursive_mutex> lock(g_textureMutex);
+                for (const auto& [fmt, e] : g_expandedFormats)
+                {
+                    char b[96];
+                    const char* name = TextureFormatName(fmt);
+                    snprintf(b, sizeof(b), "%s%s %llu (%.0f MB)", expanded.empty() ? "" : ", ", name ? name : "?", (unsigned long long)e.first, e.second / mb);
+                    expanded += b;
+                }
+            }
+            if (!expanded.empty())
+                Log("renderer memory: uploads decoded to RGBA8 by guest format: %s", expanded.c_str());
+        }
+    }
     if (const UINT64 used = f.ringUsed.load(); used > g_ringPeak)
     {
         g_ringPeak = used;
         if (used > f.ringSize / 2)
             Log("renderer: upload ring peak %llu MB of %llu", (unsigned long long)(used >> 20), (unsigned long long)(f.ringSize >> 20));
     }
+    // REGPU_UPLOAD_RING_AUTO=1 (start-time; FM3 port, session 36): the ring's place chosen by measuring. In VRAM the GPU
+    // reads the per-draw constants locally but the draw thread writes them over PCIe (it stalls on the store buffer);
+    // in system memory the writes are cheap and the GPU reads them over PCIe. FM3's grid at 1440p, RX 7900 XTX: no
+    // MSAA (draw thread the limit) system memory +5.5% (GPU 2.0 -> 2.95 ms); 4x MSAA VRAM +1.6%; 4K: VRAM by far
+    // (session 31). Every 30 s: four interleaved pairs of windows (30 frames to settle, then 120 measured, median frame
+    // time); a mode that wins at least 3 of the 4 pairs by over 1.5% on average is kept, else the current one stays
+    // (a frame cap makes them equal). Same picture either way. Off: REGPU_GPU_UPLOAD_RING decides, as before.
+    struct RingAuto
+    {
+        bool on = false, wantVram = true;
+        std::chrono::steady_clock::time_point last{}, nextTrial{};
+        int window = -1, frames = 0; // window: -1 holding; 0..7 in a trial (even: the current mode, odd: the other)
+        bool trialStartVram = true;
+        std::vector<float> samples;
+        float medians[8] = {};
+    };
+    static RingAuto ringAuto = [] {
+        RingAuto a;
+        a.on = getenv("REGPU_UPLOAD_RING_AUTO") && atoi(getenv("REGPU_UPLOAD_RING_AUTO")) != 0;
+        a.nextTrial = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        return a;
+    }();
+    static LiveSwitch vramRing("REGPU_GPU_UPLOAD_RING");
+    if (ringAuto.on && g_gpuUploadHeap && f.ringAlt)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const float ms = ringAuto.last.time_since_epoch().count() ? std::chrono::duration<float, std::milli>(now - ringAuto.last).count() : 0.0f;
+        ringAuto.last = now;
+        if (ringAuto.window < 0 && now >= ringAuto.nextTrial)
+        {
+            ringAuto.window = 0;
+            ringAuto.frames = 0;
+            ringAuto.trialStartVram = ringAuto.wantVram;
+            ringAuto.samples.clear();
+        }
+        else if (ringAuto.window >= 0 && ms > 0.0f)
+        {
+            if (++ringAuto.frames > 30)
+                ringAuto.samples.push_back(ms);
+            if (ringAuto.frames >= 150)
+            {
+                std::sort(ringAuto.samples.begin(), ringAuto.samples.end());
+                ringAuto.medians[ringAuto.window] = ringAuto.samples[ringAuto.samples.size() / 2];
+                ringAuto.samples.clear();
+                ringAuto.frames = 0;
+                if (++ringAuto.window == 8)
+                {
+                    float cur = 0, other = 0;
+                    int otherWins = 0, curWins = 0;
+                    for (int p = 0; p < 4; p++)
+                    {
+                        cur += ringAuto.medians[2 * p], other += ringAuto.medians[2 * p + 1];
+                        otherWins += ringAuto.medians[2 * p + 1] < ringAuto.medians[2 * p];
+                        curWins += ringAuto.medians[2 * p] < ringAuto.medians[2 * p + 1];
+                    }
+                    const bool switchTo = otherWins >= 3 && other < cur * 0.985f;
+                    ringAuto.wantVram = switchTo ? !ringAuto.trialStartVram : ringAuto.trialStartVram;
+                    static bool lastLogged = true, logged = false;
+                    if (!logged || ringAuto.wantVram != lastLogged)
+                        Log("renderer: upload ring auto: %s %.2f ms, %s %.2f ms a frame (median): %s", ringAuto.trialStartVram ? "VRAM" : "system memory",
+                            cur / 4, ringAuto.trialStartVram ? "system memory" : "VRAM", other / 4, ringAuto.wantVram ? "VRAM" : "system memory");
+                    logged = true, lastLogged = ringAuto.wantVram;
+                    ringAuto.window = -1;
+                    ringAuto.nextTrial = now + std::chrono::seconds(30);
+                }
+            }
+        }
+    }
+    const bool wantVram = ringAuto.on && g_gpuUploadHeap
+        ? (ringAuto.window >= 0 ? ((ringAuto.window & 1) ? !ringAuto.trialStartVram : ringAuto.trialStartVram) : ringAuto.wantVram)
+        : bool(vramRing);
+    // REGPU_GPU_UPLOAD_RING: this slot's ring in VRAM or system memory (its last use finished with its frame). The other
+    // place's ring is made here when first wanted; without REGPU_KEEP_BOTH_RINGS the replaced one goes (garbage of this
+    // slot: its frame has finished).
+    static const bool keepBoth = getenv("REGPU_KEEP_BOTH_RINGS") != nullptr;
+    if (g_gpuUploadHeap && !f.ringAlt && wantVram != f.ringInVram)
+    {
+        if (wantVram)
+            f.ringAlt = CreateGpuUploadRing(f.ringSize, f.ringAltCpu);
+        else if ((f.ringAlt = CreateBuffer(f.ringSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)))
+            f.ringAlt->Map(0, nullptr, reinterpret_cast<void**>(&f.ringAltCpu));
+        f.ringAltSize = f.ringAlt ? f.ringSize : 0;
+    }
+    if (f.ringAlt && wantVram != f.ringInVram)
+    {
+        std::swap(f.ring, f.ringAlt);
+        std::swap(f.ringCpu, f.ringAltCpu);
+        std::swap(f.ringSize, f.ringAltSize);
+        f.ringInVram = !f.ringInVram;
+        if (frameIndex == 0 && !ringAuto.on)
+            Log("renderer: upload ring in %s", f.ringInVram ? "VRAM (GPU upload heap)" : "system memory");
+        if (!keepBoth && !ringAuto.on)
+        {
+            f.garbage.push_back(f.ringAlt);
+            f.ringAlt.Reset();
+            f.ringAltCpu = nullptr;
+            f.ringAltSize = 0;
+        }
+    }
     if (const UINT64 want = g_ringWant.load(); want > f.ringSize)
     {
         f.garbage.push_back(f.ring); // the old ring may still be referenced by views until this frame's end
-        f.ring = CreateBuffer(want, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-        f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
+        uint8_t* cpu = nullptr;
+        f.ring = f.ringInVram ? CreateGpuUploadRing(want, cpu) : CreateBuffer(want, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (f.ringInVram && f.ring)
+            f.ringCpu = cpu;
+        else
+            f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
         f.ringSize = want;
         Log("renderer: upload ring grown to %llu MB", (unsigned long long)(want >> 20));
     }
     f.ringUsed = 0;
+    g_ringGeneration.fetch_add(1, std::memory_order_relaxed); // (threads' ring chunks from before are void: RingAlloc)
     f.uploads.clear();
     // Guest memory not mapped at init: try again a few times (see MapGuestMemory).
     if (!g_r.physical && (g_r.frame == 30 || g_r.frame == 120 || g_r.frame == 600 || g_r.frame == 2400) && !getenv("REGPU_NO_MAP_RETRY"))
@@ -2750,7 +3986,12 @@ void BeginFrameIfNeeded()
         raw.Buffer.NumElements = UINT(f.ringSize / 4);
         raw.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
         g_r.device->CreateShaderResourceView(f.ring.Get(), &raw, Cpu(g_r.srvHeap.Get(), f.descriptorBase, g_r.srvStride));
-        if (g_r.physical)
+        if (ID3D12Resource* arena = VertexCacheBeginFrame())
+        {
+            raw.Buffer.NumElements = UINT(arena->GetDesc().Width / 4);
+            g_r.device->CreateShaderResourceView(arena, &raw, Cpu(g_r.srvHeap.Get(), f.descriptorBase + 1, g_r.srvStride));
+        }
+        else if (g_r.physical)
         {
             raw.Buffer.NumElements = UINT(g_r.physical->GetDesc().Width / 4);
             g_r.device->CreateShaderResourceView(g_r.physical.Get(), &raw, Cpu(g_r.srvHeap.Get(), f.descriptorBase + 1, g_r.srvStride));
@@ -2760,21 +4001,66 @@ void BeginFrameIfNeeded()
     }
     f.descriptorsUsed = 2;
     EvictBindless();
-    EvictTextures();
     ReclaimTextureBlocks();
     ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() };
     C().list->SetDescriptorHeaps(g_r.samplerHeap ? 2 : 1, heaps);
     C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
     g_drawState.Invalidate();
+    EvictSurfaces();
     SelectSurfaces(true);
     C().list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_r.listOpen = true;
 }
 
 // Allocates from the frame's upload ring; returns the offset (or ~0).
-UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256)
+UINT64 RingAlloc(UINT64 bytes, UINT64 alignment, RingKind kind)
 {
+    if (g_traceRingKinds)
+    {
+        g_ringKindBytes[kind].fetch_add(bytes, std::memory_order_relaxed);
+        g_ringKindCount[kind].fetch_add(1, std::memory_order_relaxed);
+    }
     FrameResources& f = Frame();
+    // Small allocations come from a 64 KB chunk this thread took from the ring: one locked compare-and-swap per chunk,
+    // not per allocation (two to three a draw). A locked instruction waits for the draw's write-combined ring writes to
+    // drain (PGR3 port, session 4: RingAlloc 4.4% of the draw thread, nearly all on its compare-and-swap). A chunk is
+    // void once the ring is reset (g_ringGeneration) or the frame's resources change. REGPU_NO_RING_CHUNKS=1: every
+    // allocation from the ring as before (live).
+    static LiveSwitch noChunks("REGPU_NO_RING_CHUNKS");
+    constexpr UINT64 kChunk = 64 << 10;
+    struct Chunk
+    {
+        const FrameResources* f = nullptr;
+        uint64_t generation = ~0ull;
+        UINT64 at = 0, end = 0;
+    };
+    thread_local Chunk chunk;
+    if (!noChunks && bytes <= kChunk / 4 && alignment <= 256)
+    {
+        const uint64_t generation = g_ringGeneration.load(std::memory_order_relaxed);
+        if (chunk.f == &f && chunk.generation == generation)
+        {
+            const UINT64 offset = (chunk.at + alignment - 1) & ~(alignment - 1);
+            if (offset + bytes <= chunk.end)
+            {
+                chunk.at = offset + bytes;
+                return offset;
+            }
+        }
+        UINT64 used = f.ringUsed.load(std::memory_order_relaxed), start;
+        for (;;)
+        {
+            start = (used + 255) & ~UINT64(255);
+            if (start + kChunk > f.ringSize || f.ringUsed.compare_exchange_weak(used, start + kChunk, std::memory_order_relaxed))
+                break;
+        }
+        if (start + kChunk <= f.ringSize)
+        {
+            chunk = { &f, generation, start + bytes, start + kChunk };
+            return start; // (256-aligned)
+        }
+        // Full: the allocation itself below (grows the ring, logs).
+    }
     UINT64 used = f.ringUsed.load(std::memory_order_relaxed), offset;
     for (;;)
     {
@@ -2965,7 +4251,7 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
         static std::atomic<uint32_t> logged{ 0 };
         if (logged++ < 8)
             Log("upload: %08X (%u bytes) is not all readable guest memory: %zu bytes copied, zeros after", guest, bytes, readable);
-        const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16);
+        const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16, RingVertexUpload);
         if (offset != ~0ull)
         {
             memcpy(f.ringCpu + offset, src, readable);
@@ -3082,7 +4368,7 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
     if (g_perfTiming) g_uploadStats.copied += bytes;
     if (RendererTracing() && bytes > (16u << 10))
         Log("upload: %08X %u bytes (ring %llu)", guest, bytes, (unsigned long long)f.ringUsed.load());
-    const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16);
+    const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16, RingVertexUpload);
     if (offset == ~0ull)
         return offset;
     memcpy(f.ringCpu + offset, src, bytes);
@@ -3120,6 +4406,7 @@ struct IndexArena
     std::vector<Copy> pending;
 } g_indexArena;
 
+// (The vertex arena, VertexArena, follows FlushIndexCopies.)
 // This frame's index uploads, copied into the arena once its draws are recorded.
 void FlushIndexCopies()
 {
@@ -3139,11 +4426,549 @@ void FlushIndexCopies()
     arena.pending.clear();
 }
 
+// REGPU_VERTEX_ARENA=1 (start-time): large vertex buffers kept in a 512 MB arena in video memory, bound as t1 in
+// place of the mapped guest memory, and copied again only when one of their pages was written (Host::watchArm /
+// watchClean: the port makes their pages read-only and catches the write; without them, or where memory can't be
+// made read-only, each is hashed once a frame). Read in place, the GPU fetches vertices from system memory over
+// PCIe in every draw (the FM2 port: 152.7 -> 192.5 fps at 1440p 8x MSAA on an RTX 4070). With the arena bound,
+// indices aren't read in place either: triangle lists and strips are real indexed draws (the index arena), the
+// other primitives are expanded on the CPU. Where guest memory is mapped and the watch fails, the arena turns
+// itself off from the next frame (hashing everything each frame was slower than reading in place in FM2).
+// From the FM2 port (MIT), fitted to this renderer. REGPU_NO_VERTEX_ARENA=1 (live, from the next frame): off.
+struct VertexArena
+{
+    static constexpr uint64_t kBytes = 512ull << 20;
+    ComPtr<ID3D12Resource> buffer;
+    uint64_t used = 0;
+    std::unordered_map<uint32_t, std::vector<uint64_t>> free; // offsets by size class (log2)
+    struct Entry
+    {
+        uint64_t offset = 0, hash = 0, checkedFrame = ~0ull;
+        uint32_t sizeClass = 0;
+        uint64_t staged = ~0ull, stagedFrame = ~0ull; // this frame's copy in the upload ring
+        bool watched = false;      // its pages were armed when it was last copied
+        uint64_t copiedSeq = 0;    // the watch's sequence then: a page written after it is a change
+        bool hashed = false;       // can't be watched: hashed each frame
+        uint32_t changes = 0;      // checks in a row that found it changed
+        uint64_t dynamicUntil = 0; // changing every frame: copied each frame, unwatched, until then
+    };
+    std::unordered_map<uint64_t, Entry> entries;
+    bool full = false;
+    std::vector<IndexArena::Copy> pending;
+    uint64_t hashed = 0, uploaded = 0, hits = 0, frames = 0; // for the log line
+    bool watchFailed = false;
+    std::atomic<uint32_t> generation{ 0 }; // bumped when the arena starts over (VertexCache's per-thread memo)
+} g_vertexArena;
+
+// Decided at each frame's start (t1 is bound then).
+bool g_vertexCacheThisFrame = false;
+
+ID3D12Resource* VertexCacheBeginFrame()
+{
+    VertexArena& arena = g_vertexArena;
+    g_vertexCacheThisFrame = false;
+    static const bool on = getenv("REGPU_VERTEX_ARENA") && strcmp(getenv("REGPU_VERTEX_ARENA"), "0") != 0;
+    static LiveSwitch off("REGPU_NO_VERTEX_ARENA");
+    if (!on || off)
+        return nullptr;
+    const regpu::Host& host = regpu::GetHost();
+    const bool watch = host.watchArm && host.watchClean && host.watchSeq;
+    if (g_r.physical && (arena.watchFailed || !watch))
+    {
+        static bool logged = false;
+        if (!logged)
+            Log("vertex arena: off, vertex data is read in place (guest memory can't be write-watched)");
+        logged = true;
+        return nullptr;
+    }
+    if (!arena.buffer)
+    {
+        arena.buffer = CreateBuffer(VertexArena::kBytes, D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Log("vertex arena: %s", arena.buffer ? "512 MB on the GPU for large vertex buffers" : "couldn't be created");
+    }
+    g_vertexCacheThisFrame = arena.buffer != nullptr;
+    // Every 3600 frames: how much it hashed and copied.
+    if (arena.buffer && ++arena.frames == 3600)
+    {
+        Log("vertex arena: %.1f MB hashed, %.2f MB copied, %.0f hits a frame; %llu MB of %llu used, %zu buffers%s",
+            double(arena.hashed) / 3600.0 / 1048576.0, double(arena.uploaded) / 3600.0 / 1048576.0, double(arena.hits) / 3600.0,
+            (unsigned long long)(arena.used >> 20), (unsigned long long)(VertexArena::kBytes >> 20), arena.entries.size(),
+            watch ? "" : " (no write watch: hashed)");
+        arena.hashed = arena.uploaded = arena.hits = arena.frames = 0;
+    }
+    return arena.buffer.Get();
+}
+
+void FlushVertexCopies()
+{
+    VertexArena& arena = g_vertexArena;
+    if (arena.pending.empty())
+        return;
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = arena.buffer.Get();
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    C().list->ResourceBarrier(1, &b);
+    for (const auto& c : arena.pending)
+        C().list->CopyBufferRegion(arena.buffer.Get(), c.to, c.ring, c.from, c.bytes);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    C().list->ResourceBarrier(1, &b);
+    arena.pending.clear();
+}
+
+// Where a large vertex buffer is this frame: its offset in the arena (arenaHit, read through t1) or in the
+// upload ring (new or changed: copied into the arena at the frame's end). ~0 when neither has room.
+uint64_t VertexCacheLocked(uint32_t address, uint32_t bytes, bool& arenaHit)
+{
+    VertexArena& arena = g_vertexArena;
+    const regpu::Host& host = regpu::GetHost();
+    const bool watch = host.watchArm && host.watchClean && host.watchSeq;
+    arenaHit = false;
+    if (bytes > (64u << 20))
+        return ~0ull;
+    if (arena.full && arena.entries.size())
+    {
+        Log("vertex arena: full, starting over (%zu buffers)", arena.entries.size());
+        arena.generation.fetch_add(1, std::memory_order_relaxed);
+        arena.entries.clear();
+        arena.free.clear();
+        arena.used = 0;
+        arena.full = false;
+    }
+    const uint64_t key = uint64_t(address) << 32 ^ bytes;
+    auto [it, inserted] = arena.entries.try_emplace(key);
+    VertexArena::Entry& e = it->second;
+    if (inserted)
+    {
+        uint32_t sizeClass = 12; // 4 KB
+        while ((1ull << sizeClass) < bytes)
+            sizeClass++;
+        auto& list = arena.free[sizeClass];
+        if (!list.empty())
+        {
+            e.offset = list.back();
+            list.pop_back();
+        }
+        else if (arena.used + (1ull << sizeClass) <= VertexArena::kBytes)
+        {
+            e.offset = arena.used;
+            arena.used += 1ull << sizeClass;
+        }
+        else
+        {
+            arena.entries.erase(it);
+            arena.full = true;
+            return ~0ull;
+        }
+        e.sizeClass = sizeClass;
+    }
+    if (e.checkedFrame == g_r.frame)
+    {
+        if (e.stagedFrame == g_r.frame)
+            return e.staged;
+        arenaHit = true;
+        arena.hits++;
+        return e.offset;
+    }
+    e.checkedFrame = g_r.frame;
+    const uint8_t* src = GuestPtr<uint8_t>(GpuPhysToGuest(address));
+    const uint32_t physical = address & 0x1FFFFFFF;
+    // Changed? Watched: unchanged while none of its pages was written since the copy. REGPU_VERTEX_HASH=1 hashes
+    // every byte each frame instead (A/B).
+    static LiveSwitch hashOnly("REGPU_VERTEX_HASH");
+    const bool hashing = hashOnly || e.hashed || !watch;
+    uint64_t hash = 0;
+    bool unchanged;
+    if (hashing)
+    {
+        hash = FullHash(src, bytes);
+        arena.hashed += bytes;
+        unchanged = !inserted && hash == e.hash;
+    }
+    else
+        unchanged = !inserted && e.watched && host.watchClean(physical, bytes, e.copiedSeq);
+    // REGPU_VERTEX_VERIFY=1 (diagnostic): a buffer the watch calls unchanged is hashed anyway; one that changed
+    // without a write seen is logged (the first 20) and copied.
+    static LiveSwitch verify("REGPU_VERTEX_VERIFY");
+    if (verify && !hashing)
+    {
+        const uint64_t now = FullHash(src, bytes);
+        if (unchanged && e.hash && now != e.hash)
+        {
+            static int logged = 0;
+            if (logged++ < 20)
+                Log("vertex arena: %08X (%u bytes, frame %llu) changed with no write seen", address, bytes, (unsigned long long)g_r.frame);
+            unchanged = false;
+        }
+        hash = now;
+    }
+    if (unchanged)
+    {
+        e.changes = 0;
+        arenaHit = true;
+        arena.hits++;
+        return e.offset;
+    }
+    const UINT64 offset = RingAlloc((bytes + 15) & ~15u, 16, RingVertexArena);
+    if (offset == ~0ull)
+    {
+        e.checkedFrame = ~0ull; // not staged: checked again next time
+        return ~0ull;
+    }
+    // Rewritten frame after frame (or sharing pages with data that is): watching it would fault on every write,
+    // so it is copied each frame for a while, then watched again.
+    if (!inserted && ++e.changes >= 4)
+    {
+        e.dynamicUntil = g_r.frame + 120;
+        e.changes = 0;
+    }
+    e.watched = !hashing && g_r.frame >= e.dynamicUntil;
+    e.copiedSeq = watch ? host.watchSeq() + 1 : 0; // (a write between now and the copy counts as after it)
+    if (e.watched && !host.watchArm(physical, bytes)) // before the copy: a write after it faults and is seen
+    {
+        e.watched = false;
+        e.hashed = true;
+        if (!arena.watchFailed)
+            Log("vertex arena: guest memory can't be write-watched (%08X)%s", address,
+                g_r.physical ? ": off from the next frame, read in place" : ": buffers are hashed");
+        arena.watchFailed = true;
+    }
+    if (e.hashed && !hash)
+        hash = FullHash(src, bytes);
+    memcpy(Frame().ringCpu + offset, src, bytes);
+    arena.uploaded += bytes;
+    e.staged = offset;
+    e.stagedFrame = g_r.frame;
+    arena.pending.push_back({ Frame().ring.Get(), offset, e.offset, bytes });
+    e.hash = hash;
+    return offset;
+}
+
+// A buffer is checked once a frame (VertexCacheLocked: checkedFrame); later draws in the frame get the same answer.
+// Each thread remembers this frame's answers, so those draws skip the texture mutex (FM3 port, session 25: its
+// lock and release were ~3% of the draw thread, ~2,600 arena hits a frame). Forgotten when the arena starts over.
+// REGPU_NO_VERTEX_MEMO=1: every draw asks under the lock, as before (live).
+uint64_t VertexCache(uint32_t address, uint32_t bytes, bool& arenaHit)
+{
+    struct Known
+    {
+        uint64_t key = 0, frame = ~0ull, at = 0;
+        uint32_t generation = 0;
+        bool hit = false;
+    };
+    thread_local Known known[1024];
+    static LiveSwitch noMemo("REGPU_NO_VERTEX_MEMO");
+    const uint64_t key = uint64_t(address) << 32 | bytes;
+    Known& k = known[(key * 0x9E3779B97F4A7C15ull) >> 54];
+    const uint32_t generation = g_vertexArena.generation.load(std::memory_order_relaxed);
+    if (!noMemo && k.key == key && k.frame == g_r.frame && k.generation == generation)
+    {
+        arenaHit = k.hit;
+        return k.at;
+    }
+    std::lock_guard textureLock(g_textureMutex);
+    const uint64_t at = VertexCacheLocked(address, bytes, arenaHit);
+    if (at != ~0ull)
+        k = { key, g_r.frame, at, g_vertexArena.generation.load(std::memory_order_relaxed), arenaHit };
+    return at;
+}
+
+
 // The view of the guest index buffer at physical address `base` (count indices), swapped
 // into the arena; false when it cannot be cached (the draw fetches indices itself).
 bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view, uint64_t hash);
 thread_local bool g_indexChanging = false; // set by GetIndexBufferLocked: the entry is checked at every draw
 // Each thread remembers this frame's index buffers (checked once per frame), except ones seen changing.
+// ---- Hyper mesh decimation and vertex-cache order (from the FM2 port's hyper-prototype, MIT; FM3 port session 43).
+// A triangle-list draw of a big mesh gets an index buffer of its own: the same vertices, with REGPU_HYPER_DECIMATE=<10-90>
+// fewer triangles (percent kept; meshoptimizer's simplifier, borders locked so pieces still meet) and/or, with
+// REGPU_HYPER_VCACHE=1|2, the triangles reordered for the post-transform vertex cache (2: also for less overdraw; same
+// triangles, lossless). Positions come from the vertex shader's first full fetch (TranslatedShader::positionFetch),
+// read from guest memory; the work runs on a worker thread, and until a mesh is done (or for meshes it can't help) the
+// draw uses its own indices. Keyed by the index data's address, size and content and the vertex buffer. Needs
+// meshoptimizer (REGPU_MESHOPT_DIR at build time); without it both switches only log that.
+// Tuning: REGPU_HYPER_DECIMATE_MIN=<indices> smallest mesh (300), REGPU_HYPER_DECIMATE_ERROR=<0-1> largest change (0.2).
+bool DynamicBuffer(uint32_t address, uint32_t bytes);
+namespace hyperdec
+{
+uint32_t DecimatePercent()
+{
+    static const uint32_t v = [] {
+        const char* e = getenv("REGPU_HYPER_DECIMATE");
+        const int n = e && *e ? atoi(e) : 0;
+        return n <= 0 || n >= 100 ? 0u : uint32_t(std::clamp(n, 10, 90));
+    }();
+    return v;
+}
+int Vcache()
+{
+    static const int v = getenv("REGPU_HYPER_VCACHE") ? std::clamp(atoi(getenv("REGPU_HYPER_VCACHE")), 0, 2) : 0;
+    return v;
+}
+#if REGPU_MESHOPT
+struct Mesh
+{
+    std::atomic<int> state{ 0 }; // 0 queued, 1 ready, 2 left as it is
+    std::vector<uint32_t> indices; // the result: vertex IDs as in the source
+    uint64_t hash = 0, checkedFrame = ~0ull;
+    ComPtr<ID3D12Resource> buffer;
+    D3D12_INDEX_BUFFER_VIEW view{};
+    uint32_t count = 0;
+};
+struct Job
+{
+    std::shared_ptr<Mesh> mesh;
+    std::vector<uint32_t> indices; // rebased to the first vertex
+    std::vector<float> positions;  // xyz per vertex
+    uint32_t firstVertex = 0, target = 0;
+};
+std::mutex g_mutex;
+std::condition_variable g_cv;
+std::deque<Job> g_jobs;
+std::unordered_map<uint64_t, std::shared_ptr<Mesh>> g_meshes;
+std::atomic<uint32_t> g_done{ 0 }, g_kept{ 0 };
+
+void Worker()
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;)
+    {
+        Job job;
+        {
+            std::unique_lock lock(g_mutex);
+            g_cv.wait(lock, [] { return !g_jobs.empty(); });
+            job = std::move(g_jobs.front());
+            g_jobs.pop_front();
+        }
+        const size_t vertices = job.positions.size() / 3;
+        std::vector<uint32_t> out(job.indices.size());
+        size_t n = job.indices.size();
+        float error = 0;
+        if (DecimatePercent())
+        {
+            static const float maxError = getenv("REGPU_HYPER_DECIMATE_ERROR") ? float(atof(getenv("REGPU_HYPER_DECIMATE_ERROR"))) : 0.2f;
+            n = meshopt_simplify(out.data(), job.indices.data(), job.indices.size(), job.positions.data(), vertices, 12, job.target, maxError,
+                meshopt_SimplifyLockBorder, &error);
+        }
+        const bool cut = DecimatePercent() && n >= 3 && n < job.indices.size() * 9 / 10;
+        if (!cut)
+        {
+            out = job.indices;
+            n = out.size();
+        }
+        if (Vcache() > 0 && n >= 3)
+        {
+            std::vector<uint32_t> tmp(n);
+            meshopt_optimizeVertexCache(tmp.data(), out.data(), n, vertices);
+            if (Vcache() >= 2)
+                meshopt_optimizeOverdraw(out.data(), tmp.data(), n, job.positions.data(), vertices, 12, 1.05f);
+            else
+                std::copy(tmp.begin(), tmp.end(), out.begin());
+        }
+        if (cut || (Vcache() > 0 && n >= 3))
+        {
+            out.resize(n);
+            for (uint32_t& i : out)
+                i += job.firstVertex;
+            job.mesh->indices = std::move(out);
+            job.mesh->state.store(1, std::memory_order_release);
+            g_done++;
+        }
+        else
+        {
+            job.mesh->state.store(2, std::memory_order_release);
+            g_kept++;
+        }
+    }
+}
+
+uint32_t Word(const uint8_t* p, uint32_t endian)
+{
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return endian == 2 ? __builtin_bswap32(v) : endian == 1 ? ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu) : v;
+}
+
+float Half(uint16_t h)
+{
+    const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
+    const float v = e ? std::ldexp(1.0f + m / 1024.0f, int(e) - 15) : std::ldexp(m / 1024.0f, -14);
+    return s ? -v : v;
+}
+
+// The vertex's position, false for formats it can't read.
+bool Position(const uint8_t* v, uint32_t format, uint32_t endian, float* xyz)
+{
+    const bool isSigned = format & 0x100;
+    switch (format & 0xFF)
+    {
+    case 57: // 32_32_32_FLOAT
+    case 38: // 32_32_32_32_FLOAT
+        for (int i = 0; i < 3; i++)
+        {
+            const uint32_t w = Word(v + i * 4, endian);
+            memcpy(&xyz[i], &w, 4);
+        }
+        return std::isfinite(xyz[0]) && std::isfinite(xyz[1]) && std::isfinite(xyz[2]);
+    case 26: // 16_16_16_16
+    {
+        const uint32_t w0 = Word(v, endian), w1 = Word(v + 4, endian);
+        const uint32_t u[3] = { w0 & 0xFFFF, w0 >> 16, w1 & 0xFFFF };
+        for (int i = 0; i < 3; i++)
+            xyz[i] = isSigned ? float(int16_t(u[i])) : float(u[i]);
+        return true;
+    }
+    case 32: // 16_16_16_16_FLOAT
+    {
+        const uint32_t w0 = Word(v, endian), w1 = Word(v + 4, endian);
+        xyz[0] = Half(uint16_t(w0));
+        xyz[1] = Half(uint16_t(w0 >> 16));
+        xyz[2] = Half(uint16_t(w1));
+        return std::isfinite(xyz[0]) && std::isfinite(xyz[1]) && std::isfinite(xyz[2]);
+    }
+    }
+    return false;
+}
+#endif
+
+// Replaces view and drawCount with the mesh's own index buffer when it has one ready.
+void Apply(const TranslatedShader& vs, uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view, uint32_t& drawCount)
+{
+    if (!DecimatePercent() && !Vcache())
+        return;
+#if !REGPU_MESHOPT
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        Log("hyper decimate: REGPU_HYPER_DECIMATE / REGPU_HYPER_VCACHE need meshoptimizer (REGPU_MESHOPT_DIR): built without it");
+    }
+    (void)vs, (void)base, (void)count, (void)is32, (void)endian, (void)view, (void)drawCount;
+#else
+    static const uint32_t kMinIndices = getenv("REGPU_HYPER_DECIMATE_MIN") ? uint32_t(atoi(getenv("REGPU_HYPER_DECIMATE_MIN"))) : 300;
+    static uint64_t seen = 0, tooSmall = 0, noFetch = 0, dynamic = 0, used = 0, logFrame = 0;
+    seen++;
+    if (g_r.frame >= logFrame + 600)
+    {
+        logFrame = g_r.frame;
+        Log("hyper decimate: %llu draws, %llu small, %llu no position fetch, %llu dynamic, %llu with their own indices; meshes %u done, %u kept "
+            "(decimate %u%%, vertex cache %d)",
+            (unsigned long long)seen, (unsigned long long)tooSmall, (unsigned long long)noFetch, (unsigned long long)dynamic, (unsigned long long)used,
+            g_done.load(), g_kept.load(), DecimatePercent(), Vcache());
+    }
+    if (count < kMinIndices)
+        return void(tooSmall++);
+    if (!vs.positionFetch[0] || C().worker)
+        return void(noFetch++);
+    const uint32_t k = vs.positionFetch[0] - 1, format = vs.positionFetch[1], stride = vs.positionFetch[2], offset = vs.positionFetch[3];
+    if (!stride || k >= 96)
+        return;
+    const uint32_t d0 = gpureg::Get(gpureg::FetchConstants + k * 2), d1 = gpureg::Get(gpureg::FetchConstants + k * 2 + 1);
+    const uint32_t address = d0 & 0x1FFFFFFC, bytes = ((d1 >> 2) & 0xFFFFFF) * 4, vendian = d1 & 3;
+    if (!address || !bytes || DynamicBuffer(address, bytes))
+        return void(dynamic++);
+    const uint32_t indexOffset = gpureg::Get(VGT_INDX_OFFSET);
+    const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(count) << 2) ^ (uint64_t(address) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(stride) << 56) ^
+        (uint64_t(offset) << 48) ^ indexOffset ^ uint64_t(is32) << 1;
+    static const bool started = [] { std::thread(Worker).detach(); return true; }();
+    (void)started;
+    std::shared_ptr<Mesh>& slot = g_meshes[key];
+    const uint8_t* src = GuestPtr<uint8_t>(GpuPhysToGuest(base));
+    const uint32_t indexBytes = count * (is32 ? 4 : 2);
+    if (slot && slot->checkedFrame != g_r.frame)
+    {
+        slot->checkedFrame = g_r.frame;
+        if (FullHash(src, indexBytes) != slot->hash)
+            slot.reset(); // new content at the same place: made again
+    }
+    if (!slot)
+    {
+        auto mesh = std::make_shared<Mesh>();
+        mesh->hash = FullHash(src, indexBytes);
+        mesh->checkedFrame = g_r.frame;
+        slot = mesh;
+        Job job;
+        job.mesh = mesh;
+        job.indices.resize(count);
+        uint32_t lo = ~0u, hi = 0;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            uint32_t v;
+            if (is32)
+                v = Word(src + i * 4, endian);
+            else
+            {
+                uint16_t h;
+                memcpy(&h, src + i * 2, 2);
+                v = endian ? __builtin_bswap16(h) : h;
+            }
+            job.indices[i] = v;
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+        }
+        // Vertex ID = index + VGT_INDX_OFFSET; each within the fetch constant's buffer.
+        if (hi - lo > 1u << 20 || (uint64_t(hi) + indexOffset) * stride * 4 + uint64_t(offset) * 4 + 16 > bytes)
+        {
+            mesh->state = 2;
+            return;
+        }
+        job.firstVertex = lo;
+        job.positions.resize(size_t(hi - lo + 1) * 3);
+        const uint8_t* vb = GuestPtr<uint8_t>(GpuPhysToGuest(address));
+        for (uint32_t v = lo; v <= hi; v++)
+            if (!Position(vb + ((uint64_t(v) + indexOffset) * stride + offset) * 4, format, vendian, &job.positions[size_t(v - lo) * 3]))
+            {
+                static int logged = 0;
+                if (logged++ < 8)
+                    Log("hyper decimate: position format %u (signed %d) not read", format & 0xFF, (format >> 8) & 1);
+                mesh->state = 2;
+                return;
+            }
+        for (uint32_t& i : job.indices)
+            i -= lo;
+        job.target = uint32_t(uint64_t(count) * std::max(DecimatePercent(), 1u) / 100 / 3 * 3);
+        std::lock_guard lock(g_mutex);
+        g_jobs.push_back(std::move(job));
+        g_cv.notify_one();
+        return;
+    }
+    Mesh& m = *slot;
+    if (m.state.load(std::memory_order_acquire) != 1)
+        return;
+    if (!m.buffer)
+    {
+        const UINT64 size = UINT64(m.indices.size()) * (is32 ? 4 : 2);
+        m.buffer = CreateBuffer((size + 255) & ~255ull, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (!m.buffer)
+        {
+            m.state = 2;
+            return;
+        }
+        uint8_t* p = nullptr;
+        const D3D12_RANGE none{ 0, 0 };
+        m.buffer->Map(0, &none, reinterpret_cast<void**>(&p));
+        for (size_t i = 0; i < m.indices.size(); i++)
+            if (is32)
+                memcpy(p + i * 4, &m.indices[i], 4);
+            else
+            {
+                const uint16_t h = uint16_t(m.indices[i]);
+                memcpy(p + i * 2, &h, 2);
+            }
+        m.buffer->Unmap(0, nullptr);
+        m.view = { m.buffer->GetGPUVirtualAddress(), UINT(size), is32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT };
+        m.count = uint32_t(m.indices.size());
+        m.indices = {};
+    }
+    view = m.view;
+    drawCount = m.count;
+    used++;
+#endif
+}
+} // namespace hyperdec
+
 bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view)
 {
     thread_local FrameMap<D3D12_INDEX_BUFFER_VIEW> known;
@@ -3316,7 +5141,7 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
         g_indexChanging = !checkOnce;
     }
     // Swap into the upload ring (as the vertex shader would read them), then copy.
-    const UINT64 offset = RingAlloc((bytes + 15) & ~15u, 16);
+    const UINT64 offset = RingAlloc((bytes + 15) & ~15u, 16, RingIndexBuffer);
     if (offset == ~0ull)
         return false;
     uint8_t* dst = Frame().ringCpu + offset;
@@ -3579,7 +5404,8 @@ struct Manifest
             PipelineKey k{};
             unsigned long long vs, ps;
             // (Older manifests end at the flags: no polygon offset.)
-            if (sscanf(line.c_str(), "P %llx %llx %x %x %x %x %x %x", &vs, &ps, &k.blend, &k.depth, &k.stencilMaskMode, &k.flags, &k.biasScale, &k.biasOffset) >= 6)
+            if (sscanf(line.c_str(), "P %llx %llx %x %x %x %x %x %x %x", &vs, &ps, &k.blend, &k.depth, &k.stencilMaskMode, &k.flags, &k.biasScale, &k.biasOffset,
+                    &k.fetchMask) >= 6)
             {
                 k.vs = vs;
                 k.ps = ps;
@@ -3591,14 +5417,24 @@ struct Manifest
         g_stats.warmTotal = uint32_t(pending.size());
         Log("renderer: manifest lists %zu pipelines to rebuild", pending.size());
     }
-    void RecordPipeline(const PipelineKey& k)
+    void RecordPipeline(const PipelineKey& key)
     {
+        // A fetch specialisation (mask with bit 31) is written as its base pipeline (no mask: the specialisation can't be
+        // made again from the manifest). Known as written, so it is written once, not again every run (FM3 port, session
+        // 40: one such line 769 times, an 11 MB manifest).
+        PipelineKey k = key;
+        if (k.fetchMask >> 31)
+            k.fetchMask = 0;
         std::lock_guard lock(mutex);
         if (!known.insert(k).second)
             return;
         g_diskWriter.Push([k] {
-            std::ofstream(Path(), std::ios::app) << "P " << std::hex << k.vs << ' ' << k.ps << ' ' << k.blend << ' ' << k.depth << ' '
-                                                  << k.stencilMaskMode << ' ' << k.flags << ' ' << k.biasScale << ' ' << k.biasOffset << '\n';
+            std::ofstream out(Path(), std::ios::app);
+            out << "P " << std::hex << k.vs << ' ' << k.ps << ' ' << k.blend << ' ' << k.depth << ' ' << k.stencilMaskMode << ' ' << k.flags << ' '
+                << k.biasScale << ' ' << k.biasOffset;
+            if (k.fetchMask) // (a 9th field only when set: older readers stop at the 8th)
+                out << ' ' << k.fetchMask;
+            out << '\n';
         });
     }
     void RecordShader(bool pixel, uint64_t hash, const std::vector<uint32_t>& codeBE)
@@ -3628,6 +5464,14 @@ struct Manifest
     }
 } g_manifest;
 
+// Seed coverage: every pipeline a draw asks for, counted once, against the host's pipeline seed
+// (BuildSeedPipelines fills g_seedKeys). "Not in the seed" = a first boot on another PC would build
+// it while playing; "built while drawing" = this run had not prepared it (seed, manifest or
+// warm-up) when the draw came. Logged with the 600-frame renderer line when it changes. Guarded by
+// g_shaderMutex.
+std::unordered_set<PipelineKey, PipelineKeyHash> g_seedKeys, g_drawnKeys;
+uint32_t g_drawnPipelines = 0, g_drawnUnseeded = 0, g_drawnUnprepared = 0;
+
 // Shader compilation runs on worker threads so the command processor never
 // stalls on fxc: a draw whose shaders are still compiling is skipped. The
 // bytecode is cached on disk by HLSL hash, so later runs start warm.
@@ -3637,10 +5481,13 @@ struct Manifest
 // session keeps the bytecode its pipelines were built from.
 const bool g_optimizeShaders = getenv("REGPU_OPTIMIZE_SHADERS") != nullptr;
 
-std::filesystem::path ShaderCachePath(uint64_t key, bool optimized = false)
+std::filesystem::path ShaderCachePath(uint64_t key, bool optimized, bool pixel)
 {
-    char name[40];
-    snprintf(name, sizeof(name), optimized ? "%016llx.o.dxbc" : "%016llx.dxbc", (unsigned long long)key);
+    char name[48];
+    if (DxcFor(pixel))
+        snprintf(name, sizeof(name), "%016llx%s.dxil", (unsigned long long)key, DxcCacheTag().c_str());
+    else
+        snprintf(name, sizeof(name), optimized ? "%016llx.o.dxbc" : "%016llx.dxbc", (unsigned long long)key);
     return RegpuUserDir() / "shadercache" / name;
 }
 
@@ -3695,7 +5542,7 @@ struct ShaderOptimizer
                     job.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0,
                     &code, &errors)))
                 continue; // the unoptimised build stays
-            WriteCacheFile(ShaderCachePath(job.key, true), code->GetBufferPointer(), code->GetBufferSize());
+            WriteCacheFile(ShaderCachePath(job.key, true, job.pixel), code->GetBufferPointer(), code->GetBufferSize());
             if (const uint32_t n = ++built; n == 1 || n % 100 == 0)
                 Log("renderer: %u shaders optimised in the background", n);
         }
@@ -3708,9 +5555,9 @@ bool LoadCachedBytecode(CompiledShader& cs)
 {
     for (const bool optimized : { true, false })
     {
-        if (optimized && !g_optimizeShaders)
+        if (optimized && (!g_optimizeShaders || DxcFor(cs.pixel))) // (DXC: one build, already optimised)
             continue;
-        std::ifstream in{ ShaderCachePath(cs.cacheKey, optimized), std::ios::binary | std::ios::ate };
+        std::ifstream in{ ShaderCachePath(cs.cacheKey, optimized, cs.pixel), std::ios::binary | std::ios::ate };
         if (!in)
             continue;
         const auto size = size_t(in.tellg());
@@ -3718,7 +5565,7 @@ bool LoadCachedBytecode(CompiledShader& cs)
             continue;
         in.seekg(0);
         in.read(static_cast<char*>(cs.code->GetBufferPointer()), std::streamsize(size));
-        if (!optimized && g_optimizeShaders)
+        if (!optimized && g_optimizeShaders && !DxcFor(cs.pixel))
             g_optimizer.Push(cs.cacheKey, cs.pixel, cs.info.hlsl);
         return true;
     }
@@ -3738,6 +5585,22 @@ struct ShaderCompiler
     // game never draws) are parked instead: translated, compiled only if a draw promotes them.
     std::atomic<bool> park{ false };
     std::unordered_set<const CompiledShader*> parked;
+    // FM3 port session 43 (the Intel laptop's "every CPU thread at 100%" on a paused grid): once the game runs, background
+    // compiles (static shaders no draw has asked for yet) take at most this many workers, at the lowest priority, so
+    // a weak CPU keeps its cores (and a 15 W chip its power budget) for the game; a draw that needs one promotes it to
+    // the urgent queue, which keeps every worker. Default: 1 on 8 hardware threads or fewer or a UMA GPU, else no
+    // limit (as before). REGPU_COMPILE_BACKGROUND_THREADS=<n> (start-time; 0 = no limit).
+    int backgroundActive = 0; // guarded by mutex
+    static int BackgroundLimit()
+    {
+        static const int n = [] {
+            if (const char* v = getenv("REGPU_COMPILE_BACKGROUND_THREADS"); v && *v)
+                return std::max(0, atoi(v));
+            return std::thread::hardware_concurrency() <= 8 || g_uma ? 1 : 0;
+        }();
+        return n;
+    }
+    bool BackgroundAllowed() const { return !park.load() || !BackgroundLimit() || backgroundActive < BackgroundLimit(); }
 
     void Start()
     {
@@ -3788,22 +5651,28 @@ struct ShaderCompiler
     {
         if (cs.state.load(std::memory_order_relaxed) != CompiledShader::Pending || !waiting.load(std::memory_order_relaxed))
             return;
-        std::lock_guard lock(mutex);
         bool found = false;
-        if (parked.erase(&cs))
-            found = true;
-        else if (auto it = std::find(background.begin(), background.end(), &cs); it != background.end())
         {
-            background.erase(it);
-            found = true;
+            std::lock_guard lock(mutex);
+            if (parked.erase(&cs))
+                found = true;
+            else if (auto it = std::find(background.begin(), background.end(), &cs); it != background.end())
+            {
+                background.erase(it);
+                found = true;
+            }
+            if (found)
+            {
+                waiting--;
+                jobs++;
+                queue.push_front(const_cast<CompiledShader*>(&cs));
+            }
         }
+        // A promoted shader must wake a worker: with every worker asleep (nothing queued, background empty or
+        // throttled) the job stayed queued forever and the draw waiting for it held the GPU (PGR3 port: the race load
+        // hung with "compile jobs 1 (queued 1 ...)" and every compile worker idle).
         if (found)
-        {
-            waiting--;
-            jobs++;
-            queue.push_front(const_cast<CompiledShader*>(&cs));
-            cv.notify_one(); // (idle workers sleep: unwoken, the draw waited for the next shader pushed, up to 180 s)
-        }
+            cv.notify_one();
     }
 
     void Run()
@@ -3815,30 +5684,52 @@ struct ShaderCompiler
             bool urgent;
             {
                 std::unique_lock lock(mutex);
-                cv.wait(lock, [this] { return !queue.empty() || !background.empty(); });
+                cv.wait(lock, [this] { return !queue.empty() || (!background.empty() && BackgroundAllowed()); });
                 urgent = !queue.empty();
                 auto& from = urgent ? queue : background;
                 cs = from.front();
                 from.pop_front();
                 if (!urgent)
+                {
                     waiting--;
+                    backgroundActive++;
+                }
             }
             if (urgent)
             {
                 char label[64];
                 snprintf(label, sizeof(label), "%s %08llx", cs->pixel ? "pixel shader" : "vertex shader", (unsigned long long)(cs->hash >> 32));
                 g_stats.Begin(label);
-                Compile(*cs);
-                g_stats.End(true);
+                g_stats.End(Compile(*cs));
                 jobs--;
             }
             else
+            {
+                const bool throttled = park.load() && BackgroundLimit();
+                if (throttled)
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
                 Compile(*cs);
+                if (throttled)
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                {
+                    std::lock_guard lock(mutex);
+                    backgroundActive--;
+                }
+                cv.notify_one();
+            }
         }
     }
 
-    static void Compile(CompiledShader& cs)
+    // Returns whether it really compiled (false: loaded from the disk cache, or failed). FM3 port, session 40: the
+    // overlay counted every urgent job as a compile, so a shader read from the cache showed "Shader compiler" for 4 s
+    // whenever a menu screen first used it in a session.
+    static bool Compile(CompiledShader& cs)
     {
+        if (cs.loadFirst && LoadCachedBytecode(cs))
+        {
+            cs.state.store(CompiledShader::Ready, std::memory_order_release);
+            return false;
+        }
         ComPtr<ID3DBlob> errors;
         // Runtime compiles skip optimisation: fxc can take minutes on the
         // larger translated shaders.
@@ -3846,23 +5737,26 @@ struct ShaderCompiler
         // The translated source picks its sampling form per stage (see hlsl.cpp: a vertex
         // shader cannot sample with an implicit LOD).
         const D3D_SHADER_MACRO vertexStage[] = { { "REGPU_VERTEX_STAGE", "1" }, { nullptr, nullptr } };
-        const HRESULT hr = D3DCompile(cs.info.hlsl.data(), cs.info.hlsl.size(), nullptr, cs.pixel ? nullptr : vertexStage, nullptr, "main",
-            cs.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &cs.code, &errors);
+        std::string dxcErrors;
+        const HRESULT hr = DxcFor(cs.pixel) ? DxcCompileShader(cs.info.hlsl, cs.pixel, &cs.code, &dxcErrors)
+            : D3DCompile(cs.info.hlsl.data(), cs.info.hlsl.size(), nullptr, cs.pixel ? nullptr : vertexStage, nullptr, "main",
+                  cs.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &cs.code, &errors);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         if (FAILED(hr))
         {
             Log("renderer: %s %016llx failed to compile:\n%s", cs.pixel ? "ps" : "vs", (unsigned long long)cs.hash,
-                errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+                !dxcErrors.empty() ? dxcErrors.c_str() : errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
             cs.state.store(CompiledShader::Failed, std::memory_order_release);
-            return;
+            return false;
         }
         g_stats.shadersBuilt++;
         if (ms > 200)
             Log("renderer: %s %016llx compiled in %.0f ms (background)", cs.pixel ? "ps" : "vs", (unsigned long long)cs.hash, ms);
-        WriteCacheFile(ShaderCachePath(cs.cacheKey), cs.code->GetBufferPointer(), cs.code->GetBufferSize());
-        if (g_optimizeShaders)
+        WriteCacheFile(ShaderCachePath(cs.cacheKey, false, cs.pixel), cs.code->GetBufferPointer(), cs.code->GetBufferSize());
+        if (g_optimizeShaders && !DxcFor(cs.pixel))
             g_optimizer.Push(cs.cacheKey, cs.pixel, cs.info.hlsl);
         cs.state.store(CompiledShader::Ready, std::memory_order_release);
+        return true;
     }
 } g_compiler;
 
@@ -3905,12 +5799,15 @@ std::unordered_map<uint64_t, uint64_t> g_psEditAlias; // shader -> alias
 std::unordered_map<uint64_t, std::string> g_psEditExpr; // alias -> the expression it returns
 std::atomic<bool> g_psEdits{ false };
 std::unordered_set<uint64_t> g_psEditEver; // every alias made (kept out of the pipeline manifest)
+std::atomic<bool> g_psEditAny{ false };    // g_psEditEver has one (IsPsEditAlias's fast path)
 // The debug server's drawstats: draws per (vs, ps) over one frame.
 std::atomic<int> g_drawStats{ 0 }; // 1 armed for the next frame, 2 counting, 0 off
 std::mutex g_drawStatsMutex;
 std::map<std::pair<uint64_t, uint64_t>, uint32_t> g_drawStatsCounts;
 bool IsPsEditAlias(uint64_t hash)
 {
+    if (!g_psEditAny.load(std::memory_order_acquire))
+        return false; // (no live shader edit this session: no lock on the draw path)
     std::lock_guard lock(g_psEditMutex);
     return g_psEditEver.count(hash) != 0;
 }
@@ -4011,6 +5908,11 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
                 cs.info.constantsUsed = base.info.constantsUsed; // same ALU code
                 cs.info.constantMask = base.info.constantMask;
                 cs.info.interpolatorsWritten = base.info.interpolatorsWritten;
+                cs.info.readsBools = base.info.readsBools; // same code
+                cs.info.readsLoops = base.info.readsLoops;
+                cs.info.readsUser = base.info.readsUser;
+                cs.info.readsFetchLayout = true; // its layout comes from vfl
+                cs.info.packedConstants = base.info.packedConstants; // its code
                 cs.info.vertexFetchLayout = std::move(layout.vertexFetchLayout);
                 cs.info.vertexFetchConstants = std::move(layout.vertexFetchConstants);
                 cs.cacheKey = base.cacheKey;
@@ -4050,6 +5952,9 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
     // The game's own fixes to this shader (regpu.h Host::rewriteShader).
     if (const auto rewrite = regpu::GetHost().rewriteShader)
         cs.tag = rewrite(hash, cs.info.hlsl, pixel);
+    ScanBlockUse(cs.info);
+    if (!cs.tag)
+        PackConstants(cs.info, pixel);
     if (g_dumpHlsl)
     {
         std::filesystem::create_directories("out/hlsl");
@@ -4322,6 +6227,501 @@ const CompiledShader* MotionShaderLookup(const CompiledShader& base)
     return &cs;
 }
 
+// REGPU_SPLIT_ALPHA_TEST=1 (live): draws with the alpha test and alpha-to-mask off use a variant of
+// their pixel shader without the run-time alpha test. The test is a switch on pinfo.x ending in
+// `discard`, so every translated pixel shader could discard; on PC GPUs a shader that may discard
+// and writes depth can lose early depth rejection, and hidden pixels then run the whole shader.
+// Xenos tests alpha in fixed function after the shader, so its shaders carry no such kill.
+// (Guest kill instructions stay in both variants.) Built like the motion variant, from the HLSL.
+std::string NoKillVariant(const std::string& hlsl)
+{
+    const size_t a = hlsl.find("    switch (pinfo.x)\n    {\n");
+    const std::string endMark = "// alpha to mask, dithered\n";
+    const size_t b = a == std::string::npos ? std::string::npos : hlsl.find(endMark, a);
+    if (b == std::string::npos || hlsl.find("    switch (pinfo.x)\n", a + 1) != std::string::npos)
+        return {};
+    std::string h = hlsl;
+    h.erase(a, b + endMark.size() - a);
+    return h;
+}
+
+std::unordered_map<uint64_t, std::unique_ptr<CompiledShader>> g_noKillShaders;
+// The variant, made (and its compile queued, unless the shader cache has it) on first use; it may still be
+// pending, or failed. The base shader must be ready (its HLSL).
+const CompiledShader* NoKillVariantOf(const CompiledShader& base)
+{
+    if (const CompiledShader* k = base.noKill)
+        return k;
+    std::lock_guard lock(g_shaderMutex);
+    if (base.noKill)
+        return base.noKill;
+    auto [it, inserted] = g_noKillShaders.try_emplace(base.cacheKey);
+    if (inserted)
+    {
+        it->second = std::make_unique<CompiledShader>();
+        CompiledShader& cs = *it->second;
+        cs.hash = base.hash;
+        cs.pixel = true;
+        cs.ucodeBE = base.ucodeBE; // the pipeline manifest stores the base microcode
+        cs.info = base.info;
+        cs.info.hlsl = NoKillVariant(base.info.hlsl);
+        if (cs.info.hlsl.empty())
+        {
+            LOG_ONCE("renderer: no alpha-test-free variant for ps %016llx", (unsigned long long)base.hash);
+            cs.state = CompiledShader::Failed;
+        }
+        else
+        {
+            cs.cacheKey = Fnv(cs.info.hlsl.data(), cs.info.hlsl.size(), 3);
+            if (auto bc = g_bytecode.find(cs.cacheKey); bc != g_bytecode.end())
+            {
+                cs.code = bc->second;
+                cs.state = CompiledShader::Ready;
+            }
+            else if (LoadCachedBytecode(cs))
+            {
+                cs.state = CompiledShader::Ready;
+                g_bytecode.emplace(cs.cacheKey, cs.code);
+            }
+            else
+                g_compiler.Push(&cs, false);
+        }
+    }
+    base.noKill = it->second.get();
+    return base.noKill;
+}
+// nullptr until the variant is compiled (the draw uses the base shader meanwhile) or if it can't be made.
+const CompiledShader* NoKillShader(const CompiledShader& base)
+{
+    const CompiledShader* k = NoKillVariantOf(base);
+    return k && k->IsReady() ? k : nullptr;
+}
+// REGPU_FETCH_VARIANTS (live; PERF-PLAN L30 in the FM3 port): a pixel shader's variant in which the lean 2D
+// fetches (TFetch2D / TFetch2DV2, REGPU_LEAN_FETCH) of the slots in `mask` call TFetchPlain instead: the
+// texture is sampled with the fetch constant's sampler and nothing else. The draw picks the mask from the
+// slots whose fetch constant is "plain" this draw (2D, the whole image, no 16-bit fixed conversion, exponent,
+// border, single-axis clamp, gamma, mirror or swizzle other than the identity: the same test as
+// REGPU_LEAN_FETCH=2's bit 7, made on the CPU every draw), so the result is the full path's. What it saves is
+// code: every TFetch2D carries all those paths, and FM3's car paint shader came to 117 KB of RDNA3 code
+// (21,886 instructions, 236 sample instructions for 17 fetches) where the instruction cache holds 32 KB.
+// Built from the HLSL like the alpha-test-free variant (of whichever of the two the draw uses).
+std::string FetchVariant(const std::string& hlsl, uint32_t mask)
+{
+    static const char* kPlain = R"(
+float4 TFetchPlain(uint slot, float3 coord, bool denorm, float bias, float2 texel, int filt)
+{
+    const uint info = tinfo[slot].x;
+    uint mode = info & 3u;
+    if (filt >= 0)
+    {
+        const bool wrap = mode == 0u || mode == 3u;
+        mode = filt == 0 ? (wrap ? 3u : 2u) : (wrap ? 0u : 1u);
+    }
+    const uint aniso = (info >> 20) & 7u;
+    const uint s = mode != 0u ? mode : (aniso >= 1u && aniso <= 4u ? aniso + 3u : 0u);
+    const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
+    const float2 uv = denorm ? (coord.xy + texel) / texelSize : coord.xy + texel / texelSize;
+    return gtex[asuint(tbias[slot].y)].SampleBias(gsamp[s], uv, bias);
+}
+
+)";
+    std::string out;
+    out.reserve(hlsl.size() + 1024);
+    size_t pos = 0, replaced = 0;
+    for (;;)
+    {
+        const size_t at = hlsl.find("TFetch2D", pos);
+        if (at == std::string::npos)
+            break;
+        const bool v2 = hlsl.compare(at, 11, "TFetch2DV2(") == 0;
+        const size_t open = at + (v2 ? 10 : 8);
+        const size_t num = open + 1;
+        size_t end = num;
+        while (end < hlsl.size() && isdigit(uint8_t(hlsl[end])))
+            end++;
+        const bool call = open < hlsl.size() && hlsl[open] == '(' && end > num && end < hlsl.size() && hlsl[end] == ',' &&
+            (at == 0 || !isalnum(uint8_t(hlsl[at - 1])));
+        const uint32_t slot = call ? uint32_t(atoi(hlsl.c_str() + num)) : 32;
+        if (!call || slot >= 32 || !((mask >> slot) & 1))
+        {
+            out.append(hlsl, pos, open + 1 - pos);
+            pos = open + 1;
+            continue;
+        }
+        out.append(hlsl, pos, at - pos);
+        if (v2)
+        {
+            // TFetch2DV2(slot, coord, denorm, bias, texel, filt): the same arguments.
+            out += "TFetchPlain(";
+            pos = open + 1;
+        }
+        else
+        {
+            // TFetch2D(slot, coord, denorm, bias, texel): the constant's filter, as TFetch2D (filt -1).
+            size_t depth = 0, close = open;
+            for (; close < hlsl.size(); close++)
+            {
+                if (hlsl[close] == '(')
+                    depth++;
+                else if (hlsl[close] == ')' && --depth == 0)
+                    break;
+            }
+            if (close >= hlsl.size())
+                return {};
+            out += "TFetchPlain(";
+            out.append(hlsl, open + 1, close - open - 1);
+            out += ", -1)";
+            pos = close + 1;
+        }
+        replaced++;
+    }
+    out.append(hlsl, pos, std::string::npos);
+    if (!replaced)
+        return {};
+    // The helper goes before the entry point (after the declarations it uses), above any attribute line.
+    size_t mainAt = out.find("float4 main(");
+    if (mainAt == std::string::npos)
+        return {};
+    size_t lineStart = out.rfind('\n', mainAt);
+    lineStart = lineStart == std::string::npos ? 0 : lineStart + 1;
+    if (lineStart >= 2)
+    {
+        const size_t prev = out.rfind('\n', lineStart - 2);
+        const size_t prevStart = prev == std::string::npos ? 0 : prev + 1;
+        if (out[prevStart] == '[')
+            lineStart = prevStart;
+    }
+    out.insert(lineStart, kPlain);
+    return out;
+}
+
+std::mutex g_fetchVariantMutex;
+std::unordered_map<uint64_t, std::unique_ptr<CompiledShader>> g_fetchShaders; // (base cacheKey, mask) -> variant
+std::unordered_map<uint64_t, uint32_t> g_fetchVariantCount;                  // base cacheKey -> variants made
+
+// The variant, made (and its compile queued, unless the shader cache has it) on first use; nullptr when the base
+// already has 16. Failed when there's nothing to replace. `base` must be ready (its HLSL).
+// REGPU_FETCH_SPECIALIZE (live; session 33, the iGPU work: the car paint's code was 117 KB): a pixel shader's
+// variant whose lean 2D fetches pass this draw's fetch-constant words (tinfo.x, tinfo.w) as literals to TFetch2DK,
+// so each fetch compiles to what its constant asks for (one sample for a plain texture; the clamp, exponent,
+// border, 16-bit fixed conversion or swizzle when there is one). The same results as TFetch2D. A variant id is the
+// specialisation's hash with bit 31 set (plain-fetch masks never set it); its slots and words live in g_specs.
+struct FetchSpec
+{
+    uint32_t slot, info, w;
+};
+std::mutex g_specMutex;
+std::unordered_map<uint32_t, std::vector<FetchSpec>> g_specs;
+
+// (Per draw: a hash, and the lock only the first time this thread sees the specialisation.)
+uint32_t RegisterSpec(const FetchSpec* spec, size_t n)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (size_t i = 0; i < n; i++)
+        for (uint32_t v : { spec[i].slot, spec[i].info, spec[i].w })
+            h = (h ^ v) * 0x100000001B3ull;
+    const uint32_t id = uint32_t(h ^ (h >> 32)) | 0x80000000u;
+    thread_local std::unordered_set<uint32_t> known;
+    if (known.insert(id).second)
+    {
+        std::lock_guard lock(g_specMutex);
+        g_specs.try_emplace(id, std::vector<FetchSpec>(spec, spec + n));
+    }
+    return id;
+}
+
+std::string SpecVariant(const std::string& hlsl, uint32_t id)
+{
+    std::vector<FetchSpec> spec;
+    {
+        std::lock_guard lock(g_specMutex);
+        auto it = g_specs.find(id);
+        if (it == g_specs.end())
+            return {};
+        spec = it->second;
+    }
+    // Hyper tail specialisation (REGPU_HYPER_TAILSPEC; from the FM2 port: +6.5% on an HD 630): entries with slot 0x100+
+    // carry this draw's pinfo words and colour ceiling, written into the shader as literals (alpha test function,
+    // generated-parameter register, the flag bits, exponent bias, 7e3 ceiling): the same values the draw uploads.
+    std::vector<std::pair<std::string, std::string>> tail;
+    for (const FetchSpec& t : spec)
+    {
+        if (t.slot == 0x100)
+        {
+            tail.emplace_back("pinfo.x", std::to_string(t.info) + "u");
+            tail.emplace_back("pinfo.y", std::to_string(t.w) + "u");
+        }
+        else if (t.slot == 0x101)
+        {
+            tail.emplace_back("pinfo.z", std::to_string(t.info) + "u");
+            tail.emplace_back("pinfo.w", std::to_string(t.w) + "u");
+        }
+        else if (t.slot >= 0x110 && t.slot < 0x114)
+        {
+            // N3 (REGPU_SPEC_CONSTANTS): bool words 2k, 2k+1: each BoolConstant(pb, N) the shader tests as a literal.
+            const uint32_t k = t.slot - 0x110;
+            for (uint32_t half = 0; half < 2; half++)
+            {
+                const uint32_t word = half ? t.w : t.info, wordIndex = k * 2 + half;
+                for (uint32_t bit = 0; bit < 32; bit++)
+                {
+                    // BoolConstant(b, index): word (index >> 5) (b[index >> 7][(index >> 5) & 3]), bit index & 31.
+                    const uint32_t index = wordIndex * 32 + bit;
+                    tail.emplace_back("BoolConstant(pb, " + std::to_string(index) + ")", (word >> bit) & 1 ? "true" : "false");
+                }
+            }
+        }
+        else if (t.slot >= 0x120 && t.slot < 0x130)
+        {
+            // Loop words 2k, 2k+1 as literals (pl[a][b], a = word >> 2, b = word & 3).
+            const uint32_t k = t.slot - 0x120;
+            for (uint32_t half = 0; half < 2; half++)
+            {
+                const uint32_t word = k * 2 + half;
+                tail.emplace_back("pl[" + std::to_string(word >> 2) + "][" + std::to_string(word & 3) + "]", std::to_string(half ? t.w : t.info) + "u");
+            }
+        }
+        else if (t.slot == 0x102)
+        {
+            float f;
+            memcpy(&f, &t.info, 4);
+            char b[32];
+            snprintf(b, sizeof(b), "asfloat(0x%08Xu)", t.info);
+            tail.emplace_back("pinfo2.w", b);
+        }
+    }
+    const std::string& fn = SpecializedFetchFunction();
+    if (fn.empty() && tail.empty())
+        return {};
+    std::string out;
+    out.reserve(hlsl.size() + fn.size() + 1024);
+    size_t pos = 0, replaced = 0;
+    for (;;)
+    {
+        const size_t at = hlsl.find("TFetch2D", pos);
+        if (at == std::string::npos)
+            break;
+        const bool v2 = hlsl.compare(at, 11, "TFetch2DV2(") == 0;
+        const size_t open = at + (v2 ? 10 : 8);
+        size_t end = open + 1;
+        while (end < hlsl.size() && isdigit(uint8_t(hlsl[end])))
+            end++;
+        const bool call = open < hlsl.size() && hlsl[open] == '(' && end > open + 1 && end < hlsl.size() && hlsl[end] == ',' &&
+            (at == 0 || !isalnum(uint8_t(hlsl[at - 1])));
+        const uint32_t slot = call ? uint32_t(atoi(hlsl.c_str() + open + 1)) : 32;
+        const FetchSpec* f = nullptr;
+        for (const FetchSpec& s : spec)
+            if (s.slot == slot)
+                f = &s;
+        if (!call || !f)
+        {
+            out.append(hlsl, pos, open + 1 - pos);
+            pos = open + 1;
+            continue;
+        }
+        size_t depth = 0, close = open;
+        for (; close < hlsl.size(); close++)
+        {
+            if (hlsl[close] == '(')
+                depth++;
+            else if (hlsl[close] == ')' && --depth == 0)
+                break;
+        }
+        if (close >= hlsl.size())
+            return {};
+        char words[64];
+        snprintf(words, sizeof(words), "%s, 0x%08Xu, 0x%08Xu)", v2 ? "" : ", -1", f->info, f->w);
+        out.append(hlsl, pos, at - pos);
+        out += "TFetch2DK(";
+        out.append(hlsl, open + 1, close - open - 1);
+        out += words;
+        pos = close + 1;
+        replaced++;
+    }
+    out.append(hlsl, pos, std::string::npos);
+    // L62 (session 34): the full-path fetches (cube, 3D: TFetch(slot, coord, denorm, vertexStage, bias, texel)) too,
+    // as TFetchK with the words appended.
+    static LiveSwitch noFull("REGPU_NO_FETCH_SPECIALIZE_FULL");
+    if (!noFull)
+    {
+        std::string full;
+        full.reserve(out.size() + 1024);
+        pos = 0;
+        for (;;)
+        {
+            const size_t at = out.find("TFetch(", pos);
+            if (at == std::string::npos)
+                break;
+            const size_t open = at + 6;
+            size_t end = open + 1;
+            while (end < out.size() && isdigit(uint8_t(out[end])))
+                end++;
+            const bool call = end > open + 1 && end < out.size() && out[end] == ',' && (at == 0 || !isalnum(uint8_t(out[at - 1])));
+            const uint32_t slot = call ? uint32_t(atoi(out.c_str() + open + 1)) : 32;
+            const FetchSpec* f = nullptr;
+            for (const FetchSpec& s : spec)
+                if (s.slot == slot)
+                    f = &s;
+            size_t depth = 0, close = open;
+            for (; f && close < out.size(); close++)
+            {
+                if (out[close] == '(')
+                    depth++;
+                else if (out[close] == ')' && --depth == 0)
+                    break;
+            }
+            if (!f || close >= out.size())
+            {
+                full.append(out, pos, open + 1 - pos);
+                pos = open + 1;
+                continue;
+            }
+            char words[48];
+            snprintf(words, sizeof(words), ", 0x%08Xu, 0x%08Xu)", f->info, f->w);
+            full.append(out, pos, at - pos);
+            full += "TFetchK(";
+            full.append(out, open + 1, close - open - 1);
+            full += words;
+            pos = close + 1;
+            replaced++;
+        }
+        full.append(out, pos, std::string::npos);
+        out = std::move(full);
+    }
+    for (const auto& [from, to] : tail)
+    {
+        const size_t bodyAt = out.find(" main(");
+        for (size_t at = out.find(from, bodyAt == std::string::npos ? 0 : bodyAt); at != std::string::npos; at = out.find(from, at + to.size()))
+        {
+            // Whole names only (pinfo.x, not pinfo.xy).
+            const char next = at + from.size() < out.size() ? out[at + from.size()] : ' ';
+            const bool closed = from.back() == ')' || from.back() == ']';
+            if ((!closed && (isalnum(uint8_t(next)) || next == '_')) || (at && (isalnum(uint8_t(out[at - 1])) || out[at - 1] == '_')))
+            {
+                at += 1;
+                continue;
+            }
+            out.replace(at, from.size(), to);
+            replaced++;
+        }
+    }
+    if (!replaced)
+        return {};
+    if (fn.empty() || out.find("TFetch2DK(") == std::string::npos && out.find("TFetchK(") == std::string::npos)
+        return out;
+    // The function goes before the entry point, above any attribute line (as FetchVariant's helper).
+    size_t mainAt = out.find("float4 main(");
+    if (mainAt == std::string::npos)
+        return {};
+    size_t lineStart = out.rfind('\n', mainAt);
+    lineStart = lineStart == std::string::npos ? 0 : lineStart + 1;
+    if (lineStart >= 2)
+    {
+        const size_t prev = out.rfind('\n', lineStart - 2);
+        const size_t prevStart = prev == std::string::npos ? 0 : prev + 1;
+        if (out[prevStart] == '[')
+            lineStart = prevStart;
+    }
+    out.insert(lineStart, fn + "\n");
+    return out;
+}
+
+const CompiledShader* FetchVariantOf(const CompiledShader& base, uint32_t mask)
+{
+    const uint64_t id = base.cacheKey * 0x9E3779B97F4A7C15ull ^ mask;
+    std::lock_guard lock(g_fetchVariantMutex);
+    if (auto it = g_fetchShaders.find(id); it != g_fetchShaders.end())
+        return it->second.get();
+    static const bool tailSpec = (getenv("REGPU_HYPER_TAILSPEC") && atoi(getenv("REGPU_HYPER_TAILSPEC")) != 0) ||
+        (getenv("REGPU_SPEC_CONSTANTS") && atoi(getenv("REGPU_SPEC_CONSTANTS")) != 0);
+    if (g_fetchVariantCount[base.cacheKey] >= ((mask >> 31) ? (tailSpec ? 128u : 64u) : 16u)) // (specialisations: one per material's textures)
+        return nullptr;
+    auto cs = std::make_unique<CompiledShader>();
+    cs->hash = base.hash;
+    cs->pixel = true;
+    cs->ucodeBE = base.ucodeBE; // the pipeline manifest stores the base microcode
+    cs->info = base.info;
+    cs->info.hlsl = (mask >> 31) ? SpecVariant(base.info.hlsl, mask) : FetchVariant(base.info.hlsl, mask);
+    if (cs->info.hlsl.empty())
+        cs->state = CompiledShader::Failed;
+    else
+    {
+        g_fetchVariantCount[base.cacheKey]++;
+        cs->cacheKey = Fnv(cs->info.hlsl.data(), cs->info.hlsl.size(), 5);
+        std::lock_guard shaderLock(g_shaderMutex);
+        if (auto bc = g_bytecode.find(cs->cacheKey); bc != g_bytecode.end())
+        {
+            cs->code = bc->second;
+            cs->state = CompiledShader::Ready;
+        }
+        else
+        {
+            // Read from the disk cache by the compile worker, not here on the draw thread: a variant first met in a
+            // race opened and read its file mid-frame (FM3, session 37: part of a 20 ms frame). The draw keeps the
+            // base shader until then (FetchShader), which draws the same. REGPU_VARIANT_LOAD_NOW=1: read here (A/B).
+            static const bool loadNow = getenv("REGPU_VARIANT_LOAD_NOW") != nullptr;
+            if (loadNow && LoadCachedBytecode(*cs))
+            {
+                cs->state = CompiledShader::Ready;
+                g_bytecode.emplace(cs->cacheKey, cs->code);
+            }
+            else
+            {
+                cs->loadFirst = true;
+                g_compiler.Push(cs.get(), false);
+            }
+        }
+    }
+    return g_fetchShaders.emplace(id, std::move(cs)).first->second.get();
+}
+// nullptr until the variant is compiled (the draw uses its base meanwhile) or if it can't be made.
+const CompiledShader* FetchShader(const CompiledShader& base, uint32_t mask)
+{
+    // (Per thread, the variants already looked up: shaders and variants are never freed.)
+    struct Key
+    {
+        const CompiledShader* base;
+        uint32_t mask;
+        bool operator==(const Key&) const = default;
+    };
+    struct KeyHash
+    {
+        size_t operator()(const Key& k) const { return std::hash<const void*>()(k.base) ^ (size_t(k.mask) * 0x9E3779B97F4A7C15ull); }
+    };
+    thread_local std::unordered_map<Key, const CompiledShader*, KeyHash> memo;
+    const Key key{ &base, mask };
+    const CompiledShader* f;
+    if (auto it = memo.find(key); it != memo.end())
+        f = it->second;
+    else
+    {
+        f = FetchVariantOf(base, mask);
+        memo.emplace(key, f);
+    }
+    return f && f->IsReady() ? f : nullptr;
+}
+
+// A stored pipeline's pixel shader: its alpha-test-free variant for flag 0x400 and/or its plain-fetch variant
+// for fetchMask (nullptr if one can't be made), else the shader itself. `ps` must be ready; a variant may still
+// be compiling (callers wait for it or come back).
+const CompiledShader* ManifestPixelShader(const PipelineKey& key, const CompiledShader& ps)
+{
+    const CompiledShader* use = &ps;
+    if (key.flags & 0x400)
+    {
+        const CompiledShader* k = NoKillVariantOf(ps);
+        if (!k || k->state.load(std::memory_order_acquire) == CompiledShader::Failed)
+            return nullptr;
+        if (!key.fetchMask || !k->IsReady())
+            return k; // (a pending one: the fetch variant is made from it once it is ready)
+        use = k;
+    }
+    if (!key.fetchMask)
+        return use;
+    const CompiledShader* f = FetchVariantOf(*use, key.fetchMask);
+    return f && f->state.load(std::memory_order_acquire) != CompiledShader::Failed ? f : nullptr;
+}
+
 D3D12_BLEND Blend(uint32_t f)
 {
     switch (f)
@@ -4383,6 +6783,29 @@ struct PipelineLibrary
     std::shared_mutex access;
     std::chrono::steady_clock::time_point lastSave = std::chrono::steady_clock::now();
     std::vector<char> loaded;
+    // FM3 port session 43 (less RAM): the file mapped read-only instead of read into private memory (its pages are the
+    // file's, so Windows can drop and re-read them under memory pressure: 100-130 MB for an FXC library). The library
+    // keeps using the view; saving replaces the file with a POSIX-semantics rename, which works while it is mapped (the
+    // view keeps the old contents). REGPU_LIBRARY_IN_MEMORY=1 (start-time): read into memory as before.
+    const char* blob = nullptr;
+    size_t blobSize = 0;
+    HANDLE mapFile = INVALID_HANDLE_VALUE, mapping = nullptr;
+    bool LoadMapped(const std::filesystem::path& path)
+    {
+        if (getenv("REGPU_LIBRARY_IN_MEMORY"))
+            return false;
+        mapFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (mapFile == INVALID_HANDLE_VALUE)
+            return false;
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(mapFile, &size) || size.QuadPart <= 0 || !(mapping = CreateFileMappingW(mapFile, nullptr, PAGE_READONLY, 0, 0, nullptr)))
+            return CloseHandle(mapFile), mapFile = INVALID_HANDLE_VALUE, false;
+        blob = static_cast<const char*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
+        if (!blob)
+            return CloseHandle(mapping), CloseHandle(mapFile), mapping = nullptr, mapFile = INVALID_HANDLE_VALUE, false;
+        blobSize = size_t(size.QuadPart);
+        return true;
+    }
     // Compaction: entries are never removed, so every translator or driver change leaves the old ones
     // behind (FM2 port: 574 MB read at every boot). Every pipeline this session loads or builds also
     // goes into `fresh`; once that holds every pipeline the manifest lists and is at least 10% smaller,
@@ -4390,27 +6813,57 @@ struct PipelineLibrary
     ComPtr<ID3D12PipelineLibrary> fresh;
     std::atomic<size_t> freshCount{ 0 };
 
-    static std::filesystem::path Path() { return RegpuUserDir() / "pipelines.bin"; }
+    // pipelines.bin on Windows' default GPU; another one (REGPU_ADAPTER: a laptop's or a processor's built-in GPU) has
+    // its own pipelines-<vendor>-<device>.bin (FM3 port, session 33): the drivers reject each other's library, and the
+    // one run last overwrote the other's (the RX 7900 XTX's 426 MB library was lost to one iGPU test boot).
+    std::filesystem::path path = RegpuUserDir() / "pipelines.bin";
+    std::filesystem::path Path() const { return path; }
 
     void Init(ID3D12Device* device)
     {
         ComPtr<ID3D12Device1> d1;
         if (FAILED(device->QueryInterface(IID_PPV_ARGS(&d1))))
             return;
-        if (std::ifstream in{ Path(), std::ios::binary | std::ios::ate })
         {
-            loaded.resize(size_t(in.tellg()));
-            in.seekg(0);
-            in.read(loaded.data(), std::streamsize(loaded.size()));
+            ComPtr<IDXGIFactory4> factory;
+            ComPtr<IDXGIAdapter1> first, mine;
+            DXGI_ADAPTER_DESC1 a{}, m{};
+            const LUID luid = device->GetAdapterLuid();
+            if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapters1(0, &first)) && SUCCEEDED(first->GetDesc1(&a)) &&
+                (a.AdapterLuid.LowPart != luid.LowPart || a.AdapterLuid.HighPart != luid.HighPart) &&
+                SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&mine))) && SUCCEEDED(mine->GetDesc1(&m)))
+            {
+                char name[48];
+                snprintf(name, sizeof(name), "pipelines-%04X-%04X.bin", m.VendorId, m.DeviceId);
+                path = RegpuUserDir() / name;
+            }
         }
-        if (FAILED(d1->CreatePipelineLibrary(loaded.data(), loaded.size(), IID_PPV_ARGS(&library))))
+        // DXIL pipelines in their own library (REGPU_DXC): pipelines-dxil.bin, pipelines-dxil-<vendor>-<device>.bin.
+        if (DxcEnabled())
+            path = RegpuUserDir() / ("pipelines-dxil" + DxcCacheTag() + path.filename().string().substr(9));
+        // REGPU_PIPELINE_LIBRARY_TAG=<text> (tests, FM3 port session 43): a library file of its own (pipelines-<tag>...),
+        // for cold-library measurements that leave the player's library alone.
+        if (const char* tag = getenv("REGPU_PIPELINE_LIBRARY_TAG"); tag && *tag)
+            path = RegpuUserDir() / ("pipelines-" + std::string(tag) + path.filename().string().substr(9));
+        if (!LoadMapped(Path()))
+            if (std::ifstream in{ Path(), std::ios::binary | std::ios::ate })
+            {
+                loaded.resize(size_t(in.tellg()));
+                in.seekg(0);
+                in.read(loaded.data(), std::streamsize(loaded.size()));
+                blob = loaded.data();
+                blobSize = loaded.size();
+            }
+        if (const HRESULT hr = d1->CreatePipelineLibrary(blob, blobSize, IID_PPV_ARGS(&library)); FAILED(hr))
         {
-            loaded.clear();
+            if (blobSize)
+                Log("renderer: %s (%zu bytes) not usable (%08lX): starting a new one", Path().filename().string().c_str(), blobSize, (unsigned long)hr);
+            blobSize = 0;
             if (FAILED(d1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&library))))
                 library.Reset();
         }
-        Log("renderer: pipeline library %s (%zu bytes loaded)", library ? "ready" : "unavailable", loaded.size());
-        if (library && !loaded.empty() && !getenv("REGPU_NO_LIBRARY_COMPACT") && FAILED(d1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&fresh))))
+        Log("renderer: pipeline library %s (%zu bytes %s)", library ? "ready" : "unavailable", blobSize, mapping ? "mapped from the file" : "loaded");
+        if (library && blobSize && !getenv("REGPU_NO_LIBRARY_COMPACT") && FAILED(d1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&fresh))))
             fresh.Reset();
     }
 
@@ -4443,6 +6896,36 @@ struct PipelineLibrary
         return name;
     }
 
+    // REGPU_PSO_LOCK (start-time; FM3 port, session 35): 1 = the library's loads and stores one at a time (exclusive
+    // instead of shared), 2 = also pipeline creation one at a time, 0 = shared, as before. Default 1 with DXC, else 0:
+    // with DXIL pipelines AMD's drivers (RDNA2 and RDNA3 branches) crashed in amdxc64.dll (a null read) on 5 of 16 cached
+    // boots while loads and stores ran on several threads at once; 0 of 16 at 1 and at 2. FXC's never crashed.
+    static int PsoLock()
+    {
+        static const int v = [] { const char* e = getenv("REGPU_PSO_LOCK"); return e && *e ? atoi(e) : (DxcEnabled() ? 1 : 0); }();
+        return v;
+    }
+    struct LibraryLock
+    {
+        std::shared_lock<std::shared_mutex> shared;
+        std::unique_lock<std::shared_mutex> exclusive;
+        explicit LibraryLock(std::shared_mutex& m)
+        {
+            if (PsoLock() >= 1)
+                exclusive = std::unique_lock(m);
+            else
+                shared = std::shared_lock(m);
+        }
+    };
+    static HRESULT Create(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd, ComPtr<ID3D12PipelineState>& pso)
+    {
+        static std::mutex one;
+        std::unique_lock<std::mutex> lock;
+        if (PsoLock() >= 2)
+            lock = std::unique_lock(one);
+        return device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+    }
+
     HRESULT CreateOrLoad(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd, const PipelineKey& key, ComPtr<ID3D12PipelineState>& pso, bool* hit)
     {
         *hit = false;
@@ -4452,7 +6935,7 @@ struct PipelineLibrary
         {
             const std::wstring name = Name(key, pd);
             {
-                std::shared_lock lock(access);
+                LibraryLock lock(access);
                 *hit = SUCCEEDED(library->LoadGraphicsPipeline(name.c_str(), &pd, IID_PPV_ARGS(&pso)));
             }
             if (*hit)
@@ -4462,11 +6945,11 @@ struct PipelineLibrary
             }
             // The slow part (the driver compiling) runs outside the lock.
             g_compiling = { key.vs, key.ps, true };
-            const HRESULT hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+            const HRESULT hr = Create(device, pd, pso);
             g_compiling.active = false;
             if (SUCCEEDED(hr))
             {
-                std::shared_lock lock(access);
+                LibraryLock lock(access);
                 if (SUCCEEDED(library->StorePipeline(name.c_str(), pso.Get())))
                     stored++;
             }
@@ -4475,7 +6958,7 @@ struct PipelineLibrary
             return hr;
         }
         g_compiling = { key.vs, key.ps, true };
-        const HRESULT hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+        const HRESULT hr = Create(device, pd, pso);
         g_compiling.active = false;
         return hr;
     }
@@ -4485,7 +6968,7 @@ struct PipelineLibrary
         if (!fresh)
             return;
         {
-            std::shared_lock lock(access); // (stores share the library, as in CreateOrLoad)
+            LibraryLock lock(access); // (stores share the library, as in CreateOrLoad)
             if (!fresh)
                 return;
             if (SUCCEEDED(fresh->StorePipeline(name.c_str(), pso)))
@@ -4502,7 +6985,7 @@ struct PipelineLibrary
         {
             std::unique_lock lock(access);
             // Only when it saves something: else the old library stays and is not written again.
-            if (fresh && fresh->GetSerializedSize() * 10 < loaded.size() * 9)
+            if (fresh && fresh->GetSerializedSize() * 10 < blobSize * 9)
             {
                 library = fresh;
                 swap = true;
@@ -4564,9 +7047,30 @@ struct PipelineLibrary
         const auto tmp = Path().string() + ".tmp";
         { std::ofstream(tmp, std::ios::binary).write(blob.data(), std::streamsize(blob.size())); }
         std::error_code ec;
-        std::filesystem::rename(tmp, Path(), ec);
-        if (ec)
+        // (A POSIX-semantics rename first: the library file may be mapped (LoadMapped), which an ordinary replace refuses.)
+        bool renamed = false;
+        {
+            const std::wstring target = std::filesystem::absolute(Path()).wstring();
+            HANDLE t = CreateFileW(std::filesystem::path(tmp).c_str(), DELETE | GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (t != INVALID_HANDLE_VALUE)
+            {
+                std::vector<uint8_t> info(sizeof(FILE_RENAME_INFO) + target.size() * sizeof(wchar_t));
+                auto* r = reinterpret_cast<FILE_RENAME_INFO*>(info.data());
+                r->Flags = 0x1 /* FILE_RENAME_FLAG_REPLACE_IF_EXISTS */ | 0x2 /* FILE_RENAME_FLAG_POSIX_SEMANTICS */;
+                r->FileNameLength = DWORD(target.size() * sizeof(wchar_t));
+                memcpy(r->FileName, target.data(), r->FileNameLength);
+                renamed = SetFileInformationByHandle(t, FileRenameInfoEx, r, DWORD(info.size())) != 0;
+                CloseHandle(t);
+            }
+        }
+        if (!renamed)
+            std::filesystem::rename(tmp, Path(), ec);
+        if (!renamed && ec)
+        {
+            Log("renderer: pipeline library not saved (%s)", ec.message().c_str());
             std::filesystem::remove(tmp, ec);
+        }
         if (getenv("REGPU_PERF"))
             Log("perf: pipeline library saved in the background (%.0f MB): serialize %.0f ms, write %.0f ms", blob.size() / 1048576.0,
                 std::chrono::duration<double, std::milli>(serialized - start).count(),
@@ -4587,9 +7091,14 @@ struct PipelinePool
     std::condition_variable cv;
     std::deque<std::function<void()>> queue;
 
+    // Builds run on 3/4 of the hardware threads (at most 12). REGPU_PIPELINE_THREADS=<n> (start-time; FM3 port session
+    // 43, for tests): n workers. (More workers during the boot hold were tried: the boot waits for shader compiles, not
+    // pipelines, so they would only compete with those.)
     PipelinePool()
     {
-        const unsigned n = std::clamp(std::thread::hardware_concurrency() * 3 / 4, 2u, 12u);
+        unsigned n = std::clamp(std::thread::hardware_concurrency() * 3 / 4, 2u, 12u);
+        if (const char* v = getenv("REGPU_PIPELINE_THREADS"); v && atoi(v) > 0)
+            n = unsigned(atoi(v));
         for (unsigned i = 0; i < n; i++)
             std::thread([this] { Run(); }).detach();
     }
@@ -4701,7 +7210,11 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     pd.RTVFormats[0] = kColorFormat;
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     pd.SampleDesc.Count = g_msaa;
-    const bool motion = key.flags & 4; // motion-vector variants: a second target for the motion
+    pd.SampleDesc.Quality = g_msaaQuality;
+    // Motion-vector variants: a second target for the motion. Flag 0x800 (it was 4, which MakePipelineKey also sets for
+    // draws without depth clipping: those were built with the motion root signature and two targets, and left out
+    // of the manifest).
+    const bool motion = key.flags & 0x800;
     if (motion)
     {
         pd.pRootSignature = g_r.motionRootSignature.Get();
@@ -4726,7 +7239,9 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     }
     auto entry = std::make_shared<PipelineEntry>();
     g_r.pipelines[key] = entry;
-    if (!motion && !IsPsEditAlias(key.ps) && !IsPsEditAlias(key.vs)) // the manifest rebuilds pipelines from the base shaders (not live edits)
+    // The manifest rebuilds pipelines from the base shaders (not live edits or motion variants; the alpha-test-free
+    // variant, flag 0x400, is made again from its base: ManifestPixelShader).
+    if (!motion && !IsPsEditAlias(key.ps) && !IsPsEditAlias(key.vs))
     {
         g_manifest.RecordShader(false, key.vs, vs.ucodeBE);
         g_manifest.RecordShader(true, key.ps, ps.ucodeBE);
@@ -4793,8 +7308,8 @@ PipelineKey MakePipelineKey(uint64_t vsHash, uint64_t psHash, bool depthOnly, bo
     const uint32_t mask = depthOnly ? 0 : gpureg::Get(RB_COLOR_MASK) & 0xF;
     // Stencil masks (not the reference, which is dynamic) and culling are pipeline state.
     const uint32_t stencil = gpureg::Get(RB_STENCILREFMASK) & 0xFFFF00, mode = gpureg::Get(PA_SU_SC_MODE_CNTL) & 7;
-    // Alpha-to-mask (RB_COLORCONTROL bit 4): cut-out foliage and fences.
-    const bool alphaToMask = (gpureg::Get(RB_COLORCONTROL) >> 4) & 1;
+    // Alpha-to-mask (RB_COLORCONTROL bit 4): cut-out foliage and fences. (As a plain test, A2mAsTest: no coverage.)
+    const bool alphaToMask = ((gpureg::Get(RB_COLORCONTROL) >> 4) & 1) && !A2mAsTest();
     // CLIP_DISABLE (PA_CL_CLIP_CNTL bit 16): no near/far clipping, the depth clamped instead, as
     // Xenia does. FH1's sky dome lies on the far plane: with depth clipping, fragments a little
     // past it were dropped as the camera moved, and the holes showed the clear colour (grey shapes
@@ -4856,6 +7371,7 @@ bool PlainRectMustDraw()
 // report #14); these wait for their pipeline instead, a one-off hitch on first use.
 // REGPU_SKIP_SCREEN_PASSES=1: skippable like the rest, as before.
 thread_local bool g_screenPassDraw = false;
+thread_local bool g_hyperProbe = false; // Hyper culling's probe draw (HyperCull, GetPipeline)
 bool ScreenPassMustDraw()
 {
     static LiveSwitch skipScreenPasses("REGPU_SKIP_SCREEN_PASSES");
@@ -4873,14 +7389,33 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
     // REGPU_SKIP_PLAIN_RECTS=1: skippable like the rest, as before.
     if (PlainRectMustDraw() || ScreenPassMustDraw())
         return false;
+    // Only a draw into a screen-wide pass (pitch 1280: the main view, redrawn next frame) may be skipped. An
+    // off-screen pass may be drawn once and kept: FM3 builds a car's livery (vinyl layers, blended) once per car
+    // load, and a layer skipped there stayed missing until the car was rebuilt (first boots, a cold cache; FH1's
+    // port found the same). Off-screen passes wait for their pipeline: a one-off hitch on first use.
+    // REGPU_SKIP_OFFSCREEN=1: skippable like the rest, as before (live).
+    static LiveSwitch skipOffscreen("REGPU_SKIP_OFFSCREEN");
+    if (!skipOffscreen && !WidePass())
+        return false;
     const bool opaque = (blend & 0xFF1F1F1F) == 0x00010001 || (blend & 0x1F) == 1 && ((blend >> 8) & 0x1F) == 0;
     return !opaque || GameSettled();
 }
 
+extern thread_local bool g_hyperProbe;
 ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false, bool stripCut = false,
-    bool coverage = false)
+    bool coverage = false, bool noKill = false, uint32_t fetchMask = 0)
 {
     PipelineKey key = MakePipelineKey(C().vsHash, C().psHash, depthOnly, cullable);
+    if (noKill)
+        key.flags |= 0x400; // the pixel shader's variant without the alpha test (NoKillShader)
+    key.fetchMask = fetchMask; // its plain-fetch variant (FetchShader)
+    if (g_hyperProbe)
+    {
+        // Hyper culling's probe: depth-tested as the draw, but writes no depth, stencil or colour.
+        key.depth &= ~4u;
+        key.stencilMaskMode &= ~(0xFFu << 16 | 0xFu << 24);
+        key.flags |= 0x1000;
+    }
     if (coverage)
     {
         // An occlusion query's coverage draw: the depth test always passes, nothing is written.
@@ -4889,7 +7424,7 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         key.flags |= 0x200;
     }
     if (motion)
-        key.flags |= 4;
+        key.flags |= 0x800; // (EnsurePipeline)
     if (stripCut)
         key.flags |= 0x100; // strips restart at index 0xFFFF (DrawImpl)
     thread_local std::unordered_map<PipelineKey, ID3D12PipelineState*, PipelineKeyHash> ready; // (cleared when the pipelines are replaced: g_pipelineGen)
@@ -4919,6 +7454,20 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
             if (const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lockStart).count(); ms > 2.0)
                 Log("perf: GetPipeline waited %.1f ms for the shader lock", ms);
         auto it = g_r.pipelines.find(key);
+        // (As the manifest records them: no motion variants or live edits.)
+        if (!motion && !g_seedKeys.empty() && !IsPsEditAlias(key.ps) && !IsPsEditAlias(key.vs) && g_drawnKeys.insert(key).second)
+        {
+            g_drawnPipelines++;
+            // A fetch specialisation (mask bit 31) counts as seeded when its base is: it is made from the base at run
+            // time, never listed (FM3 port, session 40: every one was reported missing, which hid unseeded bases).
+            PipelineKey listed = key;
+            if (listed.fetchMask >> 31)
+                listed.fetchMask = 0;
+            if (!g_seedKeys.count(listed) && g_drawnUnseeded++ < 64) // (manifest format, for the seed)
+                Log("seed coverage: not in the seed: P %llx %llx %x %x %x %x %x %x %x", (unsigned long long)key.vs, (unsigned long long)key.ps, key.blend,
+                    key.depth, key.stencilMaskMode, key.flags, key.biasScale, key.biasOffset, key.fetchMask);
+            g_drawnUnprepared += it == g_r.pipelines.end();
+        }
         if (it != g_r.pipelines.end() && it->second->state.load(std::memory_order_acquire) == 1)
         {
             ready.emplace(key, it->second->pso.Get());
@@ -4926,10 +7475,11 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         }
         entry = EnsurePipeline(vs, ps, key);
     }
-    // A motion pipeline is never waited for: the draw uses its plain pipeline (no motion) until this one is built
+    // A plain-fetch variant's pipeline builds in the background: the draw keeps the base's until then. A motion pipeline
+    // is never waited for either: the draw uses its plain pipeline (no motion) until this one is built
     // (REGPU_MOTION_URGENT=1: waited for, as before).
     static const bool motionWaits = getenv("REGPU_MOTION_URGENT") != nullptr;
-    if (motion && !motionWaits && entry->state.load(std::memory_order_acquire) != 1)
+    if ((fetchMask || (motion && !motionWaits)) && entry->state.load(std::memory_order_acquire) != 1)
         return nullptr;
     if (SkippableDraw(depthOnly, key.blend) && entry->state.load(std::memory_order_acquire) == 0)
     {
@@ -5002,7 +7552,7 @@ ID3D12Resource* GetVolumeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     if (!DecodeTexture3D(fetch, rgba))
         return nullptr;
     const UINT rowPitch = (w * 4 + 255) & ~255u;
-    const UINT64 offset = RingAlloc(UINT64(rowPitch) * h * d, 512);
+    const UINT64 offset = RingAlloc(UINT64(rowPitch) * h * d, 512, RingTexture);
     if (offset == ~0ull)
     {
         NoteTextureFailure("upload ring full (3D)", fetch);
@@ -5048,6 +7598,23 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
         return cached.resource.Get();
     }
     cached.checkedFrame = g_r.frame;
+    // (Long-frame log: a cube read from memory and decoded, or a cube resource created, counts as an upload.)
+    struct CubeLog
+    {
+        std::chrono::steady_clock::time_point start = LongFramesEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        bool counted = false, isNew = false;
+        size_t bytes = 0;
+        uint32_t format = 0, size = 0, mips = 1;
+        ~CubeLog()
+        {
+            if (!counted || start == std::chrono::steady_clock::time_point{})
+                return;
+            char what[32];
+            snprintf(what, sizeof(what), "cube %s", TextureFormatName(format));
+            NoteTextureUpload(isNew, bytes, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), what, size, size, mips);
+        }
+    } cubeLog;
+    cubeLog.format = fetch.Format(), cubeLog.size = w, cubeLog.isNew = !cached.resource;
 
     // Faces the title resolved into?
     const ResolvedTexture* faces[6]{};
@@ -5119,12 +7686,26 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
         td.MipLevels = mips;
         td.SampleDesc.Count = 1;
         td.Format = want;
-        if (cached.resource)
-            Frame().garbage.push_back(std::move(cached.resource));
-        Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
-                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                  IID_PPV_ARGS(&cached.resource)),
-            "CreateCommittedResource(cube)"); CountCreate("cube");
+        cubeLog.counted = true;
+        // Placed in the texture pool's heaps, as 2D textures are (session 33 of the FM3 port): a committed resource cost
+        // the draw thread ~1.2 ms per new cube as a track streamed in its reflection cubes. REGPU_COMMITTED_CUBES=1
+        // (live): committed, as before.
+        static LiveSwitch committedCubes("REGPU_COMMITTED_CUBES");
+        RetireTexture(std::move(cached.resource));
+        if (!committedCubes)
+            cached.resource = CreateTexture(td, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "cube");
+        else
+        {
+            struct AddCreate
+            {
+                std::chrono::steady_clock::time_point s = std::chrono::steady_clock::now();
+                ~AddCreate() { g_frameEvents.texCreateMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s).count(); }
+            } addCreate;
+            Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                      IID_PPV_ARGS(&cached.resource)),
+                "CreateCommittedResource(cube)"); CountCreate("cube");
+        }
         cached.width = cw;
         cached.height = ch;
         cached.format = want;
@@ -5183,8 +7764,10 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     else
     {
         // Static: hash all six faces, decode on change.
+        static LiveSwitch oldStaging("REGPU_NO_CUBE_FACE_STAGING");
         const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
-        uint64_t hash = ContentHash(source, size_t(stride) * 6) ^ (uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Endian()) << 44) ^ (uint64_t(mips) << 52);
+        uint64_t hash = ContentHash(source, size_t(stride) * 6) ^ (uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Endian()) << 44) ^ (uint64_t(mips) << 52) ^
+                        (uint64_t(bool(oldStaging)) << 63);
         // Each level's face address: level 0 at the base, levels 1+ from the mip address, every level
         // holding its six faces one after another.
         uint32_t levelBase[16]{}, levelStride[16]{};
@@ -5203,12 +7786,17 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             hash ^= ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(levelBase[1])), size_t(levelBase[mips - 1] - levelBase[1]) + size_t(levelStride[mips - 1]) * 6) * 31;
         if (cached.contentHash == hash)
             return cached.resource.Get();
+        cubeLog.counted = true, cubeLog.bytes = size_t(stride) * 6, cubeLog.mips = mips;
         const UINT rowPitch = (w * 4 + 255) & ~255u;
         const UINT64 faceBytes = (UINT64(rowPitch) * h + 511) & ~511ull;
-        const UINT64 offset = RingAlloc(faceBytes * 6 * 2, 512); // all levels fit in twice level 0
+        const UINT64 offset = RingAlloc(faceBytes * 6 * 2, 512, RingTexture); // all levels fit in twice level 0
         if (offset == ~0ull)
             return nullptr;
         C().list->ResourceBarrier(1, &b);
+        // Every level of every face is staged at its own place, one after another, and copied from there. The copy of
+        // level 0 used to read the running position while the face was written at offset + faceBytes * i: all six faces
+        // showed face 0 (one level), or level 0 came from other levels' bytes (mips), so reflections read from memory
+        // were wrong; sharp reads (chrome) worst. REGPU_NO_CUBE_FACE_STAGING=1 (live, part of the hash): the old placement.
         UINT64 at = offset;
         for (uint32_t i = 0; i < 6; i++)
             for (UINT16 l = 0; l < mips; l++)
@@ -5249,8 +7837,9 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
                 snprintf(name, sizeof(name), "out/cube/%08X_face%u_stride%X.png", fetch.Address(), i, stride);
                 WritePng(name, w, h, rgba);
             }
+            const UINT64 staged = oldStaging ? offset + faceBytes * i : at;
             for (uint32_t y = 0; y < h; y++)
-                memcpy(Frame().ringCpu + offset + faceBytes * i + UINT64(y) * rowPitch, &rgba[size_t(y) * w * 4], size_t(w) * 4);
+                memcpy(Frame().ringCpu + staged + UINT64(y) * rowPitch, &rgba[size_t(y) * w * 4], size_t(w) * 4);
             D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
             dst.pResource = cached.resource.Get();
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -5260,6 +7849,8 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             src.PlacedFootprint.Offset = at;
             src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, rowPitch };
             C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            if (!oldStaging)
+                at += faceBytes;
         }
         cached.contentHash = hash;
     }
@@ -5310,7 +7901,10 @@ ID3D12Resource* ResolvedMipChain(const TextureFetch& fetch, const ResolvedTextur
     for (const ResolvedTexture* level : levels)
         sources = (sources ^ level->serial) * 0x100000001B3ull;
     if (chain.resource && (perFrame ? chain.checkedFrame == g_r.frame : chain.contentHash == sources))
+    {
+        chain.checkedFrame = g_r.frame; // (last use, for the cache release sweep; per frame mode: already this frame)
         return chain.resource.Get();
+    }
     chain.checkedFrame = g_r.frame;
     chain.contentHash = sources;
     if (!chain.resource || chain.width != hw || chain.height != hh || chain.format != level0.format ||
@@ -5410,6 +8004,7 @@ ResolvedTexture* ResolveCurrent(uint32_t base)
         if (r.stale)
             return nullptr;
     }
+    r.usedFrame = g_r.frame;
     return &r;
 }
 
@@ -5418,7 +8013,16 @@ const ResolvedTexture* ResolvedFor(const TextureFetch& fetch)
     const char* name = TextureFormatName(fetch.Format());
     if (name && (strncmp(name, "DXT", 3) == 0 || strncmp(name, "DXN", 3) == 0 || strncmp(name, "CTX", 3) == 0))
         return nullptr;
-    return ResolveCurrent(fetch.Address());
+    const ResolvedTexture* r = ResolveCurrent(fetch.Address());
+    // Hyper (REGPU_HYPER_RESOLVE_BY_SIZE=1, from the FM2 port; it took the flicker out of frozen shadow maps there):
+    // when the current image at this base has another size than the fetch asks for and a kept image at the same
+    // base has exactly that size, the fetch reads that one.
+    static const bool bySize = getenv("REGPU_HYPER_RESOLVE_BY_SIZE") && atoi(getenv("REGPU_HYPER_RESOLVE_BY_SIZE")) != 0;
+    if (bySize && r && (r->width != fetch.Width() || r->height != fetch.Height()))
+        for (const ResolvedTexture& spare : r->spares)
+            if (spare.resource && spare.width == fetch.Width() && spare.height == fetch.Height())
+                return &spare;
+    return r;
 }
 
 // The guest bytes a texture check hashes, and how densely.
@@ -5478,6 +8082,66 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format, bool&
     return r;
 }
 
+// N2 (FM3 port session 43): on a UMA GPU (integrated: the GPU reads system memory) a new texture is created in a
+// CPU-writable heap of that same memory (L0; write-back pages when the GPU's caches are coherent with the CPU's,
+// else write-combined) and written in place (WriteToSubresource): no upload-ring copy and no GPU copy, two of the
+// four memory passes an upload costs. Only a texture's first contents: a texture already in use is updated through
+// the ring as before (frames in flight may still read it). Opt-in, REGPU_UMA_TEXTURES=1 (start-time): on the Radeon
+// iGPU here it measured 63 vs 65 fps (such textures live outside the driver's carve-out); untested on Intel.
+bool UmaTextures()
+{
+    static const bool on = g_uma && getenv("REGPU_UMA_TEXTURES") && atoi(getenv("REGPU_UMA_TEXTURES")) != 0;
+    return on;
+}
+
+ComPtr<ID3D12Resource> CreateUmaTexture(const D3D12_RESOURCE_DESC& desc)
+{
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_CUSTOM;
+    hp.CPUPageProperty = g_cacheCoherentUma ? D3D12_CPU_PAGE_PROPERTY_WRITE_BACK : D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
+    hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+    ComPtr<ID3D12Resource> r;
+    if (FAILED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r))))
+    {
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            Log("renderer: CPU-writable textures refused by the driver: uploads go through the ring");
+        }
+        return nullptr;
+    }
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        Log("renderer: new textures written in place (UMA, %s pages)", g_cacheCoherentUma ? "write-back" : "write-combined");
+    }
+    return r;
+}
+
+// Writes one subresource of a CPU-writable texture; false if the driver refuses.
+bool UmaWrite(ID3D12Resource* r, UINT sub, const void* data, UINT rowPitch, UINT rows)
+{
+    if (FAILED(r->Map(sub, nullptr, nullptr)))
+        return false;
+    const HRESULT hr = r->WriteToSubresource(sub, nullptr, data, rowPitch, rowPitch * rows);
+    r->Unmap(sub, nullptr);
+    return SUCCEEDED(hr);
+}
+
+// The fresh texture to the shader-read state it is kept in (no copy: it was written in place).
+void UmaReady(ID3D12Resource* r)
+{
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    C().list->ResourceBarrier(1, &b);
+}
+
 ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format, bool& native)
 {
     TextureScope textureScope;
@@ -5489,7 +8153,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         // post-processing composite, a grid of rectangles). HUD elements sample only atlases
         // and reduced-size buffers (a 320x180 blur of the scene behind their panels).
         // (By the size the draw fetches it at: the HUD samples the scene image too, at 320x180.)
-        if (resolvedTexture->frame == g_r.frame && fetch.Width() >= kWidth)
+        if (resolvedTexture->frame == g_r.frame && fetch.Width() >= FrameW())
             g_drawSamplesResolve = true;
         // A colour-format fetch of a depth resolve reads the guest's D24S8 words (BlitResolve's pack).
         if (resolvedTexture->format == DXGI_FORMAT_R32_FLOAT && resolvedTexture->packed && fetch.Format() == 6 /* k_8_8_8_8 */)
@@ -5574,7 +8238,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     if (LiveSwitch &traceChange = g_sw_REGPU_TRACE_TEXCHANGE; traceChange && cached.resource)
         Log("texchange: %08X %s %ux%u frame %llu after %u unchanged", fetch.Address(), TextureFormatName(fetch.Format()), w, h,
             (unsigned long long)g_r.frame, cached.unchanged);
-    const auto uploadStart = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto uploadStart = g_perfTiming || LongFramesEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool wasNew = !cached.resource;
     cached.unchanged = 0;
     if (!wasNew)
@@ -5584,16 +8248,23 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         std::chrono::steady_clock::time_point start;
         const TextureFetch& fetch;
         bool isNew;
+        size_t bytes;
+        const UINT16& mips;
         ~UploadLog()
         {
-            if (!g_perfTiming)
+            if (!g_perfTiming && !LongFramesEnabled())
                 return;
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            NoteTextureUpload(isNew, bytes, ms, TextureFormatName(fetch.Format()), fetch.Width(), fetch.Height(), mips);
+            if (!g_perfTiming)
+                return;
             if (ms > 2.0)
                 Log("perf: texture %08X %s %ux%u %s took %.1f ms", fetch.Address(), TextureFormatName(fetch.Format()), fetch.Width(), fetch.Height(),
                     isNew ? "new" : "changed", ms);
         }
-    } uploadLog{ uploadStart, fetch, wasNew };
+    };
+    UINT16 loggedMips = 1;
+    UploadLog uploadLog{ uploadStart, fetch, wasNew, sourceBytes, loggedMips };
     // The title's own mip levels (distant surfaces sample the smaller, averaged ones: without
     // them the road and grass shimmer and look grainy). Down to the packed tail.
     LiveSwitch &noMips = g_sw_REGPU_NO_MIPS; // A/B
@@ -5606,6 +8277,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         levels.push_back(level);
     }
     const UINT16 mipCount = UINT16(levels.size());
+    loggedMips = mipCount;
     if (bc)
     {
         static const DXGI_FORMAT bcFormats[] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC3_UNORM,
@@ -5629,6 +8301,33 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
             td.SampleDesc.Count = 1;
             td.Format = bcFormat;
             RetireTexture(std::move(cached.resource));
+            if (UmaTextures())
+                if (ComPtr<ID3D12Resource> u = CreateUmaTexture(td))
+                {
+                    bool ok = true;
+                    std::vector<uint8_t> blocks;
+                    for (UINT16 l = 0; ok && l < mipCount; l++)
+                    {
+                        const uint32_t lw = levels[l].Width(), lh = levels[l].Height();
+                        const UINT rowPitch = (((lw + bs - 1) / bs) * blockBytes + 255) & ~255u, rows = (lh + bs - 1) / bs;
+                        blocks.assign(size_t(rowPitch) * rows, 0);
+                        CopyTextureBlocks(levels[l], blocks.data(), rowPitch);
+                        ok = UmaWrite(u.Get(), l, blocks.data(), rowPitch, rows);
+                    }
+                    if (ok)
+                    {
+                        UmaReady(u.Get());
+                        cached.resource = std::move(u);
+                        cached.width = w;
+                        cached.height = h;
+                        cached.format = bcFormat;
+                        cached.contentHash = hash;
+                        cached.native = true;
+                        format = bcFormat;
+                        native = true;
+                        return cached.resource.Get();
+                    }
+                }
             cached.resource = CreateTexture(td, D3D12_RESOURCE_STATE_COPY_DEST, "texture");
             cached.width = w;
             cached.height = h;
@@ -5645,7 +8344,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         {
             const uint32_t lw = levels[l].Width(), lh = levels[l].Height();
             const UINT rowPitch = (((lw + bs - 1) / bs) * blockBytes + 255) & ~255u;
-            const UINT64 offset = RingAlloc(UINT64(rowPitch) * ((lh + bs - 1) / bs), 512);
+            const UINT64 offset = RingAlloc(UINT64(rowPitch) * ((lh + bs - 1) / bs), 512, RingTexture);
             if (offset == ~0ull)
             {
                 NoteTextureFailure("upload ring full (compressed)", fetch);
@@ -5680,6 +8379,12 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         NoteTextureFailure("decode failed", fetch);
         return nullptr;
     }
+    // Which guest formats end up expanded to RGBA8 (the memory report lists them; FM3 port session 43).
+    {
+        auto& e = g_expandedFormats[fetch.Format()];
+        e.first++;
+        e.second += uint64_t(w) * h * 4;
+    }
     if (RendererTracing())
         Log("texture upload: %08X %s %ux%u (%s)", fetch.Address(), TextureFormatName(fetch.Format()), w, h, cached.resource ? "changed" : "new");
     static const uint32_t dumpAddress = getenv("REGPU_DUMP_TEXTURE") ? uint32_t(strtoul(getenv("REGPU_DUMP_TEXTURE"), nullptr, 16)) : 0;
@@ -5696,11 +8401,34 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         Log("renderer: wrote texture.png (%s %ux%u, endian %u, tiled %u, pitch %u)", TextureFormatName(fetch.Format()), w, h, fetch.Endian(),
             fetch.Tiled(), fetch.Pitch());
     }
-    if (!cached.resource || cached.width != w || cached.height != h || cached.format != DXGI_FORMAT_R8G8B8A8_UNORM ||
+    // k_8 (FM3 port session 43, less memory): kept as R8_UNORM, a quarter of the RGBA8 it was expanded to; its view maps
+    // the one channel to R, G and B with alpha 1 (BindlessIndex), the (v, v, v, 1) the expansion gives before the fetch
+    // swizzle, and like the block-compressed textures it is "native": the shader applies the swizzle (DecodeTexture
+    // already swizzled the RGBA8, so v is read back from an output channel the swizzle fills from X, Y or Z). The same
+    // values. FM3: 220 such textures, 78 -> 20 MB. REGPU_NO_NATIVE_R8=1 (start-time): RGBA8 as before.
+    static const bool noNativeR8 = getenv("REGPU_NO_NATIVE_R8") != nullptr;
+    const bool r8 = fetch.Format() == 2 && !noNativeR8;
+    const DXGI_FORMAT texFormat = r8 ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+    const uint32_t bpp = r8 ? 1 : 4;
+    int r8From = -1; // the swizzled channel that holds v (-1: none does, v is never seen)
+    for (int c = 0; c < 4 && r8; c++)
+        if (((fetch.Swizzle() >> (c * 3)) & 7) < 3)
+        {
+            r8From = c;
+            break;
+        }
+    auto pack = [r8, r8From](std::vector<uint8_t>& v, size_t texels) {
+        if (r8)
+            for (size_t i = 0; i < texels; i++)
+                v[i] = r8From >= 0 ? v[i * 4 + size_t(r8From)] : 0;
+    };
+    format = texFormat;
+    native = r8;
+    if (!cached.resource || cached.width != w || cached.height != h || cached.format != texFormat ||
         cached.resource->GetDesc().MipLevels != mipCount)
     {
-        cached.format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        cached.native = false;
+        cached.format = texFormat;
+        cached.native = r8;
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC td{};
@@ -5710,8 +8438,37 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         td.DepthOrArraySize = 1;
         td.MipLevels = mipCount;
         td.SampleDesc.Count = 1;
-        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.Format = texFormat;
         RetireTexture(std::move(cached.resource));
+        if (UmaTextures())
+            if (ComPtr<ID3D12Resource> u = CreateUmaTexture(td))
+            {
+                bool ok = true;
+                for (UINT16 l = 0; ok && l < mipCount; l++)
+                {
+                    if (l > 0 && !DecodeTexture(levels[l], rgba))
+                    {
+                        NoteTextureFailure("mip decode failed", fetch);
+                        return nullptr;
+                    }
+                    pack(rgba, size_t(levels[l].Width()) * levels[l].Height());
+                    ok = UmaWrite(u.Get(), l, rgba.data(), levels[l].Width() * bpp, levels[l].Height());
+                }
+                if (ok)
+                {
+                    UmaReady(u.Get());
+                    cached.resource = std::move(u);
+                    cached.width = w;
+                    cached.height = h;
+                    cached.contentHash = hash;
+                    return cached.resource.Get();
+                }
+                if (!DecodeTexture(fetch, rgba)) // (level 0 again for the ring path)
+                {
+                    NoteTextureFailure("decode failed", fetch);
+                    return nullptr;
+                }
+            }
         cached.resource = CreateTexture(td, D3D12_RESOURCE_STATE_COPY_DEST, "texture");
         cached.width = w;
         cached.height = h;
@@ -5734,15 +8491,16 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
             return nullptr;
         }
         const uint32_t lw = levels[l].Width(), lh = levels[l].Height();
-        const UINT rowPitch = (lw * 4 + 255) & ~255u;
-        const UINT64 offset = RingAlloc(UINT64(rowPitch) * lh, 512);
+        pack(rgba, size_t(lw) * lh);
+        const UINT rowPitch = (lw * bpp + 255) & ~255u;
+        const UINT64 offset = RingAlloc(UINT64(rowPitch) * lh, 512, RingTexture);
         if (offset == ~0ull)
         {
             NoteTextureFailure("upload ring full", fetch);
             return nullptr;
         }
         for (uint32_t y = 0; y < lh; y++)
-            memcpy(Frame().ringCpu + offset + UINT64(y) * rowPitch, &rgba[size_t(y) * lw * 4], size_t(lw) * 4);
+            memcpy(Frame().ringCpu + offset + UINT64(y) * rowPitch, &rgba[size_t(y) * lw * bpp], size_t(lw) * bpp);
         D3D12_TEXTURE_COPY_LOCATION dst{};
         dst.pResource = cached.resource.Get();
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -5751,7 +8509,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         src.pResource = Frame().ring.Get();
         src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src.PlacedFootprint.Offset = offset;
-        src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, lw, lh, 1, rowPitch };
+        src.PlacedFootprint.Footprint = { texFormat, lw, lh, 1, rowPitch };
         C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
     D3D12_RESOURCE_BARRIER b{};
@@ -5980,6 +8738,10 @@ struct IndexListEntry
     std::vector<uint32_t> list;
     uint64_t frame = ~0ull; // the frame `offset` belongs to
     UINT64 offset = 0;
+    uint64_t hashedFrame = ~0ull; // REGPU_INDEX_HASH_ONCE: the frame `sample` was last taken in
+    bool changing = false;        // its indices changed between two draws of a frame once: hashed at every draw
+    uint64_t probe = 0;           // a sampled hash (every 256 bytes) taken with `sample`
+    uint64_t used = 0;            // the last frame a draw asked for it (eviction)
 };
 
 IndexListEntry* CachedIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
@@ -5991,6 +8753,54 @@ IndexListEntry* CachedIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t d
              gpureg::Get(VGT_MULTI_PRIM_IB_RESET_INDX) })
         key = (key ^ v) * 0x100000001B3ull;
     uint64_t sample = 0;
+    thread_local std::unordered_map<uint64_t, IndexListEntry> cache;
+    // Past 8192 entries, lists unused for 600 frames are freed: once a frame, 512 buckets are looked at (a cursor
+    // walks the table) and at most 128 lists freed. clear() at 8192 freed every list in one draw: FM3's races grew
+    // the cache to it about once a lap, a 77-82 ms frame of heap frees (session 33, long-frame stacks).
+    // REGPU_INDEX_CACHE_CLEAR=1 (live): the old clear, for A/B. Over 32768 entries: cleared.
+    static LiveSwitch oldClear("REGPU_INDEX_CACHE_CLEAR");
+    thread_local uint64_t sweptFrame = ~0ull;
+    thread_local size_t sweepBucket = 0;
+    if (cache.size() > 8192 && oldClear)
+        cache.clear();
+    else if (cache.size() > 8192 && sweptFrame != g_r.frame)
+    {
+        sweptFrame = g_r.frame;
+        uint64_t stale[128];
+        size_t freed = 0;
+        const size_t buckets = cache.bucket_count();
+        for (size_t n = 0; n < 512 && freed < 128; n++)
+        {
+            const size_t b = sweepBucket++ % buckets;
+            for (auto it = cache.begin(b); it != cache.end(b) && freed < 128; ++it)
+                if (it->second.used + 600 < g_r.frame)
+                    stale[freed++] = it->first;
+        }
+        for (size_t i = 0; i < freed; i++)
+            cache.erase(stale[i]);
+        // (Logged every frame with REGPU_TRACE_INDEX_CACHE=1, else every 3000 frames it sweeps.)
+        static LiveSwitch trace("REGPU_TRACE_INDEX_CACHE");
+        thread_local uint64_t sweeps = 0;
+        if (trace || sweeps++ % 3000 == 0)
+            Log("index lists: %zu cached, %zu stale freed (frame %llu)", cache.size(), freed, (unsigned long long)g_r.frame);
+        if (cache.size() > 32768)
+            cache.clear();
+    }
+    // REGPU_INDEX_HASH_ONCE=1 (live): a list already hashed this frame isn't hashed again at its later draws,
+    // unless it was once seen changing within a frame (those are hashed at every draw, as before). Every
+    // index of every draw was hashed (FullHash), a few hundred KB a frame for a track's static meshes.
+    static LiveSwitch hashOnce("REGPU_INDEX_HASH_ONCE");
+    // (A sampled hash still runs: a list first rewritten between two draws is caught and marked changing.)
+    const uint8_t* indexData = source == 0 ? GuestPtr<uint8_t>(GpuPhysToGuest(dmaBase & ~(is32 ? 3u : 1u))) : nullptr;
+    const uint32_t indexBytes = source == 0 ? std::min(count, dmaSize & 0xFFFFFF) * (is32 ? 4 : 2) : 0;
+    if (hashOnce && source == 0)
+        if (auto it = cache.find(key); it != cache.end() && it->second.valid && it->second.hashedFrame == g_r.frame && !it->second.changing)
+        {
+            it->second.used = g_r.frame;
+            if (ContentHash(indexData, indexBytes) == it->second.probe)
+                return it->second.ok ? &it->second : nullptr;
+            it->second.changing = true;
+        }
     if (source == 0)
     {
         const uint32_t available = (dmaSize & 0xFFFFFF) /* in indices, as Xenia (num_words) */;
@@ -6001,10 +8811,13 @@ IndexListEntry* CachedIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t d
         const uint8_t* p = GuestPtr<uint8_t>(GpuPhysToGuest(dmaBase & ~(is32 ? 3u : 1u)));
         sample = sampledIndexHash ? ContentHash(p, bytes) : FullHash(p, bytes);
     }
-    thread_local std::unordered_map<uint64_t, IndexListEntry> cache;
-    if (cache.size() > 8192)
-        cache.clear();
     IndexListEntry& e = cache[key];
+    e.used = g_r.frame;
+    if (e.valid && e.sample != sample && e.hashedFrame == g_r.frame)
+        e.changing = true;
+    e.hashedFrame = g_r.frame;
+    if (hashOnce && source == 0 && !e.changing)
+        e.probe = ContentHash(indexData, indexBytes);
     if (!e.valid || e.sample != sample)
     {
         e.valid = true;
@@ -6254,13 +9067,14 @@ D3D12_RECT WindowScissor()
     // Taller than the screen on a pass narrower than it: a tall render target (see PassHeight).
     const uint32_t surfaceInfo = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
     static LiveSwitch noTall("REGPU_NO_TALL_PASS");
-    if (!noTall && y1 > int32_t(kHeight) && y1 <= 2048 && (surfaceInfo & 0x3FFF) < kWidth)
+    if (!noTall && y1 > int32_t(FrameH()) && y1 <= 2048 && (surfaceInfo & 0x3FFF) < FrameW())
     {
         if (g_tallInfo != surfaceInfo || g_tallHeight != uint32_t(y1))
             Log("tall pass: scissor y %d..%d x %d..%d window offset %d,%d vertexOffset %d surface %08X", y0, y1, x0, x1, wx, wy, int(vertexOffset), surfaceInfo);
         g_tallInfo = surfaceInfo;
         g_tallHeight = uint32_t(y1);
         g_tallKey = LayoutKey(surfaceInfo);
+        BumpPassEpoch();
         // REGPU_CAPTURE_TALL=1: trace this very frame from here on (its dump is taken at the swap).
         static LiveSwitch captureTall("REGPU_CAPTURE_TALL");
         static bool traced = false;
@@ -6306,6 +9120,7 @@ void EnsureResolved(ResolvedTexture& dest, uint32_t width, uint32_t height, uint
         std::swap(a.serial, b.serial);
         std::swap(a.format, b.format);
         std::swap(a.swapped, b.swapped);
+        std::swap(a.usedFrame, b.usedFrame);
     };
     if (!dest.resource || dest.width != width || dest.height != height || dest.hostWidth != hostWidth || dest.hostHeight != hostHeight ||
         dest.format != format)
@@ -6361,11 +9176,64 @@ void EnsureResolved(ResolvedTexture& dest, uint32_t width, uint32_t height, uint
     }
 }
 
+void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info);
+void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint32_t info, bool depth, const D3D12_RECT& rect,
+    const regpu::Writeback& request);
+
 // destRange: the destination's fixed-point range after the scale (the 16-bit integer range for the
 // 16-bit fixed formats); null none. destRow: the image row the surface's rect lands at (0: its own
 // row; a band of a taller image lands destRow rows down).
 void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale, bool swapRB = false,
-    const float* destRange = nullptr, uint32_t toGamma = 0, LONG destRow = 0)
+    const float* destRange = nullptr, uint32_t toGamma = 0, LONG destRow = 0);
+
+bool ResolveIntoEnclosing(uint32_t base, uint32_t pitch, uint32_t declaredHeight, uint32_t guestBpp, DXGI_FORMAT format, const D3D12_RECT& rect, float scale,
+    const float* destRange, uint32_t toGamma, bool atBase = false);
+
+// REGPU_DUMP_EACH_RESOLVE (debug): images copied to readback buffers mid-frame, written out at the frame's end.
+std::mutex g_midDumpLock;
+std::vector<ResolveDump> g_midDumps;
+std::atomic<int> g_midDumpSerial{ 0 };
+void QueueMidFrameDump(uint32_t base, uint32_t surface, const D3D12_RECT& rect)
+{
+    auto it = g_r.resolved.find(base);
+    if (it == g_r.resolved.end() || !it->second.resource)
+        return;
+    ResolvedTexture& r = it->second;
+    ResolveDump d;
+    d.base = base;
+    d.variant = 100 + g_midDumpSerial.fetch_add(1);
+    d.width = r.hostWidth;
+    d.height = r.hostHeight;
+    d.format = r.format;
+    const UINT bpp = r.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
+    d.pitch = (d.width * bpp + 255) & ~255u;
+    d.buffer = CreateBuffer(UINT64(d.pitch) * d.height, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_RESOURCE_BARRIER bar{};
+    bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar.Transition.pResource = r.resource.Get();
+    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    C().list->ResourceBarrier(1, &bar);
+    D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+    dst.pResource = d.buffer.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { r.format, d.width, d.height, 1, d.pitch };
+    src.pResource = r.resource.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    std::swap(bar.Transition.StateBefore, bar.Transition.StateAfter);
+    C().list->ResourceBarrier(1, &bar);
+    const PassScaleSnapshot& p = PassScales();
+    Log("dump each resolve: %08X v%d after rect %ld,%ld-%ld,%ld surface %08X color info %08X (image %ux%u host %ux%u, pass scale %.3f x %.3f, pass %ux%u, "
+        "surface %ux%u)",
+        base, d.variant, rect.left, rect.top, rect.right, rect.bottom, surface, gpureg::Get(0x2001), r.width, r.height, r.hostWidth, r.hostHeight, p.scaleX,
+        p.scaleY, p.width, p.height, UINT(C().color->GetDesc().Width), UINT(C().color->GetDesc().Height));
+    std::lock_guard lock(g_midDumpLock);
+    g_midDumps.push_back(std::move(d));
+}
+
+void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale, bool swapRB,
+    const float* destRange, uint32_t toGamma, LONG destRow)
 {
     // REGPU_FREEZE_RESOLVES=<hex base>[,<hex base>...]: those images keep what they hold, later resolves
     // to them are skipped (debug: does a flicker come from an image's redraws?). Read every resolve, so
@@ -6442,18 +9310,73 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
         TransitionColor(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     C().list->ResourceBarrier(barriers, b);
 
-    const bool ms = g_msaa > 1;
+    bool ms = g_msaa > 1;
+    // REGPU_RESOLVE_TWO_STEP=1 (live, session 33 of the FM3 port): a multisampled colour resolve in two steps: the
+    // hardware averages the rectangle's samples into a 1x scratch copy of the surface (ResolveSubresourceRegion, which
+    // can use the MSAA compression instead of reading every sample), then the usual 1x pass scales and converts from it.
+    // At 4K 4x the three colour resolves took 0.63 ms of FM3's 4.2 ms GPU frame, each reading all samples in a shader.
+    static LiveSwitch twoStep("REGPU_RESOLVE_TWO_STEP");
+    // (EQAA's extra coverage samples count only in the hardware's resolve: on with it.)
+    if (ms && !depth && (twoStep || g_msaaQuality) && f.descriptorsUsed < kDescriptorsPerFrame)
+    {
+        const D3D12_RESOURCE_DESC cd = C().color->GetDesc();
+        if (!g_r.resolveScratch || g_r.resolveScratch->GetDesc().Width != cd.Width || g_r.resolveScratch->GetDesc().Height != cd.Height)
+        {
+            if (g_r.resolveScratch)
+                Frame().garbage.push_back(std::move(g_r.resolveScratch));
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC td = cd;
+            td.SampleDesc = { 1, 0 };
+            td.Format = kColorFormat;
+            td.Flags = D3D12_RESOURCE_FLAG_NONE;
+            if (SUCCEEDED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                    IID_PPV_ARGS(&g_r.resolveScratch))))
+                CountCreate("resolve scratch");
+        }
+        if (g_r.resolveScratch)
+        {
+            // The colour surface: shader resource (above) -> resolve source; the scratch: shader resource -> resolve destination.
+            D3D12_RESOURCE_BARRIER rb[2]{};
+            rb[0].Type = rb[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            rb[0].Transition.pResource = C().color.Get();
+            rb[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            rb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            rb[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+            rb[1].Transition.pResource = g_r.resolveScratch.Get();
+            rb[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            rb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            rb[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+            C().list->ResourceBarrier(2, rb);
+            // (The surface's rows: a band of a taller image (destRow) is read from its surface rows, srcOrigin.)
+            const D3D12_RECT src = ToHost(D3D12_RECT{ sr.left, sr.top - destRow, sr.right, sr.bottom - destRow });
+            C().list->ResolveSubresourceRegion(g_r.resolveScratch.Get(), UINT(src.left), UINT(src.top), C().color.Get(), src, kColorFormat);
+            for (auto& x : rb)
+                std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+            C().list->ResourceBarrier(2, rb);
+            // The 1x pass reads the scratch copy at the same place.
+            D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+            sv.Format = kColorFormat;
+            sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sv.Texture2D.MipLevels = 1;
+            g_r.device->CreateShaderResourceView(g_r.resolveScratch.Get(), &sv, Cpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
+            ms = false;
+        }
+    }
     ID3D12PipelineState* pso = depth ? (ms ? g_r.depthBlitMs[g_msaa].Get() : g_r.depthBlit.Get())
         : format == DXGI_FORMAT_R8G8B8A8_UNORM ? (ms ? g_r.colorBlitMs8[g_msaa].Get() : g_r.colorBlit8.Get())
+        : format == DXGI_FORMAT_R10G10B10A2_UNORM ? (ms ? g_r.colorBlitMs10[g_msaa].Get() : g_r.colorBlit10.Get())
         : (ms ? g_r.colorBlitMs16[g_msaa].Get() : g_r.colorBlit16.Get());
     C().list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     C().list->SetGraphicsRootSignature(g_r.blitRootSignature.Get());
     C().list->SetPipelineState(pso);
     C().list->SetGraphicsRootDescriptorTable(0, Gpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
-    const uint32_t blitConstants[7] = { std::bit_cast<uint32_t>(scale), uint32_t(swapRB), uint32_t(destRange != nullptr),
+    const uint32_t blitConstants[10] = { std::bit_cast<uint32_t>(scale), uint32_t(swapRB), uint32_t(destRange != nullptr),
         std::bit_cast<uint32_t>(destRange ? destRange[0] : 0.0f), std::bit_cast<uint32_t>(destRange ? destRange[1] : 0.0f), uint32_t(toGamma),
-        uint32_t(HostY(destRow)) };
-    C().list->SetGraphicsRoot32BitConstants(1, 7, blitConstants, 0);
+        std::bit_cast<uint32_t>(1.0f), std::bit_cast<uint32_t>(1.0f), 0, std::bit_cast<uint32_t>(-float(HostY(destRow))) };
+    // (Source step 1: the destination's own pixel; a band of a taller image (destRow) reads its surface rows from 0.)
+    C().list->SetGraphicsRoot32BitConstants(1, 10, blitConstants, 0);
     // Width and height stay in game pixels (the size the title knows); the texture and the
     // rectangle are scaled.
     const D3D12_VIEWPORT vp{ 0, 0, float(hostWidth), float(hostHeight), 0, 1 };
@@ -6527,6 +9450,244 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     C().list->OMSetRenderTargets(1, &C().rtv, FALSE, &C().dsv);
     C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
     g_drawState.Invalidate();
+}
+
+// A colour resolve whose destination lies inside an image resolved earlier is also drawn into that image, at its
+// place. Xenos textures are tiled in 32x32-texel tiles (32 * 32 * bytes per pixel each, row after row of tiles),
+// so a destination a whole number of tiles past an image's base is the texel (x, y) of that tile; the copy writes
+// the EDRAM rectangle from there, and declares as its height the image's rows left below y. FM3 builds a car's
+// 2048x2048 texture (body, parts, vinyls) this way: in four 2048x512 strips (x 0, y 0/512/1024/1536), and on
+// every vinyl edit one rectangle per changed region (e.g. 1416x568 at x 512, y 512). Each became an image of its
+// own at an address nothing fetches; the car read the texture at its base, which held only the first strip: no
+// vinyls. Each copy is still resolved as its own image too, as before. Matched strictly: same row width (pitch),
+// format and bytes per pixel, the rectangle inside the image, and the declared height exactly the rows left.
+// The pass's scale and the image's may differ (a vinyl region is drawn at 1x, the composite at the big pass's):
+// the source is read scaled. REGPU_NO_RESOLVE_INTO_ENCLOSING=1 (live): not drawn (A/B).
+// atBase: the rectangle's destination is an image's own base (its texel 0, 0), and the copy is smaller than that image
+// (see the resolve's "into its own image" case): only the image at the base matches, at 0, 0.
+bool ResolveIntoEnclosing(uint32_t base, uint32_t pitch, uint32_t declaredHeight, uint32_t guestBpp, DXGI_FORMAT format, const D3D12_RECT& rect, float scale,
+    const float* destRange, uint32_t toGamma, bool atBase)
+{
+    static LiveSwitch off("REGPU_NO_RESOLVE_INTO_ENCLOSING");
+    if (off || rect.right <= rect.left || rect.bottom <= rect.top)
+        return false;
+    const uint32_t tileBytes = 32 * 32 * guestBpp, tilesAcross = (pitch + 31) / 32;
+    // The outermost match: the strips' own images match too (each declares the rows left to the end), and the
+    // texture the title fetches is the one at the lowest base.
+    uint32_t encBase = 0, x = 0, y = 0;
+    ResolvedTexture* found = nullptr;
+    // A big pass's image is kept at the pass width (the resolve clamps its width to BigPassSize, pitch * 64 / 65 of
+    // the surface), not the copy's pitch: a 1400-wide 4x surface copied with pitch 1408 makes a 1378-wide image.
+    // Its later tiles name that pitch, so the image matches either. (Matching the pitch only, the tiles after the
+    // first were never drawn into it: FM3's vinyl side-view passes lost every row past 224, and the vinyls on the
+    // car's sides and hood stopped at a straight line.) REGPU_NO_ENCLOSING_PASS_WIDTH=1: the pitch only (A/B).
+    // Only for a big pass: an ordinary one clamps to the 1280-wide output, and a 704-wide copy with pitch 2048 (a car's
+    // bumper region) then matched any 1280-wide image below it (a menu poster showed the bumper's vinyl).
+    static LiveSwitch noPassWidth("REGPU_NO_ENCLOSING_PASS_WIDTH");
+    const uint32_t passWidth = noPassWidth || !BigPassSize() ? pitch : std::clamp<uint32_t>(pitch, 1, std::max<uint32_t>(kWidth, BigPassSize()));
+    // Every match, then the lowest base among those used lately. An image whose memory the title has since
+    // reallocated a few KB higher for a new one of the same size still matches, at a lower base: FM3 builds each
+    // car's livery in a new image on each race load, and its pieces went into the previous load's image (whose
+    // memory the title had reused: the write-back safety check then dropped them, and the new livery missed them).
+    // The image the title fetches is drawn into with every piece, so it is the most recently used match; one
+    // last used more than kStaleFrames before the newest match is left out. REGPU_ENCLOSING_LOWEST=1: the lowest
+    // base of all matches (as before, A/B).
+    static LiveSwitch lowestOfAll("REGPU_ENCLOSING_LOWEST");
+    constexpr uint64_t kStaleFrames = 120;
+    struct Match
+    {
+        uint32_t base, x, y;
+        ResolvedTexture* r;
+    };
+    Match matches[16];
+    uint32_t matchCount = 0;
+    // By address range (default): the console's copy writes memory; every image whose memory holds the destination is
+    // drawn into, at the texel the destination's offset names. An image's memory is its rows (rounded up to whole
+    // 32-row tiles) of 32x32-texel tiles across its copy pitch; a copy shares it only with images of the same tiled
+    // row width, format and texel size. No guess about which image is "the" one: each gets what its memory gets (the
+    // atlas, a strip's own image inside it, a tall pass's image under its tiles). This replaces matching by the
+    // declared height, the big-pass width, the base order and recency (FM3 session 41: each car's vinyl regions hit a
+    // case one of those rules missed: a region at the atlas's base, tiles a few texels short of their pitch).
+    // REGPU_ENCLOSING_GUESS=1 (live): those rules, as before.
+    const bool byRange = !g_sw_REGPU_ENCLOSING_GUESS;
+    for (auto& [candidateBase, candidate] : g_r.resolved)
+    {
+        if (byRange)
+        {
+            const uint32_t candidatePitch = candidate.copyPitch ? candidate.copyPitch : candidate.width;
+            if ((atBase ? candidateBase > base : candidateBase >= base) || !candidate.resource || (candidatePitch + 31) / 32 != tilesAcross ||
+                candidate.format != format || candidate.guestBpp != guestBpp || !candidate.height || !candidate.hostHeight)
+                continue;
+            const uint32_t offset = base - candidateBase;
+            if (offset % tileBytes)
+                continue;
+            const uint32_t tile = offset / tileBytes, cx = tile % tilesAcross * 32, cy = tile / tilesAcross * 32;
+            if (cy >= candidate.height || cx >= candidate.width)
+                continue;
+            if (matchCount < std::size(matches))
+                matches[matchCount++] = { candidateBase, cx, cy, &candidate };
+            continue;
+        }
+        if ((atBase ? candidateBase != base : candidateBase >= base) || !candidate.resource ||
+            (candidate.width != pitch && candidate.width != passWidth) || candidate.format != format ||
+            candidate.guestBpp != guestBpp || !candidate.height || !candidate.hostHeight)
+            continue;
+        const uint32_t offset = base - candidateBase;
+        if (offset % tileBytes)
+            continue;
+        const uint32_t tile = offset / tileBytes, cx = tile % tilesAcross * 32, cy = tile / tilesAcross * 32;
+        // A last tile's rectangle is rounded up to 8 rows past the image (88 rows copied, 86 declared): clipped to the
+        // image (the draw below is), not refused. (Refused, FM3's side-view passes lost their last tile: the bottom
+        // of the car's left side and a corner of the hood.) REGPU_NO_ENCLOSING_ROW_CLIP=1: refused (A/B).
+        static LiveSwitch noRowClip("REGPU_NO_ENCLOSING_ROW_CLIP");
+        if (cy >= candidate.height || cy + declaredHeight != candidate.height || cx + uint32_t(rect.right) > candidate.width ||
+            cy + uint32_t(rect.bottom) > candidate.height + (noRowClip ? 0u : 31u))
+            continue;
+        if (matchCount < std::size(matches))
+            matches[matchCount++] = { candidateBase, cx, cy, &candidate };
+    }
+    // REGPU_TRACE_RESOLVES=1 (live): every copy's outcome here (the candidates and the image it went into).
+    static LiveSwitch traceEnclosing("REGPU_TRACE_RESOLVES");
+    if (traceEnclosing)
+    {
+        std::string list;
+        for (uint32_t i = 0; i < matchCount; i++)
+        {
+            char one[48];
+            snprintf(one, sizeof(one), " %08X@%u,%u", matches[i].base, matches[i].x, matches[i].y);
+            list += one;
+        }
+        const auto own = g_r.resolved.find(base);
+        Log("enclosing: %08X (%ldx%ld pitch %u decl %u)%s: %u matches%s; image here %ux%u", base, rect.right - rect.left, rect.bottom - rect.top, pitch,
+            declaredHeight, atBase ? " at base" : "", matchCount, list.c_str(), own != g_r.resolved.end() ? own->second.width : 0,
+            own != g_r.resolved.end() ? own->second.height : 0);
+    }
+    uint64_t newest = 0;
+    for (uint32_t i = 0; i < matchCount; i++)
+        if (matches[i].r->frame != ~0ull)
+            newest = std::max(newest, matches[i].r->frame);
+    uint32_t skippedOld = 0;
+    for (uint32_t i = 0; i < matchCount && !byRange; i++)
+    {
+        const Match& m = matches[i];
+        const uint64_t used = m.r->frame == ~0ull ? 0 : m.r->frame;
+        if (!lowestOfAll && used + kStaleFrames < newest)
+        {
+            skippedOld++;
+            continue;
+        }
+        if (!found || m.base < encBase)
+            encBase = m.base, x = m.x, y = m.y, found = m.r;
+    }
+    if (matchCount > 1 && !byRange)
+    {
+        static std::atomic<int> logged{ 0 };
+        if (logged.fetch_add(1) < 200)
+        {
+            std::string list;
+            for (uint32_t i = 0; i < matchCount; i++)
+            {
+                char one[64];
+                snprintf(one, sizeof(one), " %08X@%u,%u(frame %lld)", matches[i].base, matches[i].x, matches[i].y,
+                    matches[i].r->frame == ~0ull ? -1ll : (long long)matches[i].r->frame);
+                list += one;
+            }
+            Log("resolve: %08X (%ldx%ld) fits %u images:%s; now frame %llu; %u left out as old; into %08X", base, rect.right - rect.left,
+                rect.bottom - rect.top, matchCount, list.c_str(), (unsigned long long)g_r.frame, skippedOld, found ? encBase : 0);
+        }
+    }
+    Match targets[std::size(matches)];
+    uint32_t targetCount = 0;
+    if (byRange)
+        for (uint32_t i = 0; i < matchCount; i++)
+            targets[targetCount++] = matches[i];
+    else if (found)
+        targets[targetCount++] = { encBase, x, y, found };
+    bool drew = false;
+    for (uint32_t t = 0; t < targetCount; t++)
+    {
+        ResolvedTexture& enc = *targets[t].r;
+        encBase = targets[t].base, x = targets[t].x, y = targets[t].y;
+        FrameResources& f = Frame();
+        if (f.descriptorsUsed >= kDescriptorsPerFrame)
+            break;
+        // Host scales: the image's own, and the pass's (where the EDRAM rectangle is).
+        const float encSx = float(enc.hostWidth) / float(enc.width), encSy = float(enc.hostHeight) / float(enc.height);
+        const float srcSx = float(ScaleX()), srcSy = float(ScaleY());
+        const UINT slot = f.descriptorBase + f.descriptorsUsed++;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = kColorFormat;
+        srv.ViewDimension = g_msaa > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        g_r.device->CreateShaderResourceView(C().color.Get(), &srv, Cpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
+        const auto rtv = g_r.blitRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        C().list->CreateRenderTargetView(g_r.device, enc.resource.Get(), rtv);
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = enc.resource.Get();
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        TransitionColor(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        C().list->ResourceBarrier(1, &b);
+        const bool ms = g_msaa > 1;
+        C().list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        C().list->SetGraphicsRootSignature(g_r.blitRootSignature.Get());
+        C().list->SetPipelineState(format == DXGI_FORMAT_R8G8B8A8_UNORM ? (ms ? g_r.colorBlitMs8[g_msaa].Get() : g_r.colorBlit8.Get())
+                : format == DXGI_FORMAT_R10G10B10A2_UNORM                 ? (ms ? g_r.colorBlitMs10[g_msaa].Get() : g_r.colorBlit10.Get())
+                                                                       : (ms ? g_r.colorBlitMs16[g_msaa].Get() : g_r.colorBlit16.Get()));
+        C().list->SetGraphicsRootDescriptorTable(0, Gpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
+        // Image pixel p (host) is game pixel p / encScale, which came from EDRAM game pixel (p / encScale - (x, y)),
+        // host (p / encScale - (x, y)) * srcScale.
+        const float step[2] = { srcSx / encSx, srcSy / encSy }, origin[2] = { -float(x) * srcSx, -float(y) * srcSy };
+        const uint32_t constants[10] = { std::bit_cast<uint32_t>(scale), 0u, uint32_t(destRange != nullptr),
+            std::bit_cast<uint32_t>(destRange ? destRange[0] : 0.0f), std::bit_cast<uint32_t>(destRange ? destRange[1] : 0.0f), toGamma,
+            std::bit_cast<uint32_t>(step[0]), std::bit_cast<uint32_t>(step[1]), std::bit_cast<uint32_t>(origin[0]), std::bit_cast<uint32_t>(origin[1]) };
+        C().list->SetGraphicsRoot32BitConstants(1, 10, constants, 0);
+        const D3D12_VIEWPORT vp{ 0, 0, float(enc.hostWidth), float(enc.hostHeight), 0, 1 };
+        const D3D12_RECT hostRect{ LONG(float(x + uint32_t(rect.left)) * encSx), LONG(float(y + uint32_t(rect.top)) * encSy),
+            std::min<LONG>(LONG(enc.hostWidth), LONG(float(x + uint32_t(rect.right)) * encSx)),
+            std::min<LONG>(LONG(enc.hostHeight), LONG(float(y + uint32_t(rect.bottom)) * encSy)) };
+        C().list->RSSetViewports(1, &vp);
+        C().list->RSSetScissorRects(1, &hostRect);
+        C().list->DrawInstanced(3, 1, 0, 0);
+        std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+        C().list->ResourceBarrier(1, &b);
+        TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
+        C().list->OMSetRenderTargets(1, &C().rtv, FALSE, &C().dsv);
+        C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
+        g_drawState.Invalidate();
+        enc.frame = g_r.frame;
+        enc.serial = ++g_resolveSerial;
+        if (RendererTracing())
+            Log("resolve: %08X (%ldx%ld) also drawn into %08X at %u,%u (scale %.3f -> %.3f)", base, rect.right - rect.left, rect.bottom - rect.top, encBase, x,
+                y, srcSx, encSx);
+        // The console's copy lands in memory inside the image: if that image is one the title reads on the CPU
+        // (written back), memory needs this part too: this rectangle of it, deferred (in memory before the
+        // next fence, without a stall). REGPU_NO_ENCLOSING_WRITEBACK=1: not written (A/B).
+        static LiveSwitch noEnclosingWriteback("REGPU_NO_ENCLOSING_WRITEBACK");
+        if (enc.writtenBack && !noEnclosingWriteback)
+        {
+            regpu::Writeback part;
+            part.mode = regpu::Writeback::Mode::Deferred;
+            part.x0 = x + uint32_t(rect.left), part.x1 = x + uint32_t(rect.right);
+            part.y0 = y + uint32_t(rect.top), part.y1 = y + uint32_t(rect.bottom);
+            QueueDeferredWriteback(encBase, enc.width, enc.height, enc.writebackInfo, false, D3D12_RECT{ 0, 0, LONG(enc.width), LONG(enc.height) }, part);
+        }
+        drew = true;
+    }
+    if (drew)
+        return true;
+    // A copy that looks like a part of a bigger image (narrower than its row width, declaring more rows than it copies)
+    // but found none: logged (the first 100), so a piece that lands nowhere shows in the log.
+    if (!atBase && uint32_t(rect.right) < pitch && declaredHeight > uint32_t(rect.bottom) + 8)
+    {
+        static std::atomic<int> unmatched{ 0 };
+        if (unmatched.fetch_add(1) < 100)
+            Log("resolve: %08X (%ldx%ld, pitch %u, %u rows declared) fits no image", base, rect.right - rect.left, rect.bottom - rect.top, pitch,
+                declaredHeight);
+    }
+    return false;
 }
 
 // EDRAM resolve: copy a rectangle of the render target to the destination
@@ -6676,9 +9837,9 @@ void BeginTemporalFrame()
     g_upscale.jitterNdc[0] = 2.0f * g_upscale.jitterPx[0] / float(std::max(1u, g_upscale.renderWidth));
     g_upscale.jitterNdc[1] = -2.0f * g_upscale.jitterPx[1] / float(std::max(1u, g_upscale.renderHeight));
     g_upscale.constantsFrame++;
-    g_upscale.occurrences.clear();
+    // (occurrences: counted per frame by their own stamp, MotionTable)
     if (g_upscale.constantsFrame % 600 == 0) // draws not seen for a while
-        std::erase_if(g_upscale.constants, [](const auto& e) { return e.second.frame + 2 < g_upscale.constantsFrame; });
+        g_upscale.constants.Grow(g_upscale.constantsFrame), g_upscale.occurrences.Grow(g_upscale.constantsFrame);
     const float zero[4] = {};
     C().list->ClearRenderTargetView(g_upscale.motionRtv, zero, 0, nullptr);
     C().list->ClearRenderTargetView(g_upscale.reactiveRtv, zero, 0, nullptr);
@@ -6688,9 +9849,11 @@ void UpscaleResolved(uint32_t base);
 
 // DLSS or FSR 3 on the scene image at `base`: colour (render size), depth and motion (top left of
 // output-sized textures); the upscaled image replaces it like UpscaleResolved.
-bool EvaluateTemporal(uint32_t base, bool dlss)
+bool EvaluateTemporal(uint32_t base, bool dlss, bool xess = false)
 {
     if (dlss && !DlssInit(g_r.device))
+        return false;
+    if (xess && !XessInit(g_r.device))
         return false;
     auto it = g_r.resolved.find(base);
     if (it == g_r.resolved.end() || !it->second.resource)
@@ -6705,8 +9868,10 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     const uint32_t inWidth = dest.hostWidth, inHeight = dest.hostHeight;
     const float savedScale = g_sceneScale;
     g_sceneScale = 1.0f;
+    BumpPassEpoch();
     const uint32_t outWidth = uint32_t(HostX(LONG(dest.width))), outHeight = uint32_t(HostY(LONG(dest.height)));
     g_sceneScale = savedScale;
+    BumpPassEpoch();
     if (outWidth < inWidth || outHeight < inHeight)
         return false;
     const uint64_t frame = dest.frame;
@@ -6743,6 +9908,7 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     setup.outputHeight = outHeight;
     setup.quality = GetSettings().quality;
     setup.hdr = format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    setup.fsr4 = GetSettings().upscaler == Settings::Upscaler::Fsr4;
     static auto last = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     DlssFrame in{};
@@ -6788,10 +9954,42 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     barrier(g_upscale.motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(g_upscale.reactive.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(in.output, read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    // NGX records into the real command list (after everything recorded so far).
-    const bool ok = dlss ? DlssEvaluate(C().list->Real(), setup, in)
-                         : GetSettings().upscaler == Settings::Upscaler::Fsr4 ? Fsr4Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness)
-                                                                             : Fsr3Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness);
+    // NGX records into the real command list (after everything recorded so far: Real() waits for the replay).
+    // FSR (FM3 port, session 36): its context is made here, the dispatch queued with RecordedList::Call and run where
+    // the list replays, so the draw thread doesn't wait for the replay thread to catch up each frame (it limits the
+    // frame rate where the GPU doesn't: FM3 at 1440p on an RX 7900 XTX). REGPU_FSR_ON_REAL=1: as before.
+    struct FsrJob
+    {
+        void* handle;
+        bool switched;
+        DlssSetup setup;
+        DlssFrame in;
+        float sharpness;
+        ID3D12Resource *copyDst, *copySrc;
+    };
+    static FsrJob fsrJobs[kFrames];
+    static LiveSwitch fsrOnReal("REGPU_FSR_ON_REAL");
+    const bool queued = !dlss && !xess && !fsrOnReal;
+    bool ok;
+    if (dlss)
+        ok = DlssEvaluate(C().list->Real(), setup, in);
+    else if (xess)
+        ok = XessEvaluate(C().list->Real(), setup, in);
+    else if (!queued)
+        ok = Fsr3Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness);
+    else
+    {
+        FsrJob& job = fsrJobs[g_r.frameIndex];
+        job = { nullptr, false, setup, in, GetSettings().sharpness, nullptr, nullptr };
+        ok = Fsr3Prepare(g_r.device, setup, &job.handle, &job.switched);
+        if (ok)
+            C().list->Call(
+                [](ID3D12GraphicsCommandList* l, void* c) {
+                    const FsrJob& j = *static_cast<const FsrJob*>(c);
+                    Fsr3Dispatch(l, j.handle, j.switched, j.setup, j.in, j.sharpness);
+                },
+                &job);
+    }
     if (ok)
         g_tstat.evaluated++;
     g_upscale.viewValid = ok; // (REGPU_VIEW_MOTION / _DEPTH / _REACTIVE show them at the end of the frame)
@@ -6802,7 +10000,20 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     {
         barrier(in.output, read, D3D12_RESOURCE_STATE_COPY_SOURCE);
         barrier(color.Get(), read, D3D12_RESOURCE_STATE_COPY_DEST);
-        C().list->Real()->CopyResource(color.Get(), in.output);
+        if (queued)
+        {
+            FsrJob& job = fsrJobs[g_r.frameIndex];
+            job.copyDst = color.Get();
+            job.copySrc = in.output;
+            C().list->Call(
+                [](ID3D12GraphicsCommandList* l, void* c) {
+                    const FsrJob& j = *static_cast<const FsrJob*>(c);
+                    l->CopyResource(j.copyDst, j.copySrc);
+                },
+                &job);
+        }
+        else
+            C().list->Real()->CopyResource(color.Get(), in.output);
         barrier(color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, read);
         barrier(in.output, D3D12_RESOURCE_STATE_COPY_SOURCE, read);
     }
@@ -6828,9 +10039,19 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
 
 // The temporal upscale of the scene image at `base` (colour, depth, motion, jitter); FSR 1
 // where the chosen upscaler is not available.
+bool TaaScene(uint32_t base);
 void TemporalEvaluate(uint32_t base)
 {
-    const bool done = EvaluateTemporal(base, GetSettings().upscaler == Settings::Upscaler::Dlss);
+    // TAA (Config::postAA, FM3 port session 36): the temporal path without an upscaler.
+    if (const Settings::Upscaler u = GetSettings().upscaler;
+        u != Settings::Upscaler::Dlss && u != Settings::Upscaler::Fsr3 && u != Settings::Upscaler::Fsr4 && u != Settings::Upscaler::Xess)
+    {
+        TaaScene(base);
+        g_upscale.reset = false;
+        return;
+    }
+    const Settings::Upscaler u = GetSettings().upscaler;
+    const bool done = EvaluateTemporal(base, u == Settings::Upscaler::Dlss, u == Settings::Upscaler::Xess);
     if (!done)
         UpscaleResolved(base);
     g_upscale.reset = false;
@@ -6893,6 +10114,70 @@ bool InitUpscale()
     pd.CS = { kEnhanceMain, sizeof(kEnhanceMain) };
     if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.enhance))))
         return false;
+    {
+        // The display gamma pass drawn into the back buffer (session 33; the swap chain can't be a UAV). Same ramp as
+        // GammaMain in fsr1.hlsl, same constants and root signature.
+        static const char kGammaDraw[] = R"(
+cbuffer C : register(b0) { uint4 q0, q1, q2, q3, q4, outSize; };
+Texture2D<float4> src : register(t0);
+float4 vs(uint id : SV_VertexID) : SV_Position { return float4(float(id == 1) * 4.0 - 1.0, float(id == 2) * -4.0 + 1.0, 0, 1); }
+float Curve(float x, float p[17]) { const float f = saturate(x) * 16.0; const uint i = min(uint(f), 15u); return lerp(p[i], p[i + 1], f - float(i)); }
+float4 ps(float4 pos : SV_Position) : SV_Target
+{
+    const uint4 q[5] = { q0, q1, q2, q3, q4 };
+    float p[17];
+    [unroll] for (uint k = 0; k < 17; k++) p[k] = asfloat(q[k / 4][k % 4]);
+    const float4 c = src.Load(int3(pos.xy, 0));
+    return float4(Curve(c.r, p), Curve(c.g, p), Curve(c.b, p), c.a);
+}
+)";
+        ComPtr<ID3DBlob> vs, ps, err;
+        if (SUCCEEDED(D3DCompile(kGammaDraw, sizeof(kGammaDraw) - 1, nullptr, nullptr, nullptr, "vs", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vs, &err)) &&
+            SUCCEEDED(D3DCompile(kGammaDraw, sizeof(kGammaDraw) - 1, nullptr, nullptr, nullptr, "ps", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps, &err)))
+        {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC gd{};
+            gd.pRootSignature = g_upscale.root.Get();
+            gd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+            gd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+            gd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            gd.SampleMask = UINT_MAX;
+            gd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            gd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            gd.RasterizerState.DepthClipEnable = TRUE;
+            gd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            gd.NumRenderTargets = 1;
+            gd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            gd.SampleDesc.Count = 1;
+            if (FAILED(g_r.device->CreateGraphicsPipelineState(&gd, IID_PPV_ARGS(&g_upscale.gammaDraw))))
+                Log("gamma: back-buffer pass pipeline failed: grading into a copy");
+        }
+        else
+            Log("gamma: back-buffer pass failed to compile: %s", err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+    }
+    {
+        // L63 (FM3 port, session 34): a plain bilinear upscale for small GPUs (REGPU_UPSCALE_BILINEAR, live). FSR 1's
+        // EASU + RCAS cost 1.65 ms a frame on a 2-CU RDNA2 iGPU at 720p (~13% of its frame); softer picture.
+        static const char kBilinear[] = R"(
+cbuffer C : register(b0) { uint4 q0, q1, q2, q3, q4, outSize; };
+Texture2D<float4> src : register(t0);
+RWTexture2D<float4> dst : register(u0);
+SamplerState s : register(s0);
+[numthreads(16, 16, 1)] void main(uint2 id : SV_DispatchThreadID)
+{
+    if (any(id >= outSize.xy)) return;
+    dst[id] = src.SampleLevel(s, (float2(id) + 0.5) / float2(outSize.xy), 0);
+}
+)";
+        ComPtr<ID3DBlob> cs, err;
+        if (SUCCEEDED(D3DCompile(kBilinear, sizeof(kBilinear) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err)))
+        {
+            pd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
+            if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.bilinear))))
+                Log("upscale: bilinear pipeline failed");
+        }
+        else
+            Log("upscale: bilinear pass failed to compile: %s", err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+    }
     pd.CS = { kViewMain, sizeof(kViewMain) };
     if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.view))))
         return false;
@@ -6917,20 +10202,109 @@ std::atomic<bool> g_gammaPwlSet{ false };
 ComPtr<ID3D12Resource> g_gammaOut;
 ComPtr<ID3D12Resource> g_enhanceOut; // enhanced lighting output (Settings::enhance)
 
+// The gamma pass straight into the back buffer (FM3 port, session 33): GradeFrontBuffer fills one of these for the
+// frame end (PresenterRecordCopy's grade callback, GradeIntoBackBuffer) instead of grading into g_gammaOut, which was
+// then copied: one 4K RGBA8 write and read less (~4% at 4K 4x). REGPU_GAMMA_COPY=1 (live): the old way.
+struct GradeJob
+{
+    bool valid = false;
+    uint32_t c[24] = {};
+    UINT slots = 0; // the image's SRV
+    ID3D12Resource* image = nullptr; // COPY_SOURCE at the frame end
+};
+GradeJob g_gradeJobs[kFrames];
+
+void GradeIntoBackBuffer(ID3D12GraphicsCommandList* l, size_t rtvPtr, uint32_t width, uint32_t height, void* ctx)
+{
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv{ rtvPtr };
+    const GradeJob& j = *static_cast<const GradeJob*>(ctx);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = j.image;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    l->ResourceBarrier(1, &b);
+    l->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    const D3D12_VIEWPORT vp{ 0, 0, float(width), float(height), 0, 1 };
+    const D3D12_RECT sc{ 0, 0, LONG(width), LONG(height) };
+    l->RSSetViewports(1, &vp);
+    l->RSSetScissorRects(1, &sc);
+    l->SetGraphicsRootSignature(g_upscale.root.Get());
+    l->SetGraphicsRoot32BitConstants(0, 24, j.c, 0);
+    l->SetGraphicsRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), j.slots, g_r.srvStride));
+    l->SetGraphicsRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), j.slots, g_r.srvStride)); // (unused UAV range)
+    l->SetPipelineState(g_upscale.gammaDraw.Get());
+    l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    l->DrawInstanced(3, 1, 0, 0);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    l->ResourceBarrier(1, &b);
+}
+
+// The same pass into a texture (COPY_SOURCE afterwards), for frames the debug server or a dump reads (they read the
+// image before the present, which in this mode is not graded).
+ComPtr<ID3D12Resource> g_gammaDrawOut;
+ComPtr<ID3D12DescriptorHeap> g_gammaDrawRtv;
+ID3D12Resource* GradeIntoTexture(GradeJob* job)
+{
+    const D3D12_RESOURCE_DESC desc = job->image->GetDesc();
+    if (!g_gammaDrawRtv)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = 1;
+        if (FAILED(g_r.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_gammaDrawRtv))))
+            return job->image;
+    }
+    if (!g_gammaDrawOut || g_gammaDrawOut->GetDesc().Width != desc.Width || g_gammaDrawOut->GetDesc().Height != desc.Height)
+    {
+        D3D12_RESOURCE_DESC td = desc;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        RetireTexture(std::move(g_gammaDrawOut));
+        g_gammaDrawOut = CreateTexture(td, D3D12_RESOURCE_STATE_COPY_SOURCE, "gamma draw");
+        if (!g_gammaDrawOut)
+            return job->image;
+        g_r.device->CreateRenderTargetView(g_gammaDrawOut.Get(), nullptr, g_gammaDrawRtv->GetCPUDescriptorHandleForHeapStart());
+    }
+    C().list->Call(
+        [](ID3D12GraphicsCommandList* l, void* ctx) {
+            GradeJob* j = static_cast<GradeJob*>(ctx);
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = g_gammaDrawOut.Get();
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            l->ResourceBarrier(1, &b);
+            const D3D12_RESOURCE_DESC d = g_gammaDrawOut->GetDesc();
+            GradeIntoBackBuffer(l, g_gammaDrawRtv->GetCPUDescriptorHandleForHeapStart().ptr, uint32_t(d.Width), d.Height, j);
+            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+            l->ResourceBarrier(1, &b);
+        },
+        job);
+    g_drawState.Invalidate();
+    return g_gammaDrawOut.Get();
+}
+
 // Returns the graded copy of `image` (in COPY_SOURCE state), or null to show it as is. `pwl`: the
 // front buffer is k_2_10_10_10, so the display uses the PWL ramp. REGPU_NO_GAMMA_PWL=1: always the table.
-ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl)
+// With `direct`, a pass that grades fills *direct (valid) for the frame end and returns null.
+// `into` (VR stereo): graded into that image (UAV-capable, state COMMON before and after) instead of g_gammaOut.
+ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl, GradeJob* direct = nullptr, ID3D12Resource* into = nullptr)
 {
     static LiveSwitch off("REGPU_NO_GAMMA"), noPwl("REGPU_NO_GAMMA_PWL");
     pwl = pwl && !noPwl && g_gammaPwlSet.load(std::memory_order_relaxed);
-    if (off || (!pwl && !g_gammaSet.load(std::memory_order_relaxed)) || !InitUpscale())
+    const bool noRamp = off || (!pwl && !g_gammaSet.load(std::memory_order_relaxed));
+    if ((noRamp && !into) || !InitUpscale())
         return nullptr;
     // 17 points of the ramp (green; the title writes equal channels), at x = k/16.
     float points[17];
     bool identity = true;
     for (uint32_t k = 0; k <= 16; k++)
     {
-        if (pwl)
+        if (noRamp)
+            points[k] = k / 16.0f;
+        else if (pwl)
         {
             // A 10-bit value: its top 7 bits pick the entry, its low 3 step along the delta
             // (base and delta are 16-bit, bits 0-5 zero).
@@ -6955,13 +10329,32 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl)
         h = (h ^ uint32_t(pt * 65535.0f)) * 0x100000001B3ull;
     if (loggedHash.exchange(h) != h && logs++ < 4)
         Log("gamma: display ramp (%s): %.3f %.3f %.3f %.3f %.3f ... %.3f", pwl ? "PWL" : "table", points[0], points[1], points[2], points[4], points[8], points[16]);
-    if (identity)
+    if (identity && !into)
         return nullptr;
     const D3D12_RESOURCE_DESC desc = image->GetDesc();
     FrameResources& f = Frame();
     if (f.descriptorsUsed + 2 > kDescriptorsPerFrame)
         return nullptr;
-    if (!g_gammaOut || g_gammaOut->GetDesc().Width != desc.Width || g_gammaOut->GetDesc().Height != desc.Height)
+    if (direct && !into && g_upscale.gammaDraw)
+    {
+        direct->slots = f.descriptorBase + f.descriptorsUsed;
+        f.descriptorsUsed += 1;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        g_r.device->CreateShaderResourceView(image, &srv, Cpu(g_r.srvHeap.Get(), direct->slots, g_r.srvStride));
+        memset(direct->c, 0, sizeof(direct->c));
+        memcpy(direct->c, points, sizeof(points));
+        direct->c[20] = uint32_t(desc.Width);
+        direct->c[21] = desc.Height;
+        direct->image = image;
+        direct->valid = true;
+        g_drawState.Invalidate(); // (the frame end sets the compute pipeline)
+        return nullptr;
+    }
+    if (!into && (!g_gammaOut || g_gammaOut->GetDesc().Width != desc.Width || g_gammaOut->GetDesc().Height != desc.Height))
     {
         D3D12_RESOURCE_DESC td = desc;
         td.MipLevels = 1;
@@ -6973,7 +10366,7 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl)
     const UINT slots = f.descriptorBase + f.descriptorsUsed;
     f.descriptorsUsed += 2;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.Format = into ? desc.Format : DXGI_FORMAT_R8G8B8A8_UNORM; // (VR's HUD: a half-float copy of the surface)
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
@@ -6981,7 +10374,17 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl)
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
     uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    g_r.device->CreateUnorderedAccessView(g_gammaOut.Get(), nullptr, &uav, Cpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    ID3D12Resource* out = into ? into : g_gammaOut.Get();
+    g_r.device->CreateUnorderedAccessView(out, nullptr, &uav, Cpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    if (into)
+    {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = into;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        C().list->ResourceBarrier(1, &b);
+    }
     uint32_t c[24] = {};
     memcpy(c, points, sizeof(points));
     c[20] = uint32_t(desc.Width);
@@ -6994,12 +10397,12 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl)
     C().list->Dispatch(UINT((desc.Width + 7) / 8), (desc.Height + 7) / 8, 1);
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = g_gammaOut.Get();
+    b.Transition.pResource = out;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = into ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_SOURCE;
     C().list->ResourceBarrier(1, &b);
     g_drawState.Invalidate(); // the compute pipeline replaced the draw's
-    return g_gammaOut.Get();
+    return out;
 }
 
 // Enhanced lighting (Settings::enhance): the frame through the local-contrast pass. `image` is
@@ -7161,8 +10564,10 @@ void UpscaleResolved(uint32_t base)
     const uint32_t inWidth = dest.hostWidth, inHeight = dest.hostHeight;
     const float savedScale = g_sceneScale;
     g_sceneScale = 1.0f;
+    BumpPassEpoch();
     const uint32_t outWidth = uint32_t(HostX(LONG(dest.width))), outHeight = uint32_t(HostY(LONG(dest.height)));
     g_sceneScale = savedScale;
+    BumpPassEpoch();
     if (outWidth <= inWidth || outHeight <= inHeight)
         return;
     const uint64_t frame = dest.frame;
@@ -7245,6 +10650,18 @@ void UpscaleResolved(uint32_t base)
     const UINT gx = (outWidth + 15) / 16, gy = (outHeight + 15) / 16;
     C().list->SetComputeRootSignature(g_upscale.root.Get());
     C().list->SetComputeRoot32BitConstants(0, 24, c, 0);
+    // L63: REGPU_UPSCALE_BILINEAR=1 (live): the source straight into the output, one bilinear sample a pixel.
+    if (static LiveSwitch bilinear("REGPU_UPSCALE_BILINEAR"); bilinear && g_upscale.bilinear)
+    {
+        barrier(dest.resource.Get(), read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        C().list->SetPipelineState(g_upscale.bilinear.Get());
+        C().list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+        C().list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 3, g_r.srvStride));
+        C().list->Dispatch(gx, gy, 1);
+        barrier(dest.resource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+        g_drawState.Invalidate();
+        return;
+    }
     C().list->SetPipelineState(g_upscale.easu.Get());
     C().list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
     C().list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
@@ -7260,6 +10677,543 @@ void UpscaleResolved(uint32_t base)
     g_drawState.Invalidate(); // the compute pipeline replaced the draw's
 }
 
+// ---- Anti-aliasing filters (FM3 port, session 36) ------------------------------------------------------------------
+// Config::postAA on the finished scene image (the same point as the upscalers: before the title's post-processing and
+// HUD): FXAA 3.11, SMAA 1x or CMAA 2 (original shaders, postaa_*.hlsl, a REGPU_AA_DIR build) inside postaa.hlsl's
+// reversible tone map, or TAA (postaa.hlsl TaaMain) on the temporal upscalers' motion vectors and jitter.
+// Config::ssaa: the frame is drawn larger (Config::RenderSize) and filtered down at the present (SsaaDownsample).
+// All passes are compute, on their own root signature: 16 constants (b0), 4 SRVs (t0-t3), 8 UAVs (u0-u7), a linear
+// (s0) and a point (s1) clamp sampler.
+struct PostAA
+{
+    bool tried = false, ready = false, filters = false;
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> prep, finish, copy, taa, ssaa;
+    ComPtr<ID3D12PipelineState> fxaa, smaaEdges, smaaWeights, smaaBlend, cmEdges, cmProcess, cmApply, cmArgs;
+    ComPtr<ID3D12CommandSignature> dispatchSig;
+    ComPtr<ID3D12Resource> workA, workB, edges, weights, areaTex, searchTex; // filters (work: RGBA16F, compressed)
+    uint32_t workW = 0, workH = 0;
+    ComPtr<ID3D12Resource> history[2]; // TAA output of the last two frames (RGBA16F, linear)
+    uint32_t historyW = 0, historyH = 0, historyIndex = 0;
+    // CMAA 2's working storage (sized as Intel's DX12 sample does, for the work size).
+    ComPtr<ID3D12Resource> cmEdgeTex, cmHeads, cmCandidates, cmLocations, cmItems, cmControl, cmIndirect;
+    bool cmFirst = true;
+    ComPtr<ID3D12Resource> ssaaOut; // the shown frame (RGBA8, shown size)
+} g_postAA;
+
+const D3D12_RESOURCE_STATES kAaRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+bool InitPostAA()
+{
+    if (g_postAA.tried)
+        return g_postAA.ready;
+    g_postAA.tried = true;
+    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 4;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 8;
+    D3D12_ROOT_PARAMETER params[3]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.Num32BitValues = 16;
+    for (int i = 1; i < 3; i++)
+    {
+        params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[i].DescriptorTable.NumDescriptorRanges = 1;
+        params[i].DescriptorTable.pDescriptorRanges = &ranges[i - 1];
+    }
+    D3D12_STATIC_SAMPLER_DESC samplers[2]{};
+    for (int i = 0; i < 2; i++)
+    {
+        samplers[i].Filter = i ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+        samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samplers[i].MaxLOD = D3D12_FLOAT32_MAX;
+        samplers[i].ShaderRegister = UINT(i);
+        samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC rs{};
+    rs.NumParameters = 3;
+    rs.pParameters = params;
+    rs.NumStaticSamplers = 2;
+    rs.pStaticSamplers = samplers;
+    ComPtr<ID3DBlob> blob, error;
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) ||
+        FAILED(g_r.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_postAA.root))))
+    {
+        Log("anti-aliasing: root signature failed: %s", error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
+        return false;
+    }
+    auto make = [](const unsigned char* code, size_t size, ComPtr<ID3D12PipelineState>& out, const char* name) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = g_postAA.root.Get();
+        pd.CS = { code, size };
+        if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&out))))
+        {
+            Log("anti-aliasing: %s pipeline failed", name);
+            return false;
+        }
+        return true;
+    };
+    bool ok = make(kPrepMain, sizeof(kPrepMain), g_postAA.prep, "prep") && make(kFinishMain, sizeof(kFinishMain), g_postAA.finish, "finish") &&
+        make(kCopyMain, sizeof(kCopyMain), g_postAA.copy, "copy") && make(kTaaMain, sizeof(kTaaMain), g_postAA.taa, "TAA") &&
+        make(kSsaaMain, sizeof(kSsaaMain), g_postAA.ssaa, "SSAA");
+    if (!ok)
+        return false;
+#if REGPU_POSTAA_FILTERS
+    g_postAA.filters = make(kFxaaMain, sizeof(kFxaaMain), g_postAA.fxaa, "FXAA") &&
+        make(kSmaaEdgesMain, sizeof(kSmaaEdgesMain), g_postAA.smaaEdges, "SMAA edges") &&
+        make(kSmaaWeightsMain, sizeof(kSmaaWeightsMain), g_postAA.smaaWeights, "SMAA weights") &&
+        make(kSmaaBlendMain, sizeof(kSmaaBlendMain), g_postAA.smaaBlend, "SMAA blend") &&
+        make(kEdgesColor2x2CS, sizeof(kEdgesColor2x2CS), g_postAA.cmEdges, "CMAA 2 edges") &&
+        make(kProcessCandidatesCS, sizeof(kProcessCandidatesCS), g_postAA.cmProcess, "CMAA 2 candidates") &&
+        make(kDeferredColorApply2x2CS, sizeof(kDeferredColorApply2x2CS), g_postAA.cmApply, "CMAA 2 apply") &&
+        make(kComputeDispatchArgsCS, sizeof(kComputeDispatchArgsCS), g_postAA.cmArgs, "CMAA 2 arguments");
+    if (g_postAA.filters)
+    {
+        D3D12_INDIRECT_ARGUMENT_DESC arg{};
+        arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+        D3D12_COMMAND_SIGNATURE_DESC sd{};
+        sd.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+        sd.NumArgumentDescs = 1;
+        sd.pArgumentDescs = &arg;
+        if (FAILED(g_r.device->CreateCommandSignature(&sd, nullptr, IID_PPV_ARGS(&g_postAA.dispatchSig))))
+            g_postAA.filters = false;
+    }
+    // SMAA's precomputed area (160x560 RG8) and search (64x16 R8) textures, uploaded once.
+    auto upload = [](const unsigned char* bytes, uint32_t w, uint32_t h, uint32_t pitch, DXGI_FORMAT format, ComPtr<ID3D12Resource>& out) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = w;
+        td.Height = h;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.SampleDesc.Count = 1;
+        td.Format = format;
+        if (FAILED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&out))))
+            return false;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT64 total = 0;
+        g_r.device->GetCopyableFootprints(&td, 0, 1, 0, &fp, nullptr, nullptr, &total);
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = total;
+        bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ComPtr<ID3D12Resource> staging;
+        if (FAILED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&staging))))
+            return false;
+        uint8_t* p = nullptr;
+        staging->Map(0, nullptr, reinterpret_cast<void**>(&p));
+        for (uint32_t y = 0; y < h; y++)
+            memcpy(p + fp.Offset + size_t(y) * fp.Footprint.RowPitch, bytes + size_t(y) * pitch, pitch);
+        staging->Unmap(0, nullptr);
+        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+        dst.pResource = out.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.pResource = staging.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = fp;
+        C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = out.Get();
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = kAaRead;
+        C().list->ResourceBarrier(1, &b);
+        Frame().garbage.push_back(std::move(staging)); // kept until this frame's GPU work is done
+        return true;
+    };
+    if (g_postAA.filters)
+        g_postAA.filters = upload(areaTexBytes, AREATEX_WIDTH, AREATEX_HEIGHT, AREATEX_PITCH, DXGI_FORMAT_R8G8_UNORM, g_postAA.areaTex) &&
+            upload(searchTexBytes, SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, SEARCHTEX_PITCH, DXGI_FORMAT_R8_UNORM, g_postAA.searchTex);
+#endif
+    // FinishMain keeps the scene's alpha by reading it through the UAV: a typed load of RGBA16F / RGBA8.
+    D3D12_FEATURE_DATA_D3D12_OPTIONS opt{};
+    if (g_postAA.filters && (FAILED(g_r.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opt, sizeof(opt))) || !opt.TypedUAVLoadAdditionalFormats))
+    {
+        Log("anti-aliasing: no typed UAV loads of RGBA16F/RGBA8 on this GPU: FXAA, SMAA and CMAA 2 off");
+        g_postAA.filters = false;
+    }
+    g_postAA.ready = true;
+    Log("anti-aliasing: ready (FXAA, SMAA, CMAA 2 %s; TAA, SSAA)", g_postAA.filters ? "available" : "not in this build");
+    return true;
+}
+
+// A texture of the post-AA passes (UAV-capable), left in kAaRead.
+bool EnsureAaTexture(ComPtr<ID3D12Resource>& t, uint32_t w, uint32_t h, DXGI_FORMAT format)
+{
+    if (t && t->GetDesc().Width == w && t->GetDesc().Height == h && t->GetDesc().Format == format)
+        return true;
+    if (t)
+        Frame().garbage.push_back(std::move(t));
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = w;
+    td.Height = h;
+    td.DepthOrArraySize = 1;
+    td.MipLevels = 1;
+    td.SampleDesc.Count = 1;
+    td.Format = format;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    return SUCCEEDED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, kAaRead, nullptr, IID_PPV_ARGS(&t)));
+}
+
+// A raw (stride 0) or structured buffer with a UAV, left in UNORDERED_ACCESS.
+bool EnsureAaBuffer(ComPtr<ID3D12Resource>& b, uint64_t bytes)
+{
+    if (b && b->GetDesc().Width >= bytes)
+        return true;
+    if (b)
+        Frame().garbage.push_back(std::move(b));
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = bytes;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    return SUCCEEDED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&b)));
+}
+
+// One dispatch's descriptors: 4 SRVs then 8 UAVs in this frame's slots (unused ones null).
+struct AaTable
+{
+    UINT base = ~0u;
+    explicit AaTable()
+    {
+        FrameResources& f = Frame();
+        if (f.descriptorsUsed + 12 > kDescriptorsPerFrame)
+            return;
+        base = f.descriptorBase + f.descriptorsUsed;
+        f.descriptorsUsed += 12;
+        for (UINT i = 0; i < 4; i++)
+            Srv(i, nullptr, DXGI_FORMAT_R8G8B8A8_UNORM);
+        for (UINT i = 0; i < 8; i++)
+            Uav(i, nullptr, DXGI_FORMAT_R8G8B8A8_UNORM);
+    }
+    bool ok() const { return base != ~0u; }
+    void Srv(UINT i, ID3D12Resource* r, DXGI_FORMAT format) const
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+        v.Format = format;
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.Texture2D.MipLevels = 1;
+        g_r.device->CreateShaderResourceView(r, &v, Cpu(g_r.srvHeap.Get(), base + i, g_r.srvStride));
+    }
+    void Uav(UINT i, ID3D12Resource* r, DXGI_FORMAT format) const
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC v{};
+        v.Format = format;
+        v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        g_r.device->CreateUnorderedAccessView(r, nullptr, &v, Cpu(g_r.srvHeap.Get(), base + 4 + i, g_r.srvStride));
+    }
+    void UavBuffer(UINT i, ID3D12Resource* r, UINT stride, bool raw) const
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC v{};
+        v.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        v.Format = raw ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_UNKNOWN;
+        v.Buffer.NumElements = UINT(r->GetDesc().Width / (raw ? 4 : stride));
+        v.Buffer.StructureByteStride = raw ? 0 : stride;
+        v.Buffer.Flags = raw ? D3D12_BUFFER_UAV_FLAG_RAW : D3D12_BUFFER_UAV_FLAG_NONE;
+        g_r.device->CreateUnorderedAccessView(r, nullptr, &v, Cpu(g_r.srvHeap.Get(), base + 4 + i, g_r.srvStride));
+    }
+    void Bind(ID3D12PipelineState* pso, const uint32_t c[16]) const
+    {
+        C().list->SetComputeRootSignature(g_postAA.root.Get());
+        C().list->SetComputeRoot32BitConstants(0, 16, c, 0);
+        C().list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), base, g_r.srvStride));
+        C().list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), base + 4, g_r.srvStride));
+        C().list->SetPipelineState(pso);
+    }
+};
+
+void AaBarrier(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+{
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter = to;
+    C().list->ResourceBarrier(1, &b);
+}
+
+void AaUavBarrier(ID3D12Resource* r)
+{
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    b.UAV.pResource = r;
+    C().list->ResourceBarrier(1, &b);
+}
+
+// The constants every pass reads: size (xy, zw), 1/size and size, two parameter vectors.
+void AaConstants(uint32_t c[16], uint32_t w, uint32_t h, uint32_t z = 0, uint32_t ww = 0)
+{
+    c[0] = w, c[1] = h, c[2] = z, c[3] = ww;
+    const float rt[4] = { 1.0f / float(w), 1.0f / float(h), float(w), float(h) };
+    memcpy(c + 4, rt, sizeof(rt));
+}
+
+void AaDispatch(uint32_t w, uint32_t h) { C().list->Dispatch((w + 7) / 8, (h + 7) / 8, 1); }
+
+// FXAA, SMAA or CMAA 2 on the scene image at `base` (after any upscale: output size).
+void PostFilterScene(uint32_t base)
+{
+    const Settings::PostAA mode = GetSettings().postAA;
+    auto it = g_r.resolved.find(base);
+    if (it == g_r.resolved.end() || !it->second.resource || !InitPostAA() || !g_postAA.filters)
+        return;
+    ResolvedTexture& scene = it->second;
+    if (scene.format != DXGI_FORMAT_R8G8B8A8_UNORM && scene.format != DXGI_FORMAT_R16G16B16A16_FLOAT)
+        return;
+    const uint32_t w = scene.hostWidth, h = scene.hostHeight;
+    const DXGI_FORMAT work = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (!EnsureAaTexture(g_postAA.workA, w, h, work) || !EnsureAaTexture(g_postAA.workB, w, h, work))
+        return;
+    uint32_t c[16] = {};
+    AaConstants(c, w, h);
+    // 1. Scene -> work A (compressed, luma in alpha).
+    {
+        AaTable t;
+        if (!t.ok())
+            return;
+        t.Srv(0, scene.resource.Get(), scene.format);
+        t.Uav(0, g_postAA.workA.Get(), work);
+        AaBarrier(g_postAA.workA.Get(), kAaRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        t.Bind(g_postAA.prep.Get(), c);
+        AaDispatch(w, h);
+        AaBarrier(g_postAA.workA.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kAaRead);
+    }
+    // 2. The filter: work A -> work B.
+    if (mode == Settings::PostAA::Fxaa)
+    {
+        AaTable t;
+        if (!t.ok())
+            return;
+        t.Srv(0, g_postAA.workA.Get(), work);
+        t.Uav(0, g_postAA.workB.Get(), work);
+        const float fx[4] = { 0.75f, 0.125f, 0.0312f, 0.0f }; // FXAA's defaults for quality: subpixel, threshold, minimum
+        memcpy(c + 8, fx, sizeof(fx));
+        AaBarrier(g_postAA.workB.Get(), kAaRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        t.Bind(g_postAA.fxaa.Get(), c);
+        AaDispatch(w, h);
+        AaBarrier(g_postAA.workB.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kAaRead);
+    }
+    else if (mode == Settings::PostAA::Smaa)
+    {
+        if (!EnsureAaTexture(g_postAA.edges, w, h, DXGI_FORMAT_R8G8_UNORM) || !EnsureAaTexture(g_postAA.weights, w, h, DXGI_FORMAT_R8G8B8A8_UNORM))
+            return;
+        AaTable e, wt, bl;
+        if (!e.ok() || !wt.ok() || !bl.ok())
+            return;
+        e.Srv(0, g_postAA.workA.Get(), work);
+        e.Uav(0, g_postAA.edges.Get(), DXGI_FORMAT_R8G8_UNORM);
+        AaBarrier(g_postAA.edges.Get(), kAaRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        e.Bind(g_postAA.smaaEdges.Get(), c);
+        AaDispatch(w, h);
+        AaBarrier(g_postAA.edges.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kAaRead);
+        wt.Srv(0, g_postAA.edges.Get(), DXGI_FORMAT_R8G8_UNORM);
+        wt.Srv(1, g_postAA.areaTex.Get(), DXGI_FORMAT_R8G8_UNORM);
+        wt.Srv(2, g_postAA.searchTex.Get(), DXGI_FORMAT_R8_UNORM);
+        wt.Uav(0, g_postAA.weights.Get(), DXGI_FORMAT_R8G8B8A8_UNORM);
+        AaBarrier(g_postAA.weights.Get(), kAaRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        wt.Bind(g_postAA.smaaWeights.Get(), c);
+        AaDispatch(w, h);
+        AaBarrier(g_postAA.weights.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kAaRead);
+        bl.Srv(0, g_postAA.workA.Get(), work);
+        bl.Srv(1, g_postAA.weights.Get(), DXGI_FORMAT_R8G8B8A8_UNORM);
+        bl.Uav(0, g_postAA.workB.Get(), work);
+        AaBarrier(g_postAA.workB.Get(), kAaRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        bl.Bind(g_postAA.smaaBlend.Get(), c);
+        AaDispatch(w, h);
+        AaBarrier(g_postAA.workB.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kAaRead);
+    }
+    else if (mode == Settings::PostAA::Cmaa2)
+    {
+        // Intel's sizes (vaCMAA2DX12.cpp, the "99.99% safe" variant): edges packed two pixels per R8_UINT texel, list
+        // heads per 2x2 quad, candidates w*h/4, blend items w*h/2 (uint2), locations (w*h+3)/6.
+        const uint64_t px = uint64_t(w) * h;
+        if (!EnsureAaTexture(g_postAA.cmEdgeTex, (w + 1) / 2, h, DXGI_FORMAT_R8_UINT) ||
+            !EnsureAaTexture(g_postAA.cmHeads, (w + 1) / 2, (h + 1) / 2, DXGI_FORMAT_R32_UINT) ||
+            !EnsureAaBuffer(g_postAA.cmCandidates, px / 4 * 4) || !EnsureAaBuffer(g_postAA.cmLocations, (px + 3) / 6 * 4) ||
+            !EnsureAaBuffer(g_postAA.cmItems, px / 2 * 8) || !EnsureAaBuffer(g_postAA.cmControl, 16 * 4) || !EnsureAaBuffer(g_postAA.cmIndirect, 4 * 4))
+            return;
+        // Work B starts as a copy of work A; CMAA 2 writes only the pixels it blends.
+        {
+            AaTable t;
+            if (!t.ok())
+                return;
+            t.Srv(0, g_postAA.workA.Get(), work);
+            t.Uav(0, g_postAA.workB.Get(), work);
+            AaBarrier(g_postAA.workB.Get(), kAaRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            t.Bind(g_postAA.copy.Get(), c);
+            AaDispatch(w, h);
+            AaUavBarrier(g_postAA.workB.Get());
+        }
+        AaTable t;
+        if (!t.ok())
+            return;
+        t.Srv(0, g_postAA.workA.Get(), work);
+        t.Uav(0, g_postAA.workB.Get(), work);
+        t.Uav(1, g_postAA.cmEdgeTex.Get(), DXGI_FORMAT_R8_UINT);
+        t.UavBuffer(2, g_postAA.cmCandidates.Get(), 4, false);
+        t.UavBuffer(3, g_postAA.cmLocations.Get(), 4, false);
+        t.UavBuffer(4, g_postAA.cmItems.Get(), 8, false);
+        t.Uav(5, g_postAA.cmHeads.Get(), DXGI_FORMAT_R32_UINT);
+        t.UavBuffer(6, g_postAA.cmControl.Get(), 4, true);
+        t.UavBuffer(7, g_postAA.cmIndirect.Get(), 4, true);
+        AaBarrier(g_postAA.cmEdgeTex.Get(), kAaRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        AaBarrier(g_postAA.cmHeads.Get(), kAaRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (g_postAA.cmFirst)
+        {
+            // Its arguments kernel also clears the control buffer: run once before the first frame (as Intel's does).
+            g_postAA.cmFirst = false;
+            t.Bind(g_postAA.cmArgs.Get(), c);
+            C().list->Dispatch(2, 1, 1);
+            AaUavBarrier(g_postAA.cmControl.Get());
+        }
+        t.Bind(g_postAA.cmEdges.Get(), c);
+        C().list->Dispatch((w + 14 * 2 - 1) / (14 * 2), (h + 14 * 2 - 1) / (14 * 2), 1);
+        AaUavBarrier(nullptr);
+        auto indirect = [](uint32_t x, uint32_t y, ID3D12PipelineState* pso) {
+            C().list->SetPipelineState(g_postAA.cmArgs.Get());
+            C().list->Dispatch(x, y, 1);
+            AaUavBarrier(g_postAA.cmControl.Get());
+            AaBarrier(g_postAA.cmIndirect.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            C().list->SetPipelineState(pso);
+            // (The recorded list has no ExecuteIndirect: this one call runs on the real list where it replays.)
+            C().list->Call(
+                [](ID3D12GraphicsCommandList* l, void*) { l->ExecuteIndirect(g_postAA.dispatchSig.Get(), 1, g_postAA.cmIndirect.Get(), 0, nullptr, 0); },
+                nullptr);
+            AaBarrier(g_postAA.cmIndirect.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            AaUavBarrier(nullptr);
+        };
+        indirect(2, 1, g_postAA.cmProcess.Get());
+        indirect(1, 2, g_postAA.cmApply.Get());
+        AaBarrier(g_postAA.cmEdgeTex.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kAaRead);
+        AaBarrier(g_postAA.cmHeads.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kAaRead);
+        AaBarrier(g_postAA.workB.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kAaRead);
+    }
+    else
+        return;
+    // 3. Work A, B -> scene (the changed pixels, expanded back).
+    {
+        AaTable t;
+        if (!t.ok())
+            return;
+        t.Srv(0, g_postAA.workA.Get(), work);
+        t.Srv(1, g_postAA.workB.Get(), work);
+        t.Uav(0, scene.resource.Get(), scene.format);
+        AaBarrier(scene.resource.Get(), kAaRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        t.Bind(g_postAA.finish.Get(), c);
+        AaDispatch(w, h);
+        AaBarrier(scene.resource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kAaRead);
+    }
+    g_drawState.Invalidate(); // the compute pipeline replaced the draw's
+}
+
+// TAA on the scene image at `base` (native scale): this frame's jittered image, last frame's output reprojected by the
+// motion vectors, clipped to this frame's neighbourhood, blended (10% new). false: nothing done.
+bool TaaScene(uint32_t base)
+{
+    auto it = g_r.resolved.find(base);
+    if (it == g_r.resolved.end() || !it->second.resource || !InitPostAA() || !g_upscale.motion)
+        return false;
+    ResolvedTexture& scene = it->second;
+    if (scene.format != DXGI_FORMAT_R8G8B8A8_UNORM && scene.format != DXGI_FORMAT_R16G16B16A16_FLOAT)
+        return false;
+    const uint32_t w = scene.hostWidth, h = scene.hostHeight;
+    const DXGI_FORMAT hf = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    bool reset = g_upscale.reset || g_postAA.historyW != w || g_postAA.historyH != h;
+    if (!EnsureAaTexture(g_postAA.history[0], w, h, hf) || !EnsureAaTexture(g_postAA.history[1], w, h, hf))
+        return false;
+    g_postAA.historyW = w, g_postAA.historyH = h;
+    ID3D12Resource* prev = g_postAA.history[g_postAA.historyIndex].Get();
+    ID3D12Resource* next = g_postAA.history[g_postAA.historyIndex ^ 1].Get();
+    AaTable t, copy;
+    if (!t.ok() || !copy.ok())
+        return false;
+    uint32_t c[16] = {};
+    AaConstants(c, w, h);
+    // REGPU_TAA_BLEND=<percent> (environment, read each frame: Fm3 "env" changes it live): the new frame's share, 10 by
+    // default (lower: smoother, more ghosting); REGPU_TAA_CLIP=<x100>: the neighbourhood box in standard deviations (125).
+    const char* blendEnv = getenv("REGPU_TAA_BLEND");
+    const char* clipEnv = getenv("REGPU_TAA_CLIP");
+    const float blend = blendEnv && atoi(blendEnv) > 0 ? std::clamp(float(atoi(blendEnv)) / 100.0f, 0.01f, 1.0f) : 0.1f;
+    const float clip = clipEnv && atoi(clipEnv) > 0 ? float(atoi(clipEnv)) / 100.0f : 1.25f;
+    const float p0[4] = { blend, reset ? 1.0f : 0.0f, clip, 0.0f };
+    memcpy(c + 8, p0, sizeof(p0));
+    t.Srv(0, scene.resource.Get(), scene.format);
+    t.Srv(1, prev, hf);
+    t.Srv(2, g_upscale.motion.Get(), DXGI_FORMAT_R16G16_FLOAT);
+    t.Uav(0, next, hf);
+    AaBarrier(g_upscale.motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    AaBarrier(next, kAaRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    t.Bind(g_postAA.taa.Get(), c);
+    AaDispatch(w, h);
+    AaBarrier(next, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kAaRead);
+    AaBarrier(g_upscale.motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    copy.Srv(0, next, hf);
+    copy.Uav(0, scene.resource.Get(), scene.format);
+    AaBarrier(scene.resource.Get(), kAaRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    copy.Bind(g_postAA.copy.Get(), c);
+    AaDispatch(w, h);
+    AaBarrier(scene.resource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kAaRead);
+    g_postAA.historyIndex ^= 1;
+    g_drawState.Invalidate();
+    return true;
+}
+
+// SSAA: the frame (`image`, COPY_SOURCE, the supersampled size) filtered down to the shown size; the result is in
+// COPY_SOURCE too. `image` itself when supersampling is off or anything fails.
+ID3D12Resource* SsaaDownsample(ID3D12Resource* image)
+{
+    if (!image || GetSettings().ssaa <= 1.0f || !InitPostAA())
+        return image;
+    uint32_t sw = 0, sh = 0;
+    GetSettings().ShownSize(sw, sh);
+    const D3D12_RESOURCE_DESC d = image->GetDesc();
+    if (!sw || !sh || (d.Width == sw && d.Height == sh) || d.Format != DXGI_FORMAT_R8G8B8A8_UNORM)
+        return image;
+    if (!g_postAA.ssaaOut || g_postAA.ssaaOut->GetDesc().Width != sw || g_postAA.ssaaOut->GetDesc().Height != sh)
+    {
+        if (!EnsureAaTexture(g_postAA.ssaaOut, sw, sh, DXGI_FORMAT_R8G8B8A8_UNORM))
+            return image;
+        AaBarrier(g_postAA.ssaaOut.Get(), kAaRead, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
+    AaTable t;
+    if (!t.ok())
+        return image;
+    uint32_t c[16] = {};
+    AaConstants(c, uint32_t(d.Width), d.Height, sw, sh);
+    t.Srv(0, image, DXGI_FORMAT_R8G8B8A8_UNORM);
+    t.Uav(0, g_postAA.ssaaOut.Get(), DXGI_FORMAT_R8G8B8A8_UNORM);
+    AaBarrier(image, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    AaBarrier(g_postAA.ssaaOut.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    t.Bind(g_postAA.ssaa.Get(), c);
+    AaDispatch(sw, sh);
+    AaBarrier(g_postAA.ssaaOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    AaBarrier(image, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g_drawState.Invalidate();
+    return g_postAA.ssaaOut.Get();
+}
+
+bool PostFilterOn()
+{
+    const Settings::PostAA m = GetSettings().postAA;
+    return m == Settings::PostAA::Fxaa || m == Settings::PostAA::Smaa || m == Settings::PostAA::Cmaa2;
+}
+
 // The scene is complete (its full-screen image resolved): upscale it, and render the rest of
 // the frame (post-processing, HUD) at full size.
 void UpscaleScene(uint32_t base)
@@ -7268,7 +11222,10 @@ void UpscaleScene(uint32_t base)
         TemporalEvaluate(base);
     else
         UpscaleResolved(base);
+    if (PostFilterOn())
+        PostFilterScene(base);
     g_sceneScale = 1.0f;
+    BumpPassEpoch();
     g_scenePhase = false;
     g_upscale.switchedThisFrame = true;
 }
@@ -7435,7 +11392,21 @@ void Resolve()
         const uint32_t declaredHeight = (pitchReg >> 16) & 0x3FFF;
         // (Only for a rectangle narrower than the image: full-width rows are a tall pass's tiles, which
         // FH1's scene resolves are too, at the tile's own row.)
-        const bool placedInImage = imageBase && rect.top > 0 && uint32_t(rect.bottom) <= declaredHeight && uint32_t(rect.right - rect.left) < pitch;
+        bool placedInImage = imageBase && rect.top > 0 && uint32_t(rect.bottom) <= declaredHeight && uint32_t(rect.right - rect.left) < pitch;
+        // A full-width rectangle whose destination already holds a resolved image of that width covering its rows
+        // is a part of that image, not a tile: a tile's destination is its own row (the image base plus its top
+        // rows), where no image starts. FM3 rebuilds its 512x512 road detail image half at a time, rows 256-511
+        // to the image's own base; taken as a tile it went to a separate image 256 rows earlier, and the road
+        // image kept a stale, blurred lower half (smooth bands on the asphalt once the chase camera turned).
+        // REGPU_NO_RESOLVE_INTO_IMAGE=1: as a tile, as before (A/B).
+        static LiveSwitch noIntoImage("REGPU_NO_RESOLVE_INTO_IMAGE");
+        if (!placedInImage && !noIntoImage && rect.top > 0 && uint32_t(rect.bottom) <= declaredHeight)
+        {
+            const auto existing = g_r.resolved.find(gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF);
+            if (existing != g_r.resolved.end() && existing->second.resource && existing->second.width == pitch &&
+                existing->second.height >= uint32_t(rect.bottom))
+                placedInImage = true;
+        }
         const uint32_t destBase = gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF;
         uint32_t base = placedInImage ? destBase : (destBase - uint32_t(rect.top) * pitch * (noTileBpp ? 4 : guestBpp)) & 0x1FFFFFFF;
         const uint32_t width = std::clamp<uint32_t>(pitch, 1, std::max<uint32_t>(kWidth, BigPassSize()));
@@ -7461,7 +11432,15 @@ void Resolve()
         // the HDR range. REGPU_NO_1010102_AS_8888 keeps every one HDR.
         static LiveSwitch no1010102("REGPU_NO_1010102_AS_8888");
         const int bias = int32_t(info << 10) >> 26; // bits 16-21, signed
+        // REGPU_COPIES_1010102=1 (live): a k_2_10_10_10 destination is copied into R10G10B10A2, as the console
+        // stores it (10 bits a colour, saturated), not into half floats (the HDR scene copied down with an
+        // exponent bias: half the bytes to write and to read back). The image differs by a level or two of
+        // the 10-bit colours where half floats held more. Not the main view's image while the scene is
+        // upscaled: the upscalers take 8888 and half floats only.
+        static LiveSwitch copies1010102("REGPU_COPIES_1010102");
+        const bool as1010102 = copies1010102 && !depth && destFormat == 7 && !(g_scenePhase && width >= FrameW());
         const DXGI_FORMAT format = depth ? DXGI_FORMAT_R32_FLOAT
+            : as1010102 ? DXGI_FORMAT_R10G10B10A2_UNORM
             : destFormat == 6 || (destFormat == 7 && bias == 0 && !no1010102) ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
         // Bit 24 (copy swap): the destination stores red and blue exchanged; the
         // fetch swizzle swaps them back when the title samples it.
@@ -7521,6 +11500,7 @@ void Resolve()
         // The band's rows in the image (what the write-backs copy).
         const D3D12_RECT imageRect{ rect.left, rect.top + destRow, rect.right, rect.bottom + destRow };
         g_r.resolved[base].guestBpp = guestBpp;
+        g_r.resolved[base].copyPitch = pitch;
         // 16-bit fixed destinations (k_16, k_16_16, k_16_16_16_16: formats 24-26) hold integers: the copy converts
         // each value (after the exponent bias) to a 16-bit integer and saturates, signed or unsigned by the copy's
         // number format (RB_COPY_DEST_INFO bits 13-15: 1 snorm, 3 sint signed). Our texture keeps the value as a
@@ -7535,7 +11515,7 @@ void Resolve()
         static constexpr float kUnorm[2] = { 0.0f, 1.0f };
         const float* destRange = !depth && !noFixed16Clamp && destFormat >= 24 && destFormat <= 26
             ? (numberFormat == 1 || numberFormat == 3 ? kSigned16 : kUnsigned16)
-            : !depth && destFormat == 7 && format == DXGI_FORMAT_R16G16B16A16_FLOAT ? kUnorm : nullptr;
+            : !depth && destFormat == 7 && format != DXGI_FORMAT_R8G8B8A8_UNORM ? kUnorm : nullptr;
         // A 7e3 surface (colour formats 3, 12) holds 0..31.875: additive blends past that saturate in
         // the EDRAM, but sum on in our half-float target, so the copy is held to it (scaled with the
         // exponent bias). Unclamped, PGR4's menu crowd flashes (a pile of additive sprites) fed its
@@ -7557,21 +11537,49 @@ void Resolve()
         // centre's), so the copy rounds it as the hardware's does. REGPU_NO_RESOLVE_ALPHA2=1: as before.
         static LiveSwitch noAlpha2("REGPU_NO_RESOLVE_ALPHA2");
         const uint32_t blitFlags = (toGamma ? 1u : 0u) | (!depth && destFormat == 7 && !noAlpha2 ? 2u : 0u);
+        // A copy much narrower than the image already at its destination, with that image's row width (pitch) and declaring
+        // its height, writes the image's top-left corner in memory, as any copy into a tile of it does: it is drawn into
+        // that image, not made the image there (which replaced the image by a copy-sized one). FM3 composes a vinyl
+        // region at the livery atlas's texel 0, 0 on some cars (the CRX's 784x408 region): the 2048x2048 atlas was
+        // replaced by a 1280-wide image of that region, every later region missed it, and the car showed only that
+        // region's vinyl, in the wrong places. Only a copy at least 32 texels narrower: the row width is the image's
+        // rounded up to whole 32-texel tiles, so a copy within 32 of it spans the whole image (a 1616-wide copy with
+        // pitch 1632 is that image's own: a tall pass's tiles, each at a base where the previous build left an image of
+        // its own, were drawn there and not into the pass's image: the vinyls kept only the first tile's rows).
+        // Narrower only, not shorter (session 41): a full-width copy with fewer rows (the first livery strip, 2048x512 at
+        // the atlas's base) has to stay the image there, as the game's copies make it, so the host's write-back
+        // rule sees it and writes the whole livery back; drawn into the atlas instead, only the vinyl regions reached
+        // memory and the CPU's compressed copy (garage, menus) mixed old strips in.
+        // REGPU_NO_RESOLVE_INTO_OWN_BASE=1: made the image there (A/B, live).
+        static LiveSwitch noIntoOwnBase("REGPU_NO_RESOLVE_INTO_OWN_BASE");
+        bool intoOwnBase = false;
+        if (!depth && !noIntoOwnBase && !placedInImage && !destRow && rect.top == 0 && rect.left == 0)
+            if (const auto own = g_r.resolved.find(base); own != g_r.resolved.end() && own->second.resource &&
+                own->second.height == declaredHeight && own->second.format == format && own->second.guestBpp == guestBpp &&
+                (g_sw_REGPU_ENCLOSING_GUESS ? own->second.width == pitch && uint32_t(rect.right) + 32 <= pitch
+                                            : ((own->second.copyPitch ? own->second.copyPitch : own->second.width) + 31) / 32 == (pitch + 31) / 32 &&
+                                                uint32_t(rect.right) + 32 <= own->second.width))
+                intoOwnBase = ResolveIntoEnclosing(base, pitch, declaredHeight, guestBpp, format, rect, std::ldexp(1.0f, bias), destRange, blitFlags, true);
+        if (!intoOwnBase)
+        {
         BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias), false, destRange, blitFlags, destRow);
+        // (A band of an image (destRow) is already drawn into it at its row.)
+        if (!depth && !placedInImage && !destRow && rect.top == 0 && rect.left == 0)
+            ResolveIntoEnclosing(base, pitch, declaredHeight, guestBpp, format, rect, std::ldexp(1.0f, bias), destRange, blitFlags);
         // This frame's first full-screen colour resolve (see Upscale::sceneOk).
-        if (!depth && g_upscale.fullResolveBase == ~0u && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth) && rect.bottom >= LONG(kHeight))
+        if (!depth && g_upscale.fullResolveBase == ~0u && width >= FrameW() && rect.left == 0 && rect.right >= LONG(FrameW()) && rect.bottom >= LONG(FrameH()))
             g_upscale.fullResolveBase = base;
         // Temporal upscaling: each tile of the main view keeps its depth before it is cleared.
         if (g_temporal && g_scenePhase && !depth)
         {
             g_tstat.resolves++;
-            if (width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth))
+            if (width >= FrameW() && rect.left == 0 && rect.right >= LONG(FrameW()))
                 g_tstat.resolveFullWidth++;
         }
-        if (g_temporal && g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth))
+        if (g_temporal && g_scenePhase && !depth && width >= FrameW() && rect.left == 0 && rect.right >= LONG(FrameW()))
             CopySceneDepth(rect);
         // The main view's full image (its last tile reaches the bottom): the scene is done.
-        if (g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth) && rect.bottom >= LONG(kHeight))
+        if (g_scenePhase && !depth && width >= FrameW() && rect.left == 0 && rect.right >= LONG(FrameW()) && rect.bottom >= LONG(FrameH()))
         {
             if (g_temporal)
                 g_tstat.sceneDone++;
@@ -7579,6 +11587,7 @@ void Resolve()
         }
         g_r.resolved[base].swapped = swapRB;
         g_r.resolved[base].guestFormat = depth ? 0u : destFormat;
+        g_r.resolved[base].guestNumber = depth ? 0u : numberFormat;
         g_r.resolved[base].plain8888 = !depth && destFormat == 6 && ((gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF) == 0;
         // Images the game reads on the CPU are also written to memory (regpu.h Host::resolveWriteback;
         // without it, REGPU_RESOLVE_WRITEBACK's "WxH,WxH" sizes of 8888 colour, at once).
@@ -7616,10 +11625,46 @@ void Resolve()
             request.mode = regpu::Writeback::Mode::Deferred;
         // Any destination format the copy can write (from the FM4 port; 8888 only before).
         const bool anyFormat = destFormat == 6 || !g_writeback8888Only;
-        if (request.mode == regpu::Writeback::Mode::Now && !depth && anyFormat)
+        // A resolve here that isn't written back makes the image here one the title doesn't read on the CPU: resolves
+        // drawn into it later are not written back either (ResolveIntoEnclosing). The mark used to stay with the address
+        // after the title had reused it for something else. REGPU_KEEP_WRITEBACK_MARK=1: it stays (A/B).
+        static LiveSwitch keepMark("REGPU_KEEP_WRITEBACK_MARK");
+        if (request.mode == regpu::Writeback::Mode::None && !keepMark)
+            if (auto it = g_r.resolved.find(base); it != g_r.resolved.end())
+                it->second.writtenBack = false;
+        if (g_stereoReplay)
+            ; // (VR stereo's second eye: the guest has the first eye's)
+        else if (request.mode == regpu::Writeback::Mode::Now && !depth && anyFormat)
             WriteResolveToGuest(base, width, height, info);
         else if (request.mode == regpu::Writeback::Mode::Deferred && (depth || anyFormat))
             QueueDeferredWriteback(base, width, height, info, depth, imageRect, request);
+        } // !intoOwnBase
+        // REGPU_DUMP_EACH_RESOLVE=<hex base>[,...] (live, debug): the image at that base right after each resolve
+        // into it, to out/res as <base>_<w>x<h>_v<100+n>.png at the end of the frame (n counts up), and a log line.
+        // Shows what each of several copies into one image wrote (the end-of-frame dumps show only the last).
+        // (Read through FrameEnv: a getenv per resolve was ~1.5% of the draw thread in an FM3 race, session 45.)
+        thread_local FrameEnv eachEnv{ "REGPU_DUMP_EACH_RESOLVE" };
+        if (const char* each = eachEnv.Get(); each && *each && !depth)
+            for (const char* p = each; *p;)
+            {
+                uint32_t w = 0, h = 0;
+                const bool bySize = sscanf(p, "%ux%u", &w, &h) == 2 && strchr(p, 'x') && (!strchr(p, ',') || strchr(p, 'x') < strchr(p, ','));
+                if (bySize ? LONG(w) == rect.right - rect.left && LONG(h) == rect.bottom - rect.top
+                           : (uint32_t(strtoul(p, nullptr, 16)) & 0x1FFFFFFF) == base)
+                {
+                    QueueMidFrameDump(base, gpureg::Get(RB_SURFACE_INFO), rect);
+                    // And the host surface it was copied from, through the ordinary copy (1280x720 at the pass's
+                    // scale) into a spare image at a base no title uses this high, dumped the same way.
+                    constexpr uint32_t kSnapBase = 0x1C000000;
+                    BlitResolve(false, kSnapBase, kWidth, kHeight, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RECT{ 0, 0, LONG(kWidth), LONG(kHeight) }, 1.0f);
+                    QueueMidFrameDump(kSnapBase, gpureg::Get(RB_SURFACE_INFO), D3D12_RECT{ 0, 0, LONG(kWidth), LONG(kHeight) });
+                    break;
+                }
+                const char* comma = strchr(p, ',');
+                if (!comma)
+                    break;
+                p = comma + 1;
+            }
     }
     // Clears after a tile's resolve prepare the EDRAM for the next tile, which
     // we draw lower on the same host surface: a full-width clear covers every
@@ -7638,7 +11683,7 @@ void Resolve()
         lc.colorHi = gpureg::Get(RB_COLOR_CLEAR), lc.colorLo = gpureg::Get(RB_COLOR_CLEAR_LO), lc.depthValue = gpureg::Get(RB_DEPTH_CLEAR);
         lc.colorFormat = (gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF, lc.depthFloat = (gpureg::Get(RB_DEPTH_INFO) >> 16) & 1;
     }
-    if (!noClearExtend && !merged && surfacePitch && uint32_t(rect.right - rect.left) >= std::min<uint32_t>(surfacePitch, kWidth) && rect.left == 0)
+    if (!noClearExtend && !merged && surfacePitch && uint32_t(rect.right - rect.left) >= std::min<uint32_t>(surfacePitch, FrameW()) && rect.left == 0)
         clearRect.bottom = PassHeight();
     if ((control >> 8) & 1) // colour clear (ARGB)
     {
@@ -7938,8 +11983,14 @@ void SeedStep()
         const auto vs = g_r.shaders.find(key.vs), ps = g_r.shaders.find(key.ps);
         if (vs == g_r.shaders.end() || ps == g_r.shaders.end() || !vs->second->IsReady() || !ps->second->IsReady())
             return false;
-        EnsurePipeline(*vs->second, *ps->second, key);
-        started++;
+        const CompiledShader* psUse = ManifestPixelShader(key, *ps->second); // (flag 0x400: its variant)
+        if (psUse && !psUse->IsReady() && psUse->state.load() == CompiledShader::Pending)
+            return false;
+        if (psUse && psUse->IsReady())
+        {
+            EnsurePipeline(*vs->second, *psUse, key);
+            started++;
+        }
         return true;
     });
     if (started)
@@ -7976,7 +12027,16 @@ void WarmupStep()
             continue;
         }
         const CompiledShader& vs = GetShader(key.vs, vsCode, false);
-        const CompiledShader& ps = GetShader(key.ps, psCode, true);
+        const CompiledShader& psBase = GetShader(key.ps, psCode, true);
+        // (flag 0x400: the base shader's alpha-test-free variant, made once the base is ready)
+        const CompiledShader* psUse = psBase.IsReady() ? ManifestPixelShader(key, psBase) : &psBase;
+        if (!psUse)
+        {
+            g_manifest.next++;
+            g_stats.warmDone++;
+            continue;
+        }
+        const CompiledShader& ps = *psUse;
         if (vs.state.load() == CompiledShader::Pending || ps.state.load() == CompiledShader::Pending)
         {
             // Still compiling: look further ahead instead of waiting on it.
@@ -8100,11 +12160,59 @@ struct OverlayUpload
     UINT64 offset = 0;
 };
 
+UINT64 PanelUploadBytes(UINT w, UINT h)
+{
+    return UINT64((w * 4 + 255) & ~255u) * h;
+}
+
+// Copies RGBA pixels (w x h) through the staging space into texture, leaving it COPY_SOURCE.
+template <typename List> // (a D3D list, or the recorded list: no wait for the replay)
+bool UploadPanelPixels(List* list, ID3D12Resource* texture, D3D12_RESOURCE_STATES& state, UINT w, UINT h,
+    const std::vector<uint32_t>& pixels, const OverlayUpload& staging)
+{
+    if (!staging.resource)
+        return false;
+    const UINT pitch = w * 4;
+    const UINT alignedPitch = (pitch + 255) & ~255u;
+    for (UINT y = 0; y < h; y++)
+        memcpy(staging.cpu + staging.offset + UINT64(y) * alignedPitch, pixels.data() + size_t(y) * w, pitch);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = texture;
+    b.Transition.Subresource = 0;
+    if (state != D3D12_RESOURCE_STATE_COPY_DEST)
+    {
+        b.Transition.StateBefore = state;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        list->ResourceBarrier(1, &b);
+    }
+    D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+    dst.pResource = texture;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.pResource = staging.resource;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = staging.offset;
+    src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, alignedPitch };
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1, &b);
+    state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    return true;
+}
+
 // upload(bytes) returns staging space (resource + CPU pointer + offset) or a null resource.
-ID3D12Resource* PrepareOverlayOn(ID3D12GraphicsCommandList* list, const std::function<OverlayUpload(UINT64)>& upload, bool force)
+template <typename List>
+ID3D12Resource* PrepareOverlayOn(List* list, const std::function<OverlayUpload(UINT64)>& upload, bool force)
 {
     std::vector<std::string> lines;
     g_overlay.visible = OverlayWanted(lines);
+    // Logged when it appears and goes (FM3 port, session 40: why players saw it in the menus).
+    if (static bool was = false; g_overlay.visible != was)
+    {
+        was = g_overlay.visible;
+        Log("overlay: %s%s%s", was ? "shown: " : "hidden", was && lines.size() > 1 ? lines[1].c_str() : "", "");
+    }
     if (!g_overlay.visible)
         return nullptr;
     std::string text;
@@ -8140,49 +12248,283 @@ ID3D12Resource* PrepareOverlayOn(ID3D12GraphicsCommandList* list, const std::fun
             memcpy(rgba.data(), pixels.data(), rgba.size());
             WritePng("overlay.png", kOverlayW, kOverlayH, rgba);
         }
-        const UINT pitch = kOverlayW * 4;
-        const UINT alignedPitch = (pitch + 255) & ~255u;
-        const OverlayUpload staging = upload(UINT64(alignedPitch) * kOverlayH);
-        if (!staging.resource)
+        if (!UploadPanelPixels(list, g_overlay.texture.Get(), g_overlay.state, kOverlayW, kOverlayH, pixels, upload(PanelUploadBytes(kOverlayW, kOverlayH))))
             return nullptr;
-        for (UINT y = 0; y < kOverlayH; y++)
-            memcpy(staging.cpu + staging.offset + UINT64(y) * alignedPitch, pixels.data() + size_t(y) * kOverlayW, pitch);
-        if (g_overlay.state != D3D12_RESOURCE_STATE_COPY_DEST)
-        {
-            D3D12_RESOURCE_BARRIER b{};
-            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            b.Transition.pResource = g_overlay.texture.Get();
-            b.Transition.Subresource = 0;
-            b.Transition.StateBefore = g_overlay.state;
-            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-            list->ResourceBarrier(1, &b);
-        }
-        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
-        dst.pResource = g_overlay.texture.Get();
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.pResource = staging.resource;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        src.PlacedFootprint.Offset = staging.offset;
-        src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, kOverlayW, kOverlayH, 1, alignedPitch };
-        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        D3D12_RESOURCE_BARRIER b{};
-        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource = g_overlay.texture.Get();
-        b.Transition.Subresource = 0;
-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        list->ResourceBarrier(1, &b);
-        g_overlay.state = D3D12_RESOURCE_STATE_COPY_SOURCE;
         g_overlay.lastText = text;
         g_overlay.lastRender = now;
     }
     return g_overlay.state == D3D12_RESOURCE_STATE_COPY_SOURCE ? g_overlay.texture.Get() : nullptr;
 }
 
+// ---- Timer: REGPU_TIMER=1 shows the log clock (seconds, to a tenth) in the top-left corner, white on
+// black, over the game's picture (it never goes through the guest's frame). A screenshot then says
+// which [time] in the log to look at. Live: "switch REGPU_TIMER 0|1".
+constexpr UINT kTimerW = 136, kTimerH = 34;
+struct TimerPanel
+{
+    ComPtr<ID3D12Resource> texture;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+    std::string lastText;
+} g_timer;
+
+void RenderTimerPixels(const std::string& text, std::vector<uint32_t>& pixels)
+{
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = kTimerW;
+    bi.bmiHeader.biHeight = -int(kTimerH);
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    HDC dc = CreateCompatibleDC(nullptr);
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+    RECT all{ 0, 0, LONG(kTimerW), LONG(kTimerH) };
+    FillRect(dc, &all, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+    // Grey anti-aliasing (not ClearType): the copy is 1:1, but colour fringes read badly on black.
+    HFONT font = CreateFontW(26, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+        FIXED_PITCH | FF_MODERN, L"Consolas");
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    DrawTextA(dc, text.c_str(), int(text.size()), &all, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    GdiFlush();
+    pixels.resize(size_t(kTimerW) * kTimerH);
+    const uint32_t* src = static_cast<const uint32_t*>(bits);
+    for (size_t i = 0; i < pixels.size(); i++)
+    {
+        const uint32_t p = src[i]; // 0x00RRGGBB
+        pixels[i] = 0xFF000000u | ((p & 0xFF) << 16) | (p & 0xFF00) | ((p >> 16) & 0xFF);
+    }
+    SelectObject(dc, oldFont);
+    SelectObject(dc, oldBitmap);
+    DeleteObject(font);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+}
+
+// Like PrepareOverlayOn: records the upload when the shown tenth changed, returns the texture or null.
+template <typename List>
+ID3D12Resource* PrepareTimerOn(List* list, const std::function<OverlayUpload(UINT64)>& upload)
+{
+    static LiveSwitch on("REGPU_TIMER");
+    if (!on)
+        return nullptr;
+    char text[32];
+    snprintf(text, sizeof(text), "%.1f s", std::floor(LogSeconds() * 10.0) / 10.0);
+    if (!g_timer.texture)
+    {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = kTimerW;
+        td.Height = kTimerH;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.SampleDesc.Count = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (FAILED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_timer.texture))))
+            return nullptr;
+        g_timer.state = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    if (text != g_timer.lastText || g_timer.state != D3D12_RESOURCE_STATE_COPY_SOURCE)
+    {
+        std::vector<uint32_t> pixels;
+        RenderTimerPixels(text, pixels);
+        if (!UploadPanelPixels(list, g_timer.texture.Get(), g_timer.state, kTimerW, kTimerH, pixels, upload(PanelUploadBytes(kTimerW, kTimerH))))
+            return nullptr;
+        g_timer.lastText = text;
+    }
+    return g_timer.texture.Get();
+}
+
+// The frame path's timer, staged through the frame's upload ring.
+ID3D12Resource* PrepareTimer()
+{
+    // (Recorded, not on the real list: Real() waited for the replay thread at every swap, ~3% of the draw thread.)
+    return PrepareTimerOn(C().list, [](UINT64 bytes) {
+        OverlayUpload u;
+        const UINT64 offset = RingAlloc(bytes, 512);
+        if (offset == ~0ull)
+            return u;
+        u.resource = Frame().ring.Get();
+        u.cpu = Frame().ringCpu;
+        u.offset = offset;
+        return u;
+    });
+}
+
+// ---- Fps panel: REGPU_FPS_PANEL=1 (live) shows fps and frame times at the top centre of the picture: a text line
+// (fps, average and 99th-percentile frame time over the last half second, updated 4 times a second) over a graph of
+// the last kFpsW frames' times (one column a frame, newest on the right; guide lines at 360/240/144/60 fps; green,
+// yellow over 1.5x the average, red over 2x). Each frame's time is the interval between frame ends on the draw
+// thread. Like the timer it is copied onto the back buffer after the game's frame (never in the guest's images).
+constexpr UINT kFpsW = 400, kFpsTextH = 30, kFpsGraphH = 80, kFpsH = kFpsTextH + kFpsGraphH;
+struct FpsPanel
+{
+    ComPtr<ID3D12Resource> texture;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+    std::vector<uint32_t> text; // kFpsW x kFpsTextH, re-rendered 4 times a second
+    float times[kFpsW] = {};    // frame times in ms, ring
+    UINT head = 0, count = 0;
+    std::chrono::steady_clock::time_point last{}, lastText{};
+    float scale = 10.0f;        // ms at the graph's top
+} g_fps;
+
+void RenderFpsText(const std::string& text, std::vector<uint32_t>& pixels)
+{
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = kFpsW;
+    bi.bmiHeader.biHeight = -int(kFpsTextH);
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    HDC dc = CreateCompatibleDC(nullptr);
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+    RECT all{ 0, 0, LONG(kFpsW), LONG(kFpsTextH) };
+    FillRect(dc, &all, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+    HFONT font = CreateFontW(24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+        FIXED_PITCH | FF_MODERN, L"Consolas");
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    DrawTextA(dc, text.c_str(), int(text.size()), &all, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    GdiFlush();
+    pixels.resize(size_t(kFpsW) * kFpsTextH);
+    const uint32_t* src = static_cast<const uint32_t*>(bits);
+    for (size_t i = 0; i < pixels.size(); i++)
+    {
+        const uint32_t px = src[i];
+        pixels[i] = 0xFF000000u | ((px & 0xFF) << 16) | (px & 0xFF00) | ((px >> 16) & 0xFF);
+    }
+    SelectObject(dc, oldFont);
+    SelectObject(dc, oldBitmap);
+    DeleteObject(font);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+}
+
+template <typename List>
+ID3D12Resource* PrepareFpsOn(List* list, const std::function<OverlayUpload(UINT64)>& upload)
+{
+    static LiveSwitch on("REGPU_FPS_PANEL");
+    const auto now = std::chrono::steady_clock::now();
+    if (!on)
+    {
+        g_fps.count = 0;
+        g_fps.last = {};
+        return nullptr;
+    }
+    if (g_fps.last != std::chrono::steady_clock::time_point{})
+    {
+        g_fps.times[g_fps.head] = float(std::chrono::duration<double, std::milli>(now - g_fps.last).count());
+        g_fps.head = (g_fps.head + 1) % kFpsW;
+        g_fps.count = std::min(g_fps.count + 1, kFpsW);
+    }
+    g_fps.last = now;
+    if (!g_fps.texture)
+    {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = kFpsW;
+        td.Height = kFpsH;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.SampleDesc.Count = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (FAILED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_fps.texture))))
+            return nullptr;
+        g_fps.state = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    // Average over the last half second (at least 8 frames).
+    double sum = 0;
+    UINT n = 0;
+    float recent[kFpsW];
+    while (n < g_fps.count && (sum < 500.0 || n < 8))
+    {
+        const float v = g_fps.times[(g_fps.head + kFpsW - 1 - n) % kFpsW];
+        recent[n++] = v;
+        sum += v;
+    }
+    const double avg = n ? sum / n : 0.0;
+    if (g_fps.text.empty() || now - g_fps.lastText > std::chrono::milliseconds(250))
+    {
+        char text[96];
+        if (n)
+        {
+            std::sort(recent, recent + n);
+            const UINT at = std::min<UINT>(n - 1, UINT(std::ceil(n * 0.99)) > 0 ? UINT(std::ceil(n * 0.99)) - 1 : 0);
+            const float p99 = recent[at];
+            snprintf(text, sizeof(text), "%.0f fps  %.2f ms  p99 %.2f ms", avg > 0 ? 1000.0 / avg : 0.0, avg, p99);
+            // The graph's top: 1.6x the 99th percentile, at least 5 ms, eased so it does not jump.
+            const float want = std::max(5.0f, p99 * 1.6f);
+            g_fps.scale = g_fps.scale * 0.5f + want * 0.5f;
+        }
+        else
+            snprintf(text, sizeof(text), "-- fps");
+        RenderFpsText(text, g_fps.text);
+        g_fps.lastText = now;
+    }
+    std::vector<uint32_t> pixels(size_t(kFpsW) * kFpsH, 0xFF181818u);
+    memcpy(pixels.data(), g_fps.text.data(), g_fps.text.size() * 4);
+    uint32_t* graph = pixels.data() + size_t(kFpsW) * kFpsTextH;
+    const float scale = g_fps.scale;
+    for (const float guide : { 1000.0f / 360, 1000.0f / 240, 1000.0f / 144, 1000.0f / 60 })
+        if (guide < scale)
+        {
+            const int y = int(kFpsGraphH) - 1 - int(guide / scale * float(kFpsGraphH - 1));
+            for (UINT x = 0; x < kFpsW; x += 2)
+                graph[size_t(y) * kFpsW + x] = 0xFF505050u;
+        }
+    // R8G8B8A8 in memory = 0xAABBGGRR: green 0xFF40D040, yellow 0xFF20D0E0, red 0xFF3030F0.
+    for (UINT i = 0; i < g_fps.count; i++)
+    {
+        const float v = g_fps.times[(g_fps.head + kFpsW - g_fps.count + i) % kFpsW];
+        const UINT x = kFpsW - g_fps.count + i;
+        const int h = std::clamp(int(v / scale * float(kFpsGraphH - 1)), 1, int(kFpsGraphH));
+        const uint32_t colour = avg > 0 && v > avg * 2 ? 0xFF3030F0u : avg > 0 && v > avg * 1.5 ? 0xFF20D0E0u : 0xFF40D040u;
+        for (int y = int(kFpsGraphH) - h; y < int(kFpsGraphH); y++)
+            graph[size_t(y) * kFpsW + x] = colour;
+    }
+    // REGPU_FPS_PANEL_DUMP=1 (live): the panel to fps_panel.png in the working directory (to look at it without a
+    // window screenshot).
+    static LiveSwitch dump("REGPU_FPS_PANEL_DUMP");
+    if (dump)
+    {
+        std::vector<uint8_t> rgba(pixels.size() * 4);
+        memcpy(rgba.data(), pixels.data(), rgba.size());
+        WritePng("fps_panel.png", kFpsW, kFpsH, rgba);
+    }
+    if (!UploadPanelPixels(list, g_fps.texture.Get(), g_fps.state, kFpsW, kFpsH, pixels, upload(PanelUploadBytes(kFpsW, kFpsH))))
+        return nullptr;
+    return g_fps.texture.Get();
+}
+
+ID3D12Resource* PrepareFps()
+{
+    return PrepareFpsOn(C().list, [](UINT64 bytes) {
+        OverlayUpload u;
+        const UINT64 offset = RingAlloc(bytes, 512);
+        if (offset == ~0ull)
+            return u;
+        u.resource = Frame().ring.Get();
+        u.cpu = Frame().ringCpu;
+        u.offset = offset;
+        return u;
+    });
+}
+
 // The frame path stages through the frame's upload ring.
 ID3D12Resource* PrepareOverlay()
 {
-    return PrepareOverlayOn(C().list->Real(), [](UINT64 bytes) {
+    return PrepareOverlayOn(C().list, [](UINT64 bytes) {
         OverlayUpload u;
         const UINT64 offset = RingAlloc(bytes, 512);
         if (offset == ~0ull)
@@ -8207,7 +12549,8 @@ void HoldPresent()
             FAILED(g_r.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_hold.allocator.Get(), nullptr, IID_PPV_ARGS(&g_hold.list))))
             return;
         g_hold.list->Close();
-        const UINT64 bytes = UINT64((kOverlayW * 4 + 255) & ~255u) * kOverlayH + 1024;
+        // The overlay at 0, the timer after it (512-aligned placement).
+        const UINT64 bytes = ((PanelUploadBytes(kOverlayW, kOverlayH) + 511) & ~511ull) + PanelUploadBytes(kTimerW, kTimerH) + 1024;
         g_hold.upload = CreateBuffer(bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         void* mapped = nullptr;
         g_hold.upload->Map(0, nullptr, &mapped);
@@ -8222,6 +12565,13 @@ void HoldPresent()
         u.cpu = g_hold.uploadCpu;
         return u;
     }, true);
+    ID3D12Resource* timer = PrepareTimerOn(g_hold.list.Get(), [](UINT64) {
+        OverlayUpload u;
+        u.resource = g_hold.upload.Get();
+        u.cpu = g_hold.uploadCpu;
+        u.offset = (PanelUploadBytes(kOverlayW, kOverlayH) + 511) & ~511ull;
+        return u;
+    });
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = g_hold.image.Get();
@@ -8229,7 +12579,7 @@ void HoldPresent()
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     g_hold.list->ResourceBarrier(1, &b);
-    const bool ok = PresenterRecordCopy(g_hold.list.Get(), g_hold.image.Get(), overlay, kOverlayW, kOverlayH);
+    const bool ok = PresenterRecordCopy(g_hold.list.Get(), g_hold.image.Get(), overlay, kOverlayW, kOverlayH, timer, kTimerW, kTimerH);
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     g_hold.list->ResourceBarrier(1, &b);
     g_hold.list->Close();
@@ -8265,7 +12615,8 @@ void BootPresent(const std::vector<uint8_t>& rgba)
             FAILED(g_r.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_hold.allocator.Get(), nullptr, IID_PPV_ARGS(&g_hold.list))))
             return;
         g_hold.list->Close();
-        const UINT64 bytes = UINT64((kOverlayW * 4 + 255) & ~255u) * kOverlayH + 1024;
+        // Sized like HoldPresent's (which shares it): the overlay, then the timer.
+        const UINT64 bytes = ((PanelUploadBytes(kOverlayW, kOverlayH) + 511) & ~511ull) + PanelUploadBytes(kTimerW, kTimerH) + 1024;
         g_hold.upload = CreateBuffer(bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         void* mapped = nullptr;
         g_hold.upload->Map(0, nullptr, &mapped);
@@ -8699,6 +13050,8 @@ struct DeferredWriteback
     DXGI_FORMAT hostFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
     uint32_t base = 0, width = 0, height = 0, info = 0, x0 = 0, x1 = 0, y0 = 0, y1 = 0;
     bool depth = false;
+    uint64_t memHash = 0, queuedFrame = 0, queuedSeq = 0; // the guest bytes it will cover, when queued (DeferredSpan)
+    std::vector<uint8_t> snapshot;                        // those bytes, when queued (where a later change is)
     // Fence-ordered write-back (FenceWritebacks): generation << 2 | state (0 waiting, 1 being written,
     // 2 written); the generation changes each time the entry is reused, so a late claim cannot take
     // the next use's entry.
@@ -8802,6 +13155,12 @@ void WriteResolvePixels(const uint8_t* pixels, UINT pitch, DXGI_FORMAT hostForma
                                 memcpy(&h, px + k * 2, 2);
                                 c[k] += regpu::resolve::HalfToFloat(h);
                             }
+                            else if (hostFormat == DXGI_FORMAT_R10G10B10A2_UNORM)
+                            {
+                                uint32_t w;
+                                memcpy(&w, px, 4);
+                                c[k] += k < 3 ? float((w >> (10 * k)) & 0x3FF) / 1023.0f : float(w >> 30) / 3.0f;
+                            }
                             else
                                 c[k] += float(px[k]) / 255.0f;
                         }
@@ -8821,16 +13180,93 @@ void WriteResolvePixels(const uint8_t* pixels, UINT pitch, DXGI_FORMAT hostForma
     }
 }
 
+// Our own write-backs per image base (a sequence number each): a change from one of them is not a reuse.
+std::mutex g_ourWritesMutex;
+std::unordered_map<uint32_t, uint64_t> g_ourWrites;
+std::atomic<uint64_t> g_writeSeq{ 0 };
+bool WrittenByUsSince(uint32_t base, uint64_t seq)
+{
+    std::lock_guard lock(g_ourWritesMutex);
+    const auto it = g_ourWrites.find(base);
+    return it != g_ourWrites.end() && it->second > seq;
+}
+void NoteOurWrite(uint32_t base)
+{
+    std::lock_guard lock(g_ourWritesMutex);
+    g_ourWrites[base] = ++g_writeSeq;
+}
+
+// The guest bytes a deferred write-back covers: the tile rows (32 rows each) of its rows, whole width.
+bool DeferredSpan(const DeferredWriteback& w, const uint8_t*& data, size_t& bytes)
+{
+    uint32_t log2Bytes = 2;
+    if (!w.depth && !regpu::resolve::DestLog2Bytes((w.info >> 7) & 0x3F, log2Bytes))
+        return false;
+    const size_t rowBytes = size_t((w.width + 31) & ~31u) << log2Bytes; // one row of texels, tiled in 32-row blocks
+    const size_t first = size_t(w.y0 / 32) * 32 * rowBytes, last = size_t((w.y1 + 31) / 32) * 32 * rowBytes;
+    data = GuestPtr<uint8_t>(GpuPhysToGuest(w.base)) + first;
+    bytes = last - first;
+    return bytes > 0;
+}
+
 // Writes one entry's pixels if this caller claims it (state waiting, generation as expected).
 bool ClaimAndWrite(DeferredWriteback& w, uint64_t generation)
 {
     uint64_t expected = generation << 2;
     if (!w.state.compare_exchange_strong(expected, (generation << 2) | 1))
         return false;
+    // The console writes a resolve when the GPU runs it; ours lands later (before the next fence, or a frame or
+    // two on). If the title has written the memory since (it finished with the image and reused the memory),
+    // writing now would overwrite its new data: skipped. REGPU_NO_WRITEBACK_REUSE_CHECK=1: written anyway (A/B).
+    static LiveSwitch noReuseCheck("REGPU_NO_WRITEBACK_REUSE_CHECK");
+    const uint8_t* span = nullptr;
+    size_t spanBytes = 0;
+    if (w.memHash && DeferredSpan(w, span, spanBytes) && (ContentHash(span, spanBytes, 4) | 1) != w.memHash && !WrittenByUsSince(w.base, w.queuedSeq))
+    {
+        // The span is whole 32-row tile blocks across the whole width, but the write covers only its rectangle: a
+        // change outside it (other columns, the block's other rows) is not one this write would overwrite. Compared
+        // texel by texel with the snapshot taken at queue time; written when nothing inside changed.
+        // REGPU_WRITEBACK_REUSE_SPAN=1: any change in the span skips it (as before, A/B).
+        static LiveSwitch reuseSpan("REGPU_WRITEBACK_REUSE_SPAN");
+        uint32_t inside = 0, outside = 0, ix0 = ~0u, ix1 = 0, iy0 = ~0u, iy1 = 0, ox0 = ~0u, ox1 = 0, oy0 = ~0u, oy1 = 0;
+        uint32_t log2Bytes = 2;
+        const bool compared = w.snapshot.size() == spanBytes && (w.depth || regpu::resolve::DestLog2Bytes((w.info >> 7) & 0x3F, log2Bytes));
+        if (compared)
+        {
+            const uint32_t pitchTexels = (w.width + 31) & ~31u, bytes = 1u << log2Bytes;
+            const uint32_t by0 = w.y0 / 32 * 32, by1 = (w.y1 + 31) / 32 * 32;
+            const size_t first = size_t(by0) * (size_t(pitchTexels) << log2Bytes);
+            for (uint32_t y = by0; y < by1; y++)
+                for (uint32_t x = 0; x < pitchTexels; x++)
+                {
+                    const size_t at = size_t(TextureTiledOffset(x, y, pitchTexels, log2Bytes)) - first;
+                    if (at + bytes > spanBytes || !memcmp(span + at, w.snapshot.data() + at, bytes))
+                        continue;
+                    if (x >= w.x0 && x < w.x1 && y >= w.y0 && y < w.y1)
+                        inside++, ix0 = std::min(ix0, x), ix1 = std::max(ix1, x), iy0 = std::min(iy0, y), iy1 = std::max(iy1, y);
+                    else
+                        outside++, ox0 = std::min(ox0, x), ox1 = std::max(ox1, x), oy0 = std::min(oy0, y), oy1 = std::max(oy1, y);
+                }
+        }
+        const bool skip = !noReuseCheck && (!compared || inside || reuseSpan);
+        static std::atomic<int> logged{ 0 };
+        if (logged.fetch_add(1) < 64)
+            Log("writeback: %08X %ux%u rect %u,%u-%u,%u: the memory changed since the resolve (%llu frames ago, now frame %llu, thread %lu): "
+                "%s; changed texels inside %u (x %u-%u, y %u-%u), outside %u (x %u-%u, y %u-%u): %s",
+                w.base, w.width, w.height, w.x0, w.y0, w.x1, w.y1, (unsigned long long)(g_r.frame - w.queuedFrame), (unsigned long long)g_r.frame,
+                GetCurrentThreadId(), compared ? "compared" : "no snapshot", inside, ix0, ix1, iy0, iy1, outside, ox0, ox1, oy0, oy1,
+                skip ? "not written" : "written");
+        if (skip)
+        {
+            w.state = (generation << 2) | 2;
+            return true;
+        }
+    }
     const uint8_t* pixels = nullptr;
     if (SUCCEEDED(w.buffer->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&pixels)))) && pixels)
     {
         WriteResolvePixels(pixels, w.pitch, w.hostFormat, w.hostW, w.hostH, w.base, w.width, w.info, w.depth, w.x0, w.x1, w.y0, w.y1);
+        NoteOurWrite(w.base);
         const D3D12_RANGE none{ 0, 0 };
         w.buffer->Unmap(0, &none);
     }
@@ -8867,7 +13303,8 @@ void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint
     const auto it = g_r.resolved.find(base);
     if (it == g_r.resolved.end() || !it->second.resource ||
         (depth ? it->second.format != DXGI_FORMAT_R32_FLOAT
-               : it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM && it->second.format != DXGI_FORMAT_R16G16B16A16_FLOAT))
+               : it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM && it->second.format != DXGI_FORMAT_R16G16B16A16_FLOAT &&
+                     it->second.format != DXGI_FORMAT_R10G10B10A2_UNORM))
         return;
     const uint32_t x0 = std::min(request.x0, width), x1 = std::min(request.x1, width);
     const uint32_t y0 = std::max<uint32_t>(std::min(request.y0, height), uint32_t(std::max<LONG>(rect.top, 0)));
@@ -8910,6 +13347,20 @@ void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint
     w.info = info;
     w.depth = depth;
     w.x0 = x0, w.x1 = x1, w.y0 = y0, w.y1 = y1;
+    {
+        const uint8_t* span = nullptr;
+        size_t spanBytes = 0;
+        w.memHash = DeferredSpan(w, span, spanBytes) ? ContentHash(span, spanBytes, 4) | 1 : 0;
+        // A copy to tell where a later change is (ClaimAndWrite); spans up to 16 MB (a 2048x2048 image).
+        if (w.memHash && spanBytes <= (16u << 20))
+            w.snapshot.assign(span, span + spanBytes);
+        else
+            w.snapshot.clear();
+        w.queuedFrame = g_r.frame;
+        w.queuedSeq = g_writeSeq.load();
+    }
+    if (!depth)
+        r.writtenBack = true, r.writebackInfo = info;
 }
 
 // Before a fence write from the command stream: what has been recorded is submitted and a host
@@ -8970,7 +13421,8 @@ void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_
 {
     const auto it = g_r.resolved.find(base);
     if (it == g_r.resolved.end() || !it->second.resource || !width || !height ||
-        (it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM && it->second.format != DXGI_FORMAT_R16G16B16A16_FLOAT))
+        (it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM && it->second.format != DXGI_FORMAT_R16G16B16A16_FLOAT &&
+            it->second.format != DXGI_FORMAT_R10G10B10A2_UNORM))
         return;
     ResolvedTexture& r = it->second;
     // Run what has been recorded (the resolve's copy included) and let the GPU finish it.
@@ -9007,6 +13459,9 @@ void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_
     WriteResolvePixels(pixels, pitch, r.format, r.hostWidth, r.hostHeight, base, width, info, false, 0, width, 0, height);
     buffer->Unmap(0, nullptr);
     NoteResolvedMemory(base, r); // our own write: not a reuse of the memory
+    NoteOurWrite(base);
+    r.writtenBack = true;
+    r.writebackInfo = info;
     Log("resolve: wrote %ux%u back to guest memory at %08X (format %u, endian %u, swap %u)", width, height, base, (info >> 7) & 0x3F, info & 7,
         (info >> 24) & 1);
 }
@@ -9126,6 +13581,16 @@ bool RendererIsResolveDraw()
 }
 
 uint64_t RendererFenceSubmit() { return FenceSubmitImpl(); }
+bool LongFramesOn() { return LongFramesEnabled(); }
+bool RegpuPerfLiteOn() { return PerfLiteOn(); } // (render/presenter.cpp)
+void RendererDrawThreadIdle(double ms) { g_drawIdleMs += ms; }
+// A host's long-frame callback (driver::SetLongFrameCallback): called on the draw thread at the end of a long frame,
+// e.g. to log stack samples taken while it ran. It must be quick.
+std::atomic<void (*)(uint64_t, double, double)> g_longFrameCallback{ nullptr };
+void regpu::driver::SetLongFrameCallback(void (*callback)(uint64_t frame, double ms, double cpuMs))
+{
+    g_longFrameCallback.store(callback);
+}
 
 bool RendererTruthfulFences()
 {
@@ -9346,6 +13811,32 @@ void RendererOcclusionBegin()
         g_occlusionOrders = 0;
         g_occlusionKindCount.clear();
     }
+    // Predicated tiles: D3D replays a tile's commands once per tile, so a query's ZPD events come in
+    // pairs per tile (count on before its draws, off after them) and only the final one carries the end
+    // markers; the hardware sums the samples counted inside the pairs. A second start while counting is
+    // that pause, the next one resumes in a new part. Treated as one long span, a query began in the
+    // first tile also counted every draw of the next tile's replay up to its end (FM3's sun query: 3.5
+    // screens of samples, the glare went white, and each of those draws was drawn again for coverage).
+    // REGPU_NO_ZPD_SPANS=1: one span from the first start to the end, as before (A/B).
+    static LiveSwitch noSpans("REGPU_NO_ZPD_SPANS");
+    if (!noSpans && g_occlusionOpen)
+    {
+        EndOcclusionPart();
+        g_occlusionOpen = false;
+        g_occlusionPaused = true;
+        return;
+    }
+    if (!noSpans && g_occlusionPaused)
+    {
+        if (g_occlusionCount + 1 > kOcclusionPerFrame)
+            return; // out of D3D queries: what was counted so far is its result
+        g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
+        g_occlusionCurrent.main.push_back(g_occlusionIndex);
+        C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
+        g_occlusionOpen = true;
+        g_occlusionPaused = false;
+        return;
+    }
     if (g_occlusionOpen || g_occlusionCount + 4 > kOcclusionPerFrame)
         return;
     if (!g_occlusionHeap)
@@ -9367,6 +13858,11 @@ void RendererOcclusionBegin()
     g_occlusionOpen = true;
     if (const uint64_t t = TraceFrame(); t && g_r.frame + 1 == t)
         Log("occlusion query %u begins (draw #%u next)", g_occlusionOrder, g_r.drawsThisFrame.load() + 1);
+}
+
+bool RendererOcclusionCounting()
+{
+    return g_occlusionOpen;
 }
 
 bool OcclusionEndImpl(uint32_t& samples, uint32_t& total, uint32_t address);
@@ -9412,25 +13908,63 @@ bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total, uint32_t address)
     return known;
 }
 
+// The recording side of a query's end (the thread that records its draws): which query it is.
+bool OcclusionRecordEnd(uint64_t kind, UINT kindOrder)
+{
+    if (!g_occlusionOpen && !g_occlusionPaused)
+        return false;
+    g_occlusionCurrent.kind = kind;
+    g_occlusionCurrent.kindOrder = kindOrder;
+    if (g_occlusionOpen)
+        EndOcclusionQuery();
+    else
+        g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent); // its last span already ended
+    g_occlusionPaused = false;
+    return true;
+}
+
+bool OcclusionLookup(uint32_t& samples, uint32_t& total, UINT order, const std::pair<uint64_t, UINT>& kind, bool allowByOrder);
+
 bool OcclusionEndImpl(uint32_t& samples, uint32_t& total, uint32_t address)
 {
-    if (!g_occlusionOpen)
-        return false;
     const UINT order = g_occlusionOrder;
-    g_occlusionCurrent.kind = uint64_t(address) << 1 | 1;
-    g_occlusionCurrent.kindOrder = g_occlusionKindCount[g_occlusionCurrent.kind]++;
-    const std::pair<uint64_t, UINT> kind{ g_occlusionCurrent.kind, g_occlusionCurrent.kindOrder };
-    EndOcclusionQuery();
-    // REGPU_OCCLUSION_BY_ORDER=1: answered by order in the frame, as before (A/B).
+    const uint64_t k = uint64_t(address) << 1 | 1;
+    if (!g_occlusionOpen && !g_occlusionPaused)
+        return false;
+    const UINT kindOrder = g_occlusionKindCount[k]++;
+    OcclusionRecordEnd(k, kindOrder);
+    return OcclusionLookup(samples, total, order, { k, kindOrder }, true);
+}
+
+// With the draw thread (gpu.cpp work::): the command processor answers a query's end from earlier frames'
+// results (its place among this frame's queries to `address` counted there), and the draw thread records
+// the D3D query around its draws in stream order (RendererOcclusionBegin for every start, EndOn at the end).
+bool RendererOcclusionAnswer(uint32_t& samples, uint32_t& total, uint32_t address, uint32_t kindOrder)
+{
+    return OcclusionLookup(samples, total, ~0u, { uint64_t(address) << 1 | 1, kindOrder }, false);
+}
+
+void RendererOcclusionEndOn(uint32_t address, uint32_t kindOrder)
+{
+    OcclusionRecordEnd(uint64_t(address) << 1 | 1, kindOrder);
+}
+
+// The answer for a query: the last finished result of the same kind (address, place in the frame).
+bool OcclusionLookup(uint32_t& samples, uint32_t& total, UINT order, const std::pair<uint64_t, UINT>& kind, bool allowByOrder)
+{
+    // REGPU_OCCLUSION_BY_ORDER=1: answered by order in the frame, as before (A/B; not with the draw thread).
     static LiveSwitch byOrder("REGPU_OCCLUSION_BY_ORDER");
     int64_t passed = -1, covered = -1;
-    if (byOrder)
     {
-        if (order < g_occlusionResult.size())
-            passed = g_occlusionResult[order], covered = g_occlusionCoverage[order];
+        std::lock_guard resultLock(g_occlusionResultLock);
+        if (byOrder && allowByOrder)
+        {
+            if (order < g_occlusionResult.size())
+                passed = g_occlusionResult[order], covered = g_occlusionCoverage[order];
+        }
+        else if (auto it = g_occlusionByKind.find(kind); it != g_occlusionByKind.end())
+            std::tie(passed, covered) = it->second;
     }
-    else if (auto it = g_occlusionByKind.find(kind); it != g_occlusionByKind.end())
-        std::tie(passed, covered) = it->second;
     if (const uint64_t t = TraceFrame(); t && g_r.frame + 1 == t)
         Log("occlusion query %u ends: kind %016llx #%u, answer passed %lld covered %lld (host samples)", order, (unsigned long long)kind.first,
             kind.second, (long long)passed, (long long)covered);
@@ -9439,7 +13973,16 @@ bool OcclusionEndImpl(uint32_t& samples, uint32_t& total, uint32_t address)
     // Host samples to the console's: the output is ScaleX x ScaleY host pixels per game pixel
     // with g_msaa samples each; the guest surface has 1, 2 or 4 samples per pixel.
     const uint32_t guestMsaa = (gpureg::Get(RB_SURFACE_INFO) >> 16) & 3;
-    const double perHost = double(1u << guestMsaa) / (double(ScaleX()) * double(ScaleY()) * double(g_msaa));
+    // REGPU_ZPD_SCALE=<f> (env, read live: Fm3 "env REGPU_ZPD_SCALE 0.5"): multiplies the answer, to
+    // A/B how a title sizes an effect from the count (e.g. pixels instead of samples). Default 1.
+    static double zpdScale = 1.0;
+    static uint32_t zpdScaleAge = 0;
+    if (zpdScaleAge++ % 64 == 0)
+    {
+        const char* e = getenv("REGPU_ZPD_SCALE");
+        zpdScale = e && *e ? atof(e) : 1.0;
+    }
+    const double perHost = zpdScale * double(1u << guestMsaa) / (double(ScaleX()) * double(ScaleY()) * double(g_msaa));
     samples = uint32_t(std::min(double(passed) * perHost + 0.5, 4294967295.0));
     // Total: the samples the query's draws covered, depth test aside (their coverage draws); without
     // one (REGPU_NO_OCCLUSION_COVERAGE, or none yet), the passed count as before.
@@ -9591,8 +14134,116 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
     g_drawState.Invalidate();
 }
 
+// VR stereo, the HUD on its own panel: a title that draws its HUD first, onto a cleared surface, and then the scene's
+// composite under it by destination alpha (FM3: the HUD's colour premultiplied, its coverage in alpha) is named by that
+// composite's pixel shader (REGPU_VR_HUD_UNDER=<hash>, the port's). On a stereo frame the surface just before that draw
+// is the HUD alone: it goes to the headset's HUD panel (first eye's pass), and the composite is drawn opaque, so neither
+// eye has the HUD in its picture. REGPU_VR_HUD_IN_VIEW=1 (live): the HUD stays in both eyes' pictures, as before.
+// Head-tracked mono frames (REGPU_VR=cockpit, regpu::xr::MonoHudPanel) do the same (FM3 port session 39).
+ComPtr<ID3D12Resource> g_hudCopy;
+bool StereoHudDraw()
+{
+    static const uint64_t hudUnder = [] {
+        const char* v = getenv("REGPU_VR_HUD_UNDER");
+        return v && *v ? strtoull(v, nullptr, 16) : 0ull;
+    }();
+    static LiveSwitch inView("REGPU_VR_HUD_IN_VIEW");
+    // (Not the resolve that follows: a copy packet runs with the composite's shaders still loaded.)
+    return hudUnder && (g_stereoClipX != 0.0f || regpu::xr::MonoHudPanel() || g_tripleSide) && C().psHash == hudUnder && WidePass() && !inView && C().color && !RendererIsResolveDraw();
+}
+
+void StereoCaptureHud()
+{
+    const D3D12_RECT host = ToHost(D3D12_RECT{ 0, 0, LONG(FrameW()), LONG(FrameH()) });
+    const UINT w = UINT(host.right - host.left), h = UINT(host.bottom - host.top);
+    ID3D12Resource* target = regpu::xr::StereoTarget(2, w, h);
+    if (!target)
+        return;
+    if (!g_hudCopy || g_hudCopy->GetDesc().Width != w || g_hudCopy->GetDesc().Height != h)
+    {
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = w;
+        td.Height = h;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.Format = kColorFormat;
+        td.SampleDesc.Count = 1;
+        RetireTexture(std::move(g_hudCopy));
+        g_hudCopy = CreateTexture(td, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "vr hud");
+        if (!g_hudCopy)
+            return;
+    }
+    const bool ms = g_msaa > 1;
+    TransitionColor(ms ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = g_hudCopy.Get();
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = ms ? D3D12_RESOURCE_STATE_RESOLVE_DEST : D3D12_RESOURCE_STATE_COPY_DEST;
+    C().list->ResourceBarrier(1, &b);
+    if (ms)
+        C().list->ResolveSubresourceRegion(g_hudCopy.Get(), 0, 0, C().color.Get(), host, kColorFormat);
+    else
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst{ g_hudCopy.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, src{ C().color.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+        dst.SubresourceIndex = src.SubresourceIndex = 0;
+        const D3D12_BOX box{ UINT(host.left), UINT(host.top), 0, UINT(host.right), UINT(host.bottom), 1 };
+        C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    }
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    C().list->ResourceBarrier(1, &b);
+    TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
+    GradeFrontBuffer(g_hudCopy.Get(), false, nullptr, target);
+    regpu::xr::StereoHudCaptured();
+    g_drawState.Invalidate();
+}
+
+// VR pose tags (regpu::vr::SubmitTaggedPose, FM3 port session 39): the newest tag among the main view's vertex constants
+// this frame (float bits kPoseTagBits | tag). Constants stay in the register file across draws and frames, so a draw
+// early in the frame may still hold the last frame's tag: the newest (16-bit, wrapping) seen in the frame wins. Every
+// 32nd main-view draw is scanned (all ALU constants), from the head-tracked modes only.
+uint32_t g_frameVrTag = 0;
+uint32_t g_frameVrScans = 0;
+void ScanVrTag()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_VR");
+        return v && (strcmp(v, "cockpit") == 0 || strcmp(v, "stereo") == 0);
+    }();
+    if (!on || g_stereoReplay || !WidePass() || (g_frameVrScans++ & 31) != 0)
+        return;
+    for (uint32_t r = 0x4000; r < 0x4800; r++)
+    {
+        const uint32_t v = gpureg::Get(r);
+        if ((v & 0xFFFF0000u) != regpu::vr::kPoseTagBits || !(v & 0xFFFF))
+            continue;
+        const uint32_t tag = v & 0xFFFF;
+        // (Only a pose handed in recently: another constant can have the same bit pattern; session 39, the user saw
+        // frames fall back to the flat view, logged as tags without a pose.)
+        if ((!g_frameVrTag || int16_t(uint16_t(tag - g_frameVrTag)) > 0) && regpu::xr::TagKnown(tag))
+            g_frameVrTag = tag;
+    }
+}
+
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
+    ScanVrTag();
+    if (StereoHudDraw())
+    {
+        if (!g_stereoReplay)
+            StereoCaptureHud();
+        // REGPU_VR_SHOW_HUD=1 (live): the composite not drawn at all: the picture is the HUD panel's (on black).
+        static LiveSwitch showHud("REGPU_VR_SHOW_HUD");
+        const uint32_t blend = gpureg::Get(RB_BLENDCONTROL0);
+        gpureg::Set(RB_BLENDCONTROL0, 0x00010001); // one, zero: the scene alone
+        if (!showHud)
+            DrawImpl(initiator, dmaBase, dmaSize);
+        gpureg::Set(RB_BLENDCONTROL0, blend);
+        g_perf.draws++;
+        g_passDraws++;
+        return;
+    }
     if (g_gpuShaders)
         PassMark("vs %08X ps %08X", uint32_t(C().vsHash), uint32_t(C().psHash));
     if (!g_perfTiming)
@@ -9796,8 +14447,498 @@ bool DebugSkipDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     return false;
 }
 
+// REGPU_FREEZE_HELPERS=<n> (start-time, 2-8): passes narrower than the screen (HelperPass) that draw a colour
+// image with depth-tested geometry (reflection and environment maps: 8888 and 2_10_10_10 colour formats; not
+// shadow or data maps) are drawn, and resolved, only every n-th frame; between, their draws and resolves are
+// skipped and the images keep their content (reflections update n times less often). Only a pass the title
+// has drawn in each of the last n + 2 frames: a picture made once (a car's photo, a livery) is always drawn.
+// REGPU_NO_FREEZE_HELPERS=1 (live): every pass drawn.
+namespace FreezeHelpers
+{
+struct Pass
+{
+    uint64_t last = ~0ull;
+    uint32_t streak = 0;
+    bool geometryNow = false, geometryBefore = false; // depth-tested colour draws this and last frame
+    bool flatNow = false, flatBefore = false;         // draws without the depth test (screen quads: exposure, blur)
+    bool logged = false;
+};
+std::mutex g_mutex;
+std::unordered_map<uint64_t, Pass> g_passes;
+
+// Hyper (from the FM2 port's hyper-prototype): REGPU_HYPER_FREEZE=<frames> lets a pass draw normally for that many
+// frames in a row, then freezes it, redrawn every REGPU_HYPER_FREEZE_REFRESH=<n>-th frame (0: never; odd n keeps
+// double-buffered views alternating); REGPU_HYPER_FREEZE_SHADOWS=1 freezes depth-only helper passes (shadow maps)
+// too. The old REGPU_FREEZE_HELPERS=<n> is the same with a warm-up of n + 2 frames and a refresh of n.
+uint32_t Warmup()
+{
+    static const uint32_t n = [] {
+        if (const char* v = getenv("REGPU_HYPER_FREEZE"); v && atoi(v) > 0)
+            return uint32_t(atoi(v));
+        const char* old = getenv("REGPU_FREEZE_HELPERS");
+        const uint32_t e = old ? std::clamp<uint32_t>(uint32_t(atoi(old)), 0, 8) : 0;
+        return e >= 2 ? e + 2 : 0u;
+    }();
+    return n;
+}
+
+uint32_t Refresh()
+{
+    static const uint32_t n = [] {
+        if (const char* v = getenv("REGPU_HYPER_FREEZE"); v && atoi(v) > 0)
+            return getenv("REGPU_HYPER_FREEZE_REFRESH") ? uint32_t(std::max(0, atoi(getenv("REGPU_HYPER_FREEZE_REFRESH")))) : 0u;
+        return std::clamp<uint32_t>(uint32_t(atoi(getenv("REGPU_FREEZE_HELPERS"))), 0, 8);
+    }();
+    return n;
+}
+
+uint32_t Every()
+{
+    return Warmup();
+}
+
+// For a draw or resolve of the current pass: true when it is skipped this frame.
+bool Skip(bool resolve, uint32_t initiator)
+{
+    static LiveSwitch off("REGPU_NO_FREEZE_HELPERS");
+    if (!Warmup() || off || !HelperPass())
+        return false;
+    static const bool shadows = getenv("REGPU_HYPER_FREEZE_SHADOWS") && atoi(getenv("REGPU_HYPER_FREEZE_SHADOWS")) != 0;
+    const uint32_t mode = gpureg::Get(RB_MODECONTROL) & 7;
+    const uint32_t colorFormat = (gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF;
+    const bool depthPass = mode == 5;
+    if (depthPass ? !shadows : !(colorFormat <= 3 || colorFormat == 10 || colorFormat == 12))
+        return false;
+    uint64_t key = 0xCBF29CE484222325ull;
+    for (uint32_t v : { gpureg::Get(RB_SURFACE_INFO), gpureg::Get(RB_COLOR_INFO), gpureg::Get(RB_DEPTH_INFO), gpureg::Get(PA_SC_WINDOW_OFFSET) })
+        key = (key ^ v) * 0x100000001B3ull;
+    std::lock_guard lock(g_mutex);
+    if (g_passes.size() > 4096)
+        g_passes.clear();
+    Pass& p = g_passes[key];
+    const uint64_t frame = g_r.frame;
+    if (p.last != frame)
+    {
+        p.streak = p.last + 1 == frame ? p.streak + 1 : (p.streak > Warmup() && p.last + 1 < frame && Refresh() && frame - p.last <= Refresh() ? p.streak : 1);
+        p.geometryBefore = p.last + 1 == frame ? p.geometryNow : p.geometryBefore;
+        p.flatBefore = p.last + 1 == frame ? p.flatNow : p.flatBefore;
+        p.geometryNow = p.flatNow = false;
+        p.last = frame;
+    }
+    if (!resolve && (mode == 4 || mode == 5))
+    {
+        // 3D geometry: depth-tested with a real compare, not a screen pass (rectangle list, six vertices or fewer).
+        const uint32_t dc = gpureg::Get(RB_DEPTHCONTROL);
+        const bool screen = (initiator & 0x3F) == 8 || (initiator >> 16) <= 6;
+        ((dc >> 1) & 1 && ((dc >> 4) & 7) != 7 && !screen ? p.geometryNow : p.flatNow) = true;
+    }
+    const uint32_t refresh = Refresh();
+    // Only a pass of 3D geometry alone (FM3 session 43: its exposure/luminance quads share a helper surface layout,
+    // and freezing them washed the whole picture out yellow). A pass with any screen quad is never frozen.
+    const bool frozen = p.streak > Warmup() && p.geometryBefore && !p.flatBefore && !p.flatNow;
+    if (frozen && !p.logged)
+    {
+        p.logged = true;
+        Log("freeze helpers: pass frozen (surface %08X colour %08X depth %08X window %08X, mode %u)", gpureg::Get(RB_SURFACE_INFO),
+            gpureg::Get(RB_COLOR_INFO), gpureg::Get(RB_DEPTH_INFO), gpureg::Get(PA_SC_WINDOW_OFFSET), mode);
+    }
+    return frozen && !(refresh && frame % refresh == 0);
+}
+} // namespace FreezeHelpers
+
+// REGPU_DRAW_CULL=<pixels> (start-time): draws that covered fewer than that many guest pixels the last time
+// they were drawn are skipped by GPU predication. 1 skips only draws that drew nothing at all (hidden behind
+// nearer geometry, outside the view): the picture is unchanged. Larger values also drop small objects, but as
+// each draw is retested every other frame those flicker rather than vanish (FM3's menu letters at 64).
+// Each draw (a key of its shaders, buffers, target and order in the frame) alternates: one frame it is drawn
+// inside an occlusion query, the next it is predicated on that count, so something that comes into view
+// shows at most one frame late. At the frame's end one resolve and a small compute pass turn the counts
+// into predicate values (no CPU readback). Only depth-tested draws that write depth (a 3D scene's meshes): a
+// draw is known by its order among draws alike, and menus, HUDs and particles redraw shared buffers with other
+// contents every frame (FM3's menu glyphs took one another's counts: letters vanished every other frame). Not
+// for draws inside the title's own occlusion queries, stencil draws, draw workers' draws or rectangle lists. REGPU_NO_DRAW_CULL=1 (live):
+// every draw drawn.
+namespace DrawCull
+{
+constexpr UINT kSlots = 16384;   // predicate values, one per draw key seen
+constexpr UINT kQueries = 8192;  // tested draws a frame
+struct Entry
+{
+    UINT slot = 0;
+    uint64_t lastTested = ~0ull, lastSeen = ~0ull;
+};
+std::unordered_map<uint64_t, Entry> g_entries;
+std::unordered_map<uint64_t, uint32_t> g_occurrence; // this frame's draws of each key so far
+std::vector<UINT> g_freeSlots;
+std::vector<uint32_t> g_pending; // this frame's tested draws: slot, threshold (samples), in query order
+uint64_t g_frame = ~0ull;
+ComPtr<ID3D12QueryHeap> g_heap;
+ComPtr<ID3D12Resource> g_results, g_predicates;
+ComPtr<ID3D12RootSignature> g_root;
+ComPtr<ID3D12PipelineState> g_pso;
+bool g_failed = false;
+
+// (Read again each frame: Fm3 "env REGPU_DRAW_CULL <n>" changes it live; 0 or unset: off.)
+uint32_t Threshold()
+{
+    thread_local uint64_t frame = ~0ull;
+    thread_local uint32_t px = 0;
+    if (frame != g_r.frame)
+    {
+        frame = g_r.frame;
+        const char* v = getenv("REGPU_DRAW_CULL");
+        px = v ? uint32_t(std::max(0, atoi(v))) : 0u;
+    }
+    return px;
+}
+
+bool Init()
+{
+    if (g_pso)
+        return true;
+    if (g_failed)
+        return false;
+    g_failed = true;
+    ID3D12Device* d = g_r.device;
+    D3D12_QUERY_HEAP_DESC qd{};
+    qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+    qd.Count = kQueries;
+    if (FAILED(d->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_heap))))
+        return false;
+    g_results = CreateBuffer(UINT64(kQueries) * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+    {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = UINT64(kSlots) * 8;
+        bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_PREDICATION, nullptr, IID_PPV_ARGS(&g_predicates))))
+            return false;
+    }
+    if (!g_results)
+        return false;
+    D3D12_ROOT_PARAMETER params[4]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.Num32BitValues = 1;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[1].Descriptor.ShaderRegister = 0;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[2].Descriptor.ShaderRegister = 1;
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[3].Descriptor.ShaderRegister = 0;
+    D3D12_ROOT_SIGNATURE_DESC rs{};
+    rs.NumParameters = 4;
+    rs.pParameters = params;
+    ComPtr<ID3DBlob> blob, error;
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) ||
+        FAILED(d->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_root))))
+        return false;
+    static const char kSource[] = R"(
+cbuffer C : register(b0) { uint count; };
+ByteAddressBuffer results : register(t0); // one 64-bit sample count per tested draw
+ByteAddressBuffer pending : register(t1);  // per tested draw: predicate slot, threshold in samples
+RWByteAddressBuffer predicates : register(u0);
+[numthreads(64, 1, 1)]
+void main(uint id : SV_DispatchThreadID)
+{
+    if (id >= count)
+        return;
+    const uint2 st = pending.Load2(id * 8);
+    const uint2 c = results.Load2(id * 8);
+    predicates.Store2(st.x * 8, uint2((c.y != 0u || c.x >= st.y) ? 1u : 0u, 0u));
+}
+)";
+    ComPtr<ID3DBlob> cs;
+    if (FAILED(D3DCompile(kSource, sizeof(kSource) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &error)))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_root.Get();
+    pd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
+    if (FAILED(d->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_pso))))
+        return false;
+    g_freeSlots.reserve(kSlots);
+    for (UINT s = kSlots; s-- > 0;)
+        g_freeSlots.push_back(s);
+    g_failed = false;
+    Log("draw cull: on, draws under %u guest pixels skipped (%u predicate slots, %u queries a frame)", Threshold(), kSlots, kQueries);
+    return true;
+}
+
+// What to do with this draw: 0 draw as usual, 1 draw inside query `query`, 2 draw predicated on `slot`.
+struct Decision
+{
+    int mode = 0;
+    UINT query = 0, slot = 0;
+};
+
+Decision Decide(uint64_t key, uint32_t thresholdSamples)
+{
+    if (g_frame != g_r.frame)
+    {
+        g_frame = g_r.frame;
+        g_occurrence.clear();
+        // Keys gone for a while give their slots back.
+        if (g_entries.size() > kSlots / 2)
+        {
+            for (auto it = g_entries.begin(); it != g_entries.end();)
+            {
+                if (it->second.lastSeen + 8 < g_r.frame)
+                {
+                    g_freeSlots.push_back(it->second.slot);
+                    it = g_entries.erase(it);
+                }
+                else
+                    ++it;
+            }
+        }
+    }
+    key = (key ^ g_occurrence[key]++) * 0x100000001B3ull;
+    auto it = g_entries.find(key);
+    if (it == g_entries.end())
+    {
+        if (g_freeSlots.empty())
+            return {};
+        it = g_entries.emplace(key, Entry{ g_freeSlots.back() }).first;
+        g_freeSlots.pop_back();
+    }
+    Entry& e = it->second;
+    e.lastSeen = g_r.frame;
+    // Tested last frame: its count is in the predicate now.
+    if (e.lastTested + 1 == g_r.frame)
+        return { 2, 0, e.slot };
+    if (g_pending.size() / 2 >= kQueries)
+        return {};
+    e.lastTested = g_r.frame;
+    const UINT query = UINT(g_pending.size() / 2);
+    g_pending.push_back(e.slot);
+    g_pending.push_back(std::max<uint32_t>(thresholdSamples, 1));
+    return { 1, query, e.slot };
+}
+
+// At the frame's end, on the frame's list: this frame's counts into the predicates.
+void EndFrame()
+{
+    if (g_pending.empty() || !g_pso)
+        return;
+    const UINT n = UINT(g_pending.size() / 2);
+    const UINT64 offset = RingAlloc(UINT64(n) * 8, 16);
+    if (offset == ~0ull)
+    {
+        g_pending.clear();
+        return;
+    }
+    memcpy(Frame().ringCpu + offset, g_pending.data(), size_t(n) * 8);
+    g_pending.clear();
+    C().list->ResolveQueryData(g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, n, g_results.Get(), 0);
+    D3D12_RESOURCE_BARRIER b[2]{};
+    b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition.pResource = g_results.Get();
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b[1].Transition.pResource = g_predicates.Get();
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PREDICATION;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b[0].Transition.Subresource = b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    C().list->ResourceBarrier(2, b);
+    C().list->SetComputeRootSignature(g_root.Get());
+    C().list->SetPipelineState(g_pso.Get());
+    C().list->SetComputeRoot32BitConstants(0, 1, &n, 0);
+    C().list->SetComputeRootShaderResourceView(1, g_results->GetGPUVirtualAddress());
+    C().list->SetComputeRootShaderResourceView(2, Frame().ring->GetGPUVirtualAddress() + offset);
+    C().list->SetComputeRootUnorderedAccessView(3, g_predicates->GetGPUVirtualAddress());
+    C().list->Dispatch((n + 63) / 64, 1, 1);
+    std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
+    std::swap(b[1].Transition.StateBefore, b[1].Transition.StateAfter);
+    C().list->ResourceBarrier(2, b);
+    // The graphics state the next draw sets again (the pipeline is cached per draw).
+    g_drawState.Invalidate();
+}
+} // namespace DrawCull
+
+// Hyper draw culling (from the FM2 port's hyper-prototype, measured there on an HD 630 and a Vega laptop): an
+// occlusion query counts the samples each eligible draw produced; a draw that produced REGPU_HYPER_CULL_PIXELS=<n>
+// pixels or fewer the last time it was measured is skipped before its pipeline, constants and textures are looked
+// up, so a culled draw costs no CPU either. Every REGPU_HYPER_CULL_RETEST (4)-th frame it is measured again: with
+// REGPU_HYPER_CULL_PROBE=1 by a probe draw that writes no colour, depth or stencil (nothing reaches the screen, so a
+// culled draw does not blink in), else drawn. REGPU_HYPER_CULL_HYST=<percent>: a culled draw stays culled until it
+// covers more than the threshold times percent/100. REGPU_HYPER_CULL_PIN (on; 0 off): a draw that comes back from
+// being culled twice within 64 frames is never culled again (a probe without depth writes can count layers that
+// hide each other). Eligible: depth-tested draws outside the title's own occlusion queries, on the frame's list, in
+// wide colour passes (REGPU_HYPER_CULL_PASSES=1: every colour and depth pass), opaque depth-writing ones only unless
+// REGPU_HYPER_CULL_ALL=1. Counts are read when the frame's slot comes round again (2-3 frames late).
+namespace HyperCull
+{
+constexpr UINT kPerFrame = 4096;
+struct State
+{
+    uint64_t samples = ~0ull;
+    bool culled = false, pinned = false;
+    uint8_t flips = 0;
+    uint64_t lastUncull = 0, lastSeen = 0;
+};
+std::unordered_map<uint64_t, State> g_states;
+std::unordered_map<uint64_t, uint32_t> g_occurrence;
+uint64_t g_occurrenceFrame = ~0ull;
+ComPtr<ID3D12QueryHeap> g_heap;
+ComPtr<ID3D12Resource> g_readback;
+struct Pending
+{
+    uint64_t key;
+    UINT index;
+};
+std::vector<Pending> g_pending[kFrames];
+UINT g_used[kFrames] = {};
+uint64_t g_drawn = 0, g_skipped = 0, g_logFrame = 0, g_pinned = 0;
+bool g_failed = false;
+thread_local uint64_t t_key = 0; // the current draw's key (Decide), for Begin
+
+int Threshold()
+{
+    static const int n = getenv("REGPU_HYPER_CULL_PIXELS") && *getenv("REGPU_HYPER_CULL_PIXELS") ? atoi(getenv("REGPU_HYPER_CULL_PIXELS")) : -1;
+    return n;
+}
+uint32_t Retest()
+{
+    static const uint32_t n = getenv("REGPU_HYPER_CULL_RETEST") ? uint32_t(std::max(1, atoi(getenv("REGPU_HYPER_CULL_RETEST")))) : 4;
+    return n;
+}
+bool On(const char* name, bool fallback)
+{
+    const char* v = getenv(name);
+    return v && *v ? atoi(v) != 0 : fallback;
+}
+
+// The finished frame in this slot: its counts update the states.
+void Collect(UINT frameIndex)
+{
+    if (g_pending[frameIndex].empty() || !g_readback)
+    {
+        g_used[frameIndex] = 0;
+        return;
+    }
+    uint64_t* counts = nullptr;
+    const D3D12_RANGE range{ size_t(frameIndex) * kPerFrame * 8, size_t(frameIndex + 1) * kPerFrame * 8 };
+    if (SUCCEEDED(g_readback->Map(0, &range, reinterpret_cast<void**>(&counts))))
+    {
+        // Summed over every occurrence of the draw in that frame: culled only if all of them were tiny.
+        std::unordered_map<uint64_t, uint64_t> sums;
+        for (const Pending& p : g_pending[frameIndex])
+            sums[p.key] += counts[p.index];
+        for (const auto& [key, samples] : sums)
+            g_states[key].samples = samples;
+        const D3D12_RANGE none{ 0, 0 };
+        g_readback->Unmap(0, &none);
+    }
+    g_pending[frameIndex].clear();
+    g_used[frameIndex] = 0;
+    if (g_states.size() > 65536)
+        for (auto it = g_states.begin(); it != g_states.end();)
+            it = it->second.lastSeen + 600 < g_r.frame ? g_states.erase(it) : std::next(it);
+}
+
+// The draw's decision: 0 draw (measured when a query is free), 1 skip, 2 probe (measure without writing).
+int Decide(uint64_t key, double samplesPerPixel)
+{
+    if (g_occurrenceFrame != g_r.frame)
+    {
+        g_occurrenceFrame = g_r.frame;
+        g_occurrence.clear();
+        if (g_r.frame >= g_logFrame + 600)
+        {
+            g_logFrame = g_r.frame;
+            if (g_drawn + g_skipped)
+                Log("hyper cull: %llu drawn, %llu skipped (%.1f%%), %llu draws pinned", (unsigned long long)g_drawn, (unsigned long long)g_skipped,
+                    100.0 * double(g_skipped) / double(g_drawn + g_skipped), (unsigned long long)g_pinned);
+        }
+    }
+    key = (key ^ g_occurrence[key]++) * 0x100000001B3ull;
+    State& st = g_states[key];
+    st.lastSeen = g_r.frame;
+    const bool retest = (g_r.frame + (key & 0xFF)) % Retest() == 0;
+    static const int hyst = getenv("REGPU_HYPER_CULL_HYST") ? std::max(100, atoi(getenv("REGPU_HYPER_CULL_HYST"))) : 100;
+    if (st.samples != ~0ull)
+    {
+        const double limit = double(Threshold()) * samplesPerPixel * (st.culled ? hyst / 100.0 : 1.0);
+        bool now = double(st.samples) <= limit;
+        static const bool pin = On("REGPU_HYPER_CULL_PIN", true);
+        if (pin && st.pinned)
+            now = false;
+        else if (pin && st.culled && !now)
+        {
+            st.flips = g_r.frame - st.lastUncull < 64 ? uint8_t(st.flips + 1) : uint8_t(1);
+            st.lastUncull = g_r.frame;
+            if (st.flips >= 2)
+            {
+                st.pinned = true;
+                g_pinned++;
+            }
+        }
+        st.culled = now;
+    }
+    t_key = key;
+    if (st.culled && !retest)
+    {
+        g_skipped++;
+        return 1;
+    }
+    static const bool probe = On("REGPU_HYPER_CULL_PROBE", false);
+    g_drawn++;
+    return probe && st.culled && retest ? 2 : 0;
+}
+
+// Before the draw call: a query around it, when one is free.
+UINT Begin()
+{
+    if (g_failed)
+        return ~0u;
+    if (!g_heap)
+    {
+        g_failed = true;
+        D3D12_QUERY_HEAP_DESC qd{};
+        qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+        qd.Count = kPerFrame * kFrames;
+        if (FAILED(g_r.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_heap))))
+            return ~0u;
+        g_readback = CreateBuffer(8ull * kPerFrame * kFrames, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!g_readback)
+            return ~0u;
+        g_failed = false;
+        Log("hyper cull: on, draws of %d pixels or fewer skipped (probe %s, hysteresis %s%%, pin %s)", Threshold(),
+            On("REGPU_HYPER_CULL_PROBE", false) ? "on" : "off", getenv("REGPU_HYPER_CULL_HYST") ? getenv("REGPU_HYPER_CULL_HYST") : "100",
+            On("REGPU_HYPER_CULL_PIN", true) ? "on" : "off");
+    }
+    const UINT slot = UINT(&Frame() - g_r.frames);
+    if (g_used[slot] >= kPerFrame)
+        return ~0u;
+    const UINT q = slot * kPerFrame + g_used[slot]++;
+    g_pending[slot].push_back({ t_key, q });
+    C().list->BeginQuery(g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, q);
+    return q;
+}
+
+// At the frame's end, on the frame's list: this frame's counts into the readback buffer.
+void EndFrame()
+{
+    const UINT slot = UINT(&Frame() - g_r.frames);
+    if (g_heap && g_readback && g_used[slot])
+        C().list->ResolveQueryData(g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, slot * kPerFrame, g_used[slot], g_readback.Get(), UINT64(slot) * kPerFrame * 8);
+}
+} // namespace HyperCull
+void HyperCullCollect(UINT frameIndex) { HyperCull::Collect(frameIndex); }
+
 void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
+    // (PassScales: asks in this draw after the first skip the register reads; 0 again when the draw returns.)
+    thread_local uint64_t drawCount = 0;
+    t_passDrawId = ++drawCount;
+    struct PassDrawEnd
+    {
+        ~PassDrawEnd() { t_passDrawId = 0; }
+    } passDrawEnd;
     Section(0);
     if (DebugSkipDraw(initiator, dmaBase, dmaSize))
         return;
@@ -9820,6 +14961,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (!g_r.ok)
         Init();
     const uint32_t edramMode = gpureg::Get(RB_MODECONTROL) & 7;
+    if (FreezeHelpers::Every() && FreezeHelpers::Skip(edramMode == 6, initiator))
+    {
+        g_r.skippedThisFrame++;
+        return;
+    }
     if (edramMode == 6)
     {
         Resolve();
@@ -9856,7 +15002,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // right away; now that set covers the game, and the 512 MB scan (~18 ms on this
         // thread) only showed as a frame spike, so once the game runs the low-priority
         // background scan is enough.
-        const bool unseen = g_r.shaders.find(C().vsHash) == g_r.shaders.end() || g_r.shaders.find(C().psHash) == g_r.shaders.end();
+        // (FM3 port, session 36: two map lookups a draw, ~1.4% of the draw thread at 1440p; consecutive draws mostly share
+        // shaders and known shaders are never removed, so a pair found known is remembered.)
+        thread_local uint64_t knownVs = 0, knownPs = 0;
+        const bool samePair = C().vsHash == knownVs && C().psHash == knownPs && knownVs;
+        const bool unseen = !samePair && (g_r.shaders.find(C().vsHash) == g_r.shaders.end() || g_r.shaders.find(C().psHash) == g_r.shaders.end());
+        if (!samePair && !unseen)
+            knownVs = C().vsHash, knownPs = C().psHash;
         static auto lastScan = std::chrono::steady_clock::time_point{};
         LiveSwitch &noScan = g_sw_REGPU_NO_SHADER_SCAN;
         if (unseen && !noScan)
@@ -9885,6 +15037,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         ~PsAlias() { C().psHash = real; C().vsHash = realVs; }
     } psAlias;
     const CompiledShader& vs = GetShader(C().vsHash, C().vsCode, false);
+    // Memory export (eA/eM registers) is not emulated: its writes are dropped. Say so once per shader, so a title that
+    // builds data with it (PGR3 port: a lighting table that stays zero) shows up in the log, not only in a capture.
+    if (vs.info.memExport)
+    {
+        static std::mutex memExportMutex;
+        static std::unordered_set<uint64_t> memExportSeen;
+        std::lock_guard lock(memExportMutex);
+        if (memExportSeen.insert(C().vsHash).second)
+            Log("memexport: vertex shader %016llx drawn (frame %llu): its memory writes are dropped", (unsigned long long)C().vsHash,
+                (unsigned long long)g_r.frame);
+    }
     if (g_drawStats.load(std::memory_order_relaxed) == 2) // the debug server's drawstats: every draw of a frame
     {
         std::lock_guard lock(g_drawStatsMutex);
@@ -9957,8 +15120,30 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // REGPU_NO_STRIP_CUT=1: expanded as before (A/B).
     const bool stripCut = prim == 6 && restartOn && indexSource == 0 && !((initiator >> 11) & 1) &&
         (gpureg::Get(VGT_MULTI_PRIM_IB_RESET_INDX) & 0xFFFF) == 0xFFFF && !g_sw_REGPU_NO_STRIP_CUT && !g_sw_REGPU_NO_INDEXED;
-    const bool directIndex = g_r.physical && !noDirectIndex && !indexOverrun && !indexRewritten && (indexSource == 0 || indexSource == 2) &&
-        (prim == 4 || prim == 13 || (prim == 6 && (!restartOn || stripCut)));
+    // With the vertex arena bound as t1 (VertexArena), indices can't be read in place: triangle lists and strips become
+    // real indexed draws (the index arena, which never reads t1), auto-generated indices stay on the GPU, the rest is
+    // expanded on the CPU.
+    bool directIndex = (g_r.physical || g_vertexCacheThisFrame) && !noDirectIndex && !indexOverrun && !indexRewritten &&
+        (indexSource == 0 || indexSource == 2) && (prim == 4 || prim == 13 || (prim == 6 && (!restartOn || stripCut)));
+    LiveSwitch &noIndexed = g_sw_REGPU_NO_INDEXED;
+    D3D12_INDEX_BUFFER_VIEW indexView{};
+    uint32_t indexedCount = 0;
+    bool indexedTried = false;
+    if (directIndex && g_vertexCacheThisFrame && indexSource == 0)
+    {
+        if (!noIndexed && (prim == 4 || prim == 6))
+        {
+            const bool is32 = (initiator >> 11) & 1;
+            const uint32_t count = std::min(indexCount, dmaSize & 0xFFFFFF);
+            indexedCount = prim == 4 ? count / 3 * 3 : count;
+            if (indexedCount < 3 || !GetIndexBuffer(dmaBase & 0x1FFFFFFF & ~(is32 ? 3u : 1u), count, is32, dmaSize >> 30, indexView))
+                indexedCount = 0;
+            else if (prim == 4) // Hyper: the mesh's decimated or reordered indices, when made (hyperdec)
+                hyperdec::Apply(vs.info, dmaBase & 0x1FFFFFFF & ~(is32 ? 3u : 1u), indexedCount, is32, dmaSize >> 30, indexView, indexedCount);
+            indexedTried = true;
+        }
+        directIndex = indexedCount != 0;
+    }
     const uint32_t directVertices = prim == 4 ? indexCount / 3 * 3 : prim == 13 ? indexCount / 4 * 6 : (indexCount >= 3 ? (indexCount - 2) * 3 : 0);
     if (directIndex && indexSource == 0)
         NoteInPlace(dmaBase & 0x1FFFFFFF, indexBytes, true, C().vsHash);
@@ -10016,10 +15201,56 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     BeginFrameIfNeeded();
     SelectSurfaces(false);
+    // Hyper draw culling (HyperCull), decided after the surfaces are selected and before the pipeline lookup,
+    // constants and textures, so a culled draw costs none of that CPU work.
+    bool hyperCullMeasure = false;
+    struct ProbeReset
+    {
+        ~ProbeReset() { g_hyperProbe = false; }
+    } probeReset;
+    g_hyperProbe = false;
+    if (HyperCull::Threshold() >= 0 && !C().worker && !g_occlusionOpen && !g_screenPassDraw)
+    {
+        static const bool cullPasses = HyperCull::On("REGPU_HYPER_CULL_PASSES", false);
+        static const bool cullAll = HyperCull::On("REGPU_HYPER_CULL_ALL", false);
+        static LiveSwitch noHyperCull("REGPU_NO_HYPER_CULL");
+        const uint32_t dc = gpureg::Get(RB_DEPTHCONTROL), bc = gpureg::Get(RB_BLENDCONTROL0);
+        const bool opaque = (dc & 4) && (bc & 31) == 1 && ((bc >> 8) & 31) == 0 && ((bc >> 5) & 7) == 0;
+        // Only draws that depth-test with a real compare and write depth (3D meshes, also blended ones that write depth
+        // with CULL_ALL): a HUD's glyphs and menus redraw shared buffers with other contents every frame, and culling
+        // them dropped FM3's HUD text (session 43).
+        if (!noHyperCull && (cullPasses ? (edramMode == 4 || edramMode == 5) : (edramMode == 4 && WidePass())) && (dc & 2) && (dc & 4) &&
+            ((dc >> 4) & 7) != 7 && !(dc & 1) && (cullAll || opaque))
+        {
+            uint64_t key = 0xCBF29CE484222325ull;
+            for (uint64_t v : { C().vsHash, C().psHash, uint64_t(initiator), uint64_t(dmaBase), uint64_t(dmaSize), uint64_t(gpureg::Get(gpureg::FetchConstants)),
+                     uint64_t(gpureg::Get(gpureg::FetchConstants + 2)), uint64_t(cullPasses ? gpureg::Get(RB_SURFACE_INFO) : 0u), uint64_t(edramMode) })
+                key = (key ^ v) * 0x100000001B3ull;
+            const int d = HyperCull::Decide(key, double(g_msaa) * ScaleX() * ScaleY());
+            // REGPU_TRACE_HYPER_CULL=1 (live): each culled draw once (shaders, depth control, vertex count, its surface).
+            if (static LiveSwitch traceCull("REGPU_TRACE_HYPER_CULL"); traceCull && d == 1)
+            {
+                static std::mutex m;
+                static std::set<uint64_t> seen;
+                std::lock_guard lock(m);
+                if (seen.size() < 400 && seen.insert(C().vsHash * 31 ^ C().psHash).second)
+                    Log("hyper cull: culled vs %016llx ps %016llx depth %08X verts %u surface %08X colour %08X blend %08X samples %llu",
+                        (unsigned long long)C().vsHash, (unsigned long long)C().psHash, dc, initiator >> 16, gpureg::Get(RB_SURFACE_INFO),
+                        gpureg::Get(RB_COLOR_INFO), bc, (unsigned long long)HyperCull::g_states[HyperCull::t_key].samples);
+            }
+            if (d == 1)
+            {
+                g_r.skippedThisFrame++;
+                return;
+            }
+            hyperCullMeasure = true;
+            g_hyperProbe = d == 2;
+        }
+    }
     // Temporal upscaling: the main view's draws in the scene also write motion vectors (their
     // shaders' motion variants, once compiled; until then the draw has no motion).
     const bool cullable = (initiator & 0x3F) != 8 && (initiator & 0x3F) != 1;
-    const bool wantMotion = g_temporal && g_scenePhase && edramMode == 4 && WidePass();
+    const bool wantMotion = g_temporal && g_scenePhase && edramMode == 4 && WidePass() && !g_hyperProbe;
     g_plainRectDraw = (initiator & 0x3F) == 8 && !ps.info.usedTextureSlots && !vs.info.usedTextureSlots;
     const CompiledShader* mvs = wantMotion ? MotionShader(vs) : nullptr;
     const CompiledShader* mps = wantMotion ? MotionShader(ps) : nullptr;
@@ -10040,12 +15271,37 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     D3D12_GPU_VIRTUAL_ADDRESS motionPrevious = 0; // last frame's vertex constants of this draw (b2)
     ID3D12PipelineState* pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true, stripCut && directIndex) : nullptr;
+    const CompiledShader* psUsed = nullptr; // the pixel shader drawn with, when not a motion pipeline
     if (wantMotion && motion && !pso)
         g_tstat.noPipeline++;
     if (!pso)
     {
         motion = false;
-        pso = GetPipeline(vs, ps, edramMode == 5, cullable, false, stripCut && directIndex);
+        // REGPU_SPLIT_ALPHA_TEST (NoKillShader): with the alpha test (RB_COLORCONTROL bit 3, a function other
+        // than "always") and alpha-to-mask (bit 4) off, the pixel shader's variant without the alpha-test kill.
+        psUsed = &ps;
+        if (static LiveSwitch splitAlphaTest("REGPU_SPLIT_ALPHA_TEST"); splitAlphaTest && !IsPsEditAlias(C().psHash))
+        {
+            const uint32_t cc = gpureg::Get(RB_COLORCONTROL);
+            const bool alphaTest = ((cc >> 3) & 1) && (cc & 7) != 7;
+            if (!alphaTest && !((cc >> 4) & 1))
+                if (const CompiledShader* k = NoKillShader(ps))
+                    psUsed = k;
+        }
+        // A depth-only rectangle (EDRAM mode 5, no textures: a depth/stencil reset) whose depth surface starts at the
+        // colour surface's EDRAM base writes the EDRAM that colour surface reads: the console has one EDRAM, and its
+        // depth words land in the colour pixels there. Titles rely on it to zero a colour target with a stencil reset.
+        // We keep colour and depth apart, so the rectangle also writes the colour target, with its own colour output
+        // (a clear's colour; zero, as the zeroed depth/stencil words are, for the resets seen so far). FM3 port: the
+        // vinyl editor's high-detail 4x layer pass (a car's rear wing) clears its first columns only this way; its
+        // layers are blended front to back by the destination's alpha, and over the colour another pass left there
+        // (alpha 1) they added nothing: the wing's vinyl was missing in a 120x256 block. REGPU_NO_DEPTH_RESET_COLOR=1:
+        // depth only, as before (A/B, live).
+        static LiveSwitch noDepthResetColor("REGPU_NO_DEPTH_RESET_COLOR");
+        const bool depthOnly = edramMode == 5 &&
+            !(g_plainRectDraw && !noDepthResetColor && (gpureg::Get(RB_DEPTH_INFO) & 0xFFF) == (gpureg::Get(RB_COLOR_INFO) & 0xFFF) &&
+                (gpureg::Get(0x2200 /* RB_DEPTHCONTROL */) & 5) != 0);
+        pso = GetPipeline(vs, *psUsed, depthOnly, cullable, false, stripCut && directIndex, false, psUsed != &ps);
     }
     if (!pso)
     {
@@ -10073,7 +15329,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         if (indexEntry->frame != g_r.frame)
         {
-            indexEntry->offset = RingAlloc(list.size() * 4, 16);
+            indexEntry->offset = RingAlloc(list.size() * 4, 16, RingIndexList);
             if (indexEntry->offset != ~0ull)
             {
                 memcpy(f.ringCpu + indexEntry->offset, list.data(), list.size() * 4);
@@ -10116,7 +15372,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         uint32_t tinfo[32][4];
         float tbias[32][4];
     };
-    const UINT64 vsOffset = RingAlloc(sizeof(VSConstants)), psOffset = RingAlloc(sizeof(PSConstants));
+    UINT64 vsOffset = RingAlloc(sizeof(VSConstants), 256, RingConstants), psOffset = RingAlloc(sizeof(PSConstants), 256, RingConstants);
     if (vsOffset == ~0ull || psOffset == ~0ull)
     {
         TraceSkip("ring full", initiator);
@@ -10129,54 +15385,98 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // frame and reading back is slower still.
     auto* vcRing = reinterpret_cast<VSConstants*>(f.ringCpu + vsOffset);
     auto* pcRing = reinterpret_cast<PSConstants*>(f.ringCpu + psOffset);
-    thread_local VSConstants vcStage;
-    thread_local PSConstants pcStage;
+    // Two stages per thread, used in turn while blocks are compared (REGPU_CONSTANT_REUSE): the other
+    // one holds the previous draw's blocks.
+    thread_local VSConstants vcStages[2];
+    thread_local PSConstants pcStages[2];
+    thread_local uint32_t stageParity = 0;
+    // The previous draw's blocks in the ring (REGPU_CONSTANT_REUSE): valid within one frame's ring.
+    struct ConstantReuse
+    {
+        const uint8_t* ring = nullptr;
+        uint64_t frame = ~0ull;
+        const CompiledShader* vs = nullptr;
+        const CompiledShader* ps = nullptr;
+        uint32_t psSlots = 0, parity = 0;
+        UINT64 vsOffset = 0, psOffset = 0;
+    };
+    thread_local ConstantReuse lastBlocks;
     // Not in low performance mode (Config::lowPerformance): on an old CPU (FM2 on an FX-8350) the
     // block copies cost more than the scattered writes they replace. REGPU_CONSTANTS_IN_RING=1 too.
     LiveSwitch &inRingSwitch = g_sw_REGPU_CONSTANTS_IN_RING;
     const bool inRing = inRingSwitch || regpu::GetConfig().lowPerformance;
-    auto* vc = inRing ? vcRing : &vcStage;
-    auto* pc = inRing ? pcRing : &pcStage;
     const bool hooked = regpu::GetHost().onDraw && (vs.tag || ps.tag); // onDraw reads and writes vc->c
+    // REGPU_CONSTANT_REUSE: a draw whose vertex (or pixel) block is byte-identical to the previous
+    // draw's, over everything its shader reads, binds the previous draw's copy in the ring and writes
+    // nothing. Not for hooked or motion draws, a traced frame, or the A/B block modes.
+    // REGPU_TRACE_CONSTANT_BYTES: logs bytes written and how many blocks repeat (with reuse off too).
+    LiveSwitch &reuseSwitch = g_sw_REGPU_CONSTANT_REUSE;
+    LiveSwitch &traceBytes = g_sw_REGPU_TRACE_CONSTANT_BYTES;
+    const bool compareBlocks = (reuseSwitch || traceBytes) && !inRing && !hooked && !motion && !g_sw_REGPU_FULL_CONSTANT_BLOCKS &&
+                               !g_sw_REGPU_ALL_CONSTANTS && !g_sw_REGPU_CONSTANTS_BY_COUNT && !(TraceFrame() && g_r.frame + 1 == TraceFrame());
+    if (compareBlocks)
+        stageParity ^= 1;
+    else
+        lastBlocks.vs = nullptr, lastBlocks.ps = nullptr;
+    auto* vc = inRing ? vcRing : &vcStages[stageParity];
+    auto* pc = inRing ? pcRing : &pcStages[stageParity];
     {
         // Byte-swapped block copy of both constant banks (1024 dwords each).
         const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
         // Only the constants each shader reads (the rest of the block is never read).
         const auto* src = reinterpret_cast<const __m128i*>(gpureg::File() + gpureg::AluConstants * 4);
-        auto* dv = reinterpret_cast<__m128i*>(hooked && !inRing ? vc->c : vcRing->c);
-        auto* dp = reinterpret_cast<__m128i*>(pcRing->c);
+        auto* dv = reinterpret_cast<__m128i*>((hooked || compareBlocks) && !inRing ? vc->c : vcRing->c);
+        auto* dp = reinterpret_cast<__m128i*>(compareBlocks ? pc->c : pcRing->c);
         LiveSwitch &allConstants = g_sw_REGPU_ALL_CONSTANTS; // A/B
         const uint32_t nv = allConstants ? 256 : std::min(vs.info.constantsUsed, 256u), np = allConstants ? 256 : std::min(ps.info.constantsUsed, 256u);
         if (LiveSwitch &traceUsed = g_sw_REGPU_TRACE_CONSTANTS_USED; traceUsed)
         {
-            static uint64_t sv = 0, sp = 0, n = 0, lastFrame = 0;
+            static uint64_t sv = 0, sp = 0, n = 0, lastFrame = 0, bv = 0, bp = 0, lv = 0, lp = 0, kv = 0, kp = 0;
             sv += nv, sp += np, n++;
+            auto bitsAndLines = [](const std::array<uint64_t, 4>& mask, uint64_t& bits, uint64_t& lines) {
+                for (uint64_t w : mask)
+                {
+                    bits += uint64_t(__builtin_popcountll(w));
+                    w |= w >> 1;
+                    w |= w >> 2;
+                    lines += uint64_t(__builtin_popcountll(w & 0x1111111111111111ull));
+                }
+            };
+            bitsAndLines(vs.info.constantMask, bv, lv);
+            bitsAndLines(ps.info.constantMask, bp, lp);
+            kv += vs.info.packedConstants, kp += ps.info.packedConstants;
             if (g_r.frame >= lastFrame + 120)
             {
                 lastFrame = g_r.frame;
-                Log("constants used: vs %.1f ps %.1f per draw (%llu draws)", double(sv) / n, double(sp) / n, (unsigned long long)n);
-                sv = sp = n = 0;
+                Log("constants used: vs %.1f ps %.1f per draw (%llu draws); read: vs %.1f ps %.1f; lines: vs %.1f ps %.1f; packed: vs %.0f%% ps %.0f%%",
+                    double(sv) / n, double(sp) / n, (unsigned long long)n, double(bv) / n, double(bp) / n, double(lv) / n, double(lp) / n,
+                    100.0 * kv / n, 100.0 * kp / n);
+                sv = sp = n = bv = bp = lv = lp = kv = kp = 0;
             }
         }
         // Only the constants each shader reads (by its mask; the game's onDraw hook may read any).
         // REGPU_CONSTANTS_BY_COUNT copies all up to the highest one again (A/B).
         LiveSwitch &byCount = g_sw_REGPU_CONSTANTS_BY_COUNT;
-        auto copy = [&](__m128i* dst, const __m128i* from, const std::array<uint64_t, 4>& mask, uint32_t n, bool all) {
-            if (all || byCount)
+        // A shader with packed constants (PackConstants) reads them in mask order from c[0]: one sequential run.
+        // The A/B modes that copy all of them (REGPU_ALL_CONSTANTS, REGPU_CONSTANTS_BY_COUNT, a hooked draw) apply
+        // to the others only.
+        auto copy = [&](__m128i* dst, const __m128i* from, const std::array<uint64_t, 4>& mask, uint32_t n, bool all, bool packed) {
+            if (!packed && (all || byCount))
             {
                 for (uint32_t i = 0; i < n; i++)
                     _mm_storeu_si128(dst + i, _mm_shuffle_epi8(_mm_loadu_si128(from + i), swap));
                 return;
             }
+            uint32_t at = 0;
             for (uint32_t w = 0; w < 4; w++)
                 for (uint64_t bits = mask[w]; bits; bits &= bits - 1)
                 {
                     const uint32_t i = w * 64 + uint32_t(_tzcnt_u64(bits));
-                    _mm_storeu_si128(dst + i, _mm_shuffle_epi8(_mm_loadu_si128(from + i), swap));
+                    _mm_storeu_si128(dst + (packed ? at++ : i), _mm_shuffle_epi8(_mm_loadu_si128(from + i), swap));
                 }
         };
-        copy(dv, src, vs.info.constantMask, nv, allConstants || hooked);
-        copy(dp, src + 256, ps.info.constantMask, np, allConstants || hooked);
+        copy(dv, src, vs.info.constantMask, nv, allConstants || hooked, vs.info.packedConstants);
+        copy(dp, src + 256, ps.info.constantMask, np, allConstants || hooked, ps.info.packedConstants);
         if (motion)
         {
             // This draw's constants for the next frame, and last frame's for its motion. The
@@ -10187,10 +15487,16 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 key = (key ^ gpureg::Get(gpureg::FetchConstants + k * 2)) * 0xFF51AFD7ED558CCDull;
                 break; // the first vertex buffer is enough to tell draws apart
             }
-            key ^= uint64_t(g_upscale.occurrences[key]++) * 0xC2B2AE3D27D4EB4Full;
+            {
+                auto& o = g_upscale.occurrences.At(key);
+                if (o.occFrame != g_upscale.constantsFrame)
+                    o.occFrame = g_upscale.constantsFrame, o.occ = 0;
+                o.c.frame = g_upscale.constantsFrame; // (kept alive by Grow's sweep)
+                key ^= uint64_t(o.occ++) * 0xC2B2AE3D27D4EB4Full;
+            }
             // Last frame's constants are still in last frame's ring (it is reused only after
             // kFrames): the draw reads them there (b2).
-            auto& entry = g_upscale.constants[key];
+            auto& entry = g_upscale.constants.At(key).c;
             const uint32_t parity = g_upscale.constantsFrame & 1;
             const D3D12_GPU_VIRTUAL_ADDRESS now = f.ring->GetGPUVirtualAddress() + vsOffset;
             const bool known = entry.frame + 1 == g_upscale.constantsFrame && !g_upscale.reset;
@@ -10239,10 +15545,38 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
     }
     Sub(0); // index list, ring allocations, float constants
-    for (uint32_t i = 0; i < 8; i++)
-        vc->b[i] = pc->b[i] = gpureg::Get(gpureg::BoolConstants + i);
-    for (uint32_t i = 0; i < 32; i++)
-        vc->l[i] = pc->l[i] = gpureg::Get(gpureg::LoopConstants + i);
+    if (static LiveSwitch lazyBools("REGPU_EXP_LAZY_LOOPS"); lazyBools) // (the same switch: bools byte-swapped 4 at a time)
+    {
+        const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+        const auto* src = reinterpret_cast<const __m128i*>(gpureg::File() + gpureg::BoolConstants * 4);
+        for (uint32_t i = 0; i < 2; i++)
+        {
+            const __m128i v = _mm_shuffle_epi8(_mm_loadu_si128(src + i), swap);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(vc->b + i * 4), v);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(pc->b + i * 4), v);
+        }
+    }
+    else
+        for (uint32_t i = 0; i < 8; i++)
+            vc->b[i] = pc->b[i] = gpureg::Get(gpureg::BoolConstants + i);
+    // REGPU_EXP_LAZY_LOOPS=1 (live; experimental system, FM3 port session 45: this copy was 1.7% of the draw thread in a
+    // line profile): the 32 loop constants only for draws whose shaders read them (ScanBlockUse's readsLoops; the ring
+    // gets them only then anyway, and the spec-constant path reads them only then), byte-swapped 4 at a time.
+    static LiveSwitch lazyLoops("REGPU_EXP_LAZY_LOOPS");
+    if (!lazyLoops)
+        for (uint32_t i = 0; i < 32; i++)
+            vc->l[i] = pc->l[i] = gpureg::Get(gpureg::LoopConstants + i);
+    else if (vs.info.readsLoops || ps.info.readsLoops || hooked)
+    {
+        const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+        const auto* src = reinterpret_cast<const __m128i*>(gpureg::File() + gpureg::LoopConstants * 4);
+        for (uint32_t i = 0; i < 8; i++)
+        {
+            const __m128i v = _mm_shuffle_epi8(_mm_loadu_si128(src + i), swap);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(vc->l + i * 4), v);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(pc->l + i * 4), v);
+        }
+    }
     // Debug: REGPU_FORCE_BOOL=<index>:<0|1> forces one boolean constant for every draw.
     if (static const char* force = getenv("REGPU_FORCE_BOOL"); force)
     {
@@ -10270,7 +15604,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         LiveSwitch &noDirect = g_sw_REGPU_NO_DIRECT_FETCH;
         static const uint32_t directBytes = getenv("REGPU_DIRECT_FETCH_KB") ? uint32_t(atoi(getenv("REGPU_DIRECT_FETCH_KB"))) * 1024u
                                           : RendererEarlyFences() ? kEarlyFenceDirectFetchBytes : kDirectFetchBytes;
-        if (g_r.physical && !noDirect && bytes >= directBytes && !DynamicBuffer(address, bytes))
+        if (g_r.physical && !g_vertexCacheThisFrame && !noDirect && bytes >= directBytes && !DynamicBuffer(address, bytes))
         {
             NoteInPlace(address & 0x1FFFFFFF, bytes, false, C().vsHash);
             vc->vf[k][0] = address & 0x1FFFFFFF;
@@ -10278,6 +15612,19 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             vc->vf[k][2] = 1;
             vc->vf[k][3] = noBounds ? ~0u : bytes / 4;
             continue;
+        }
+        // The vertex arena (VertexArena): large buffers from video memory, read through t1.
+        if (g_vertexCacheThisFrame && !noDirect && bytes >= directBytes)
+        {
+            bool arenaHit = false;
+            if (const uint64_t at = VertexCache(address, bytes, arenaHit); at != ~0ull)
+            {
+                vc->vf[k][0] = uint32_t(at);
+                vc->vf[k][1] = d1 & 3;
+                vc->vf[k][2] = arenaHit ? 1 : 0;
+                vc->vf[k][3] = noBounds ? ~0u : bytes / 4;
+                continue;
+            }
         }
         // REGPU_TRACE_MIDSIZE=1: log copied buffers of 16-64 KB that change within a frame (they must stay copied)
         LiveSwitch &traceMid = g_sw_REGPU_TRACE_MIDSIZE;
@@ -10372,7 +15719,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     vc->info[0] = uint32_t(listOffset);
     vc->info[1] = (initiator & 0x3F) == 1 ? 2 : 0;
     vc->vdepth[0] = PolygonOffsetDepth();
-    vc->vdepth[1] = vc->vdepth[2] = vc->vdepth[3] = 0;
+    // VR stereo: this eye's clip-space x offset for the main view's perspective geometry (hlsl.cpp; RendererSetStereoEye).
+    vc->vdepth[1] = WidePass() ? g_stereoClipX : 0.0f;
+    vc->vdepth[2] = vc->vdepth[3] = 0;
+    // Triple screen: the pass's view (hlsl.cpp): vtriple = a b c d (in vjitter's place: triple mode has no motion
+    // variants), vdepth.z = e, vdepth.w = 1 (on: the main view only).
+    if (g_tripleView[4] != 0.0f && WidePass())
+    {
+        memcpy(vc->vjitter, g_tripleView, sizeof(float) * 4);
+        vc->vdepth[2] = g_tripleView[4];
+        vc->vdepth[3] = 1.0f;
+    }
     // Viewport transform in the vertex shader (see hlsl.cpp).
     vc->vscale[0] = RegFloat(PA_CL_VPORT_XSCALE);
     vc->vscale[1] = RegFloat(PA_CL_VPORT_YSCALE);
@@ -10404,6 +15761,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         if ((initiator & 0x3F) != 8 || ps.info.usedTextureSlots || vs.info.usedTextureSlots)
         {
             SetNativeMsaa(LayoutKey(surface), msaa);
+            if (Color64Bpp() && (gpureg::Get(RB_COLOR_MASK) & 0xF))
+                NativeSlot64(LayoutKey(surface)).store(LayoutKey(surface) << 2 | msaa, std::memory_order_relaxed);
             if (gpureg::Get(0x2200 /* RB_DEPTHCONTROL */) & 7) // the draw uses the depth surface
             {
                 const uint32_t key = DepthLayoutKey(surface);
@@ -10420,6 +15779,41 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         {
             vc->vscale[3] = float(MsaaAcross(msaa)) / float(MsaaAcross(uint32_t(native)));
             vc->voffset[3] = float(MsaaDown(msaa)) / float(MsaaDown(uint32_t(native)));
+        }
+        // The colour version of the shadow-map clear above: a texture-less rectangle through an MSAA view of a
+        // small surface whose textured draws are 1x (g_nativeMsaa). FM3 clears the 256x256 image it projects the
+        // track's shade around the player's car into with a 120x128 rectangle through a 4x view (pitch 160) plus a
+        // 16-pixel 1x strip; unscaled, the rectangle covered a quarter of it, and the shade drawn for another car
+        // in the pass before stayed there: other cars' shade flickered over the player's car (one frame in five,
+        // one AI car a frame). Small surfaces only, by the width the view covers at 1x: FM3 also clears its 1280-wide
+        // 2x scene through a 4x view (pitch 640), whose layout key a 1x 1280-wide pass shares; scaled, those clears
+        // whitened a quarter of the screen. REGPU_NO_MSAA_COLOR_SCALE=1: not scaled (A/B).
+        // A texture-less rectangle through an MSAA view of a 64-bit colour surface whose textured draws use another
+        // MSAA mode: scaled from the view's layout to theirs, at any width. A 640x360 4x view is the same EDRAM as a
+        // 1280x720 1x surface; titles clear a full-screen 64-bit target that way (FM3 port, session 40: photo mode's
+        // 16_16_16_16 picture, cleared through a 4x view before it is built up; unscaled, a quarter was cleared and the
+        // rest kept what the 32-bit pass at the same base left, yellow with one guest tile). Its own table
+        // (g_nativeMsaa64), as a 32-bit 1x pass at the same base and width (the composite) is no guide to it.
+        // REGPU_NO_MSAA_SCALE_64=1: not scaled (A/B).
+        else if (static LiveSwitch noScale64("REGPU_NO_MSAA_SCALE_64"); !noScale64 && Color64Bpp() && (gpureg::Get(RB_COLOR_MASK) & 0xF) &&
+                 [&] {
+                     const uint32_t key = LayoutKey(surface), entry = NativeSlot64(key).load(std::memory_order_relaxed);
+                     return entry >> 2 == key && (entry & 3) != msaa;
+                 }())
+        {
+            const uint32_t native = NativeSlot64(LayoutKey(surface)).load(std::memory_order_relaxed) & 3;
+            vc->vscale[3] = float(MsaaAcross(msaa)) / float(MsaaAcross(native));
+            vc->voffset[3] = float(MsaaDown(msaa)) / float(MsaaDown(native));
+        }
+        else if (static LiveSwitch noColorScale("REGPU_NO_MSAA_COLOR_SCALE");
+                 !noColorScale && msaa && (surface & 0x3FFF) * MsaaAcross(msaa) < 1000)
+        {
+            const uint32_t key = LayoutKey(surface), nativeEntry = NativeSlot(key).load(std::memory_order_relaxed);
+            if (nativeEntry >> 2 == key && (nativeEntry & 3) == 0)
+            {
+                vc->vscale[3] = float(MsaaAcross(msaa));
+                vc->voffset[3] = float(MsaaDown(msaa));
+            }
         }
         // A rectangle through another MSAA view of a depth surface (stencil resets): scaled from the
         // view's layout to the depth surface's. Without it FH1's 4x stencil reset covered a quarter
@@ -10468,10 +15862,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         vc->vte[0] |= 1u << 28;
     Sub(3); // viewport, MSAA scale
     // Triangle lists and restart-free strips from an index buffer: a real indexed draw.
-    LiveSwitch &noIndexed = g_sw_REGPU_NO_INDEXED;
-    D3D12_INDEX_BUFFER_VIEW indexView{};
-    uint32_t indexedCount = 0;
-    if (directIndex && !noIndexed && indexSource == 0 && (prim == 4 || prim == 6))
+    if (!indexedTried && directIndex && !noIndexed && indexSource == 0 && (prim == 4 || prim == 6))
     {
         const bool is32 = (initiator >> 11) & 1;
         const uint32_t available = dmaSize & 0xFFFFFF;
@@ -10479,6 +15870,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         indexedCount = prim == 4 ? count / 3 * 3 : count;
         if (indexedCount < 3 || !GetIndexBuffer(dmaBase & 0x1FFFFFFF & ~(is32 ? 3u : 1u), count, is32, dmaSize >> 30, indexView))
             indexedCount = 0;
+        else if (prim == 4) // Hyper: the mesh's decimated or reordered indices, when made (hyperdec)
+            hyperdec::Apply(vs.info, dmaBase & 0x1FFFFFFF & ~(is32 ? 3u : 1u), indexedCount, is32, dmaSize >> 30, indexView, indexedCount);
     }
     if (stripCut && directIndex && !indexedCount)
     {
@@ -10697,11 +16090,51 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // outside the image (dword 5 bits 0-1: 1 white, else black).
         if (clampX >= 6 && clampY >= 6)
             ti[0] |= (1u << 16) | ((fetch.dwords[5] & 3) == 1 ? 1u << 17 : 0u);
+        // A resolved 16-bit fixed image (copy destination k_16, k_16_16, k_16_16_16_16: formats 24-26) keeps each
+        // value as a float in the copy's own number format (the resolve): a fraction destination holds the
+        // fraction (the console stores fraction * 65535, or * 32767 signed), an integer destination the integer
+        // (the exponent bias applied, saturated to 16 bits). On the console a fetch reads those 16 bits with
+        // the fetch constant's number format (dword 3 bit 0: integer) and sign (dword 0 bits 2-3: 1 signed):
+        // an unsigned fraction is bits / 65535 (a negative integer's bits are value + 65536), a signed one
+        // value / 32767, an integer the bits themselves. So: back to the stored bits, then read as the fetch
+        // asks; a fetch that matches the copy (fraction read as the same fraction) is unchanged. Unconverted, a
+        // fraction fetch of an integer copy read values up to 65535 times too large (FM3's variance shadow
+        // map: resolved as signed integers with exponent bias 10, fetched as unsigned fractions by its blur).
+        // tinfo.x bit 6 on, bits 14-15 the fetch's mode (0 signed integer, 1 unsigned fraction, 2 signed
+        // fraction, 3 unsigned integer), bits 4-5 the copy's (0 integer, 1 unsigned fraction, 2 signed
+        // fraction), bits 2-3 the components (0 one, 1 two, 2 four); applied before the exponent adjust and not
+        // to the border colour (hlsl.cpp Fixed16Fetch). REGPU_NO_FIXED16_FETCH=1: unconverted (A/B; read with
+        // the fetch constant, so set it before the start).
+        static const bool noFixed16Fetch = getenv("REGPU_NO_FIXED16_FETCH") != nullptr;
+        if (onGpu && resolvedPtr && resolvedPtr->guestFormat >= 24 && resolvedPtr->guestFormat <= 26 && !noFixed16Fetch)
+        {
+            const bool isSigned = ((fetch.dwords[0] >> 2) & 3) == 1;
+            const bool integer = (fetch.dwords[3] & 1) != 0;
+            const uint32_t mode = integer ? (isSigned ? 0u : 3u) : (isSigned ? 2u : 1u);
+            const uint32_t copy = resolvedPtr->guestNumber == 0 ? 1u : resolvedPtr->guestNumber == 1 ? 2u : 0u;
+            const uint32_t comps = resolvedPtr->guestFormat == 24 ? 0u : resolvedPtr->guestFormat == 25 ? 1u : 2u;
+            // The same number format on both sides is the stored value itself: nothing to do.
+            if (!(mode == 1u && copy == 1u) && !(mode == 2u && copy == 2u))
+                ti[0] |= (1u << 6) | (mode << 14) | (copy << 4) | (comps << 2);
+        }
         // Below the output resolution (a temporal upscaler's scene) the mips are biased sharper by log2 of the
         // scale (-0.58 at 67%), as upscalers ask, so the upscaled image keeps the output's texture detail
         // (from the FM4 port). REGPU_NO_LOD_BIAS=1 (live): the fetch's bias alone.
         static LiveSwitch noLodBias("REGPU_NO_LOD_BIAS");
         tb[0] = fetch.LodBias() + (g_sceneScale < 1.0f && !noLodBias ? std::log2(g_sceneScale) : 0.0f);
+        // The console picks a mip level from derivatives in guest pixels. Rendered above the guest resolution,
+        // the host's derivatives are smaller, so it picks finer levels (sharper, fine for a filtered chain). A
+        // short chain (its smallest level still 64 texels or more) can hold separate images in its levels that
+        // the title selects by how large it draws them (e.g. a picture at level 0, a smaller differently framed
+        // one at level 1): there the host's finer choice blends the wrong image in. Such textures take the
+        // guest's choice (bias + log2 of the draw scale). REGPU_NO_GUEST_LOD_SHORT_MIPS=1 (live): host choice.
+        static LiveSwitch noGuestLod("REGPU_NO_GUEST_LOD_SHORT_MIPS");
+        if (!noGuestLod && fetch.MipMaxLevel() > 0 && (std::min(fetch.Width(), fetch.Height()) >> fetch.MipMaxLevel()) >= 64)
+        {
+            const float drawScale = ScaleY();
+            if (drawScale > 1.0f)
+                tb[0] += std::log2(drawScale);
+        }
         memcpy(&tb[1], &index, 4);
         // A resolved texture is as wide as the pitch it was resolved with; the fetch
         // constant may declare a narrower image inside it (e.g. 163 of 192 columns):
@@ -10714,6 +16147,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         ti[1] = fetch.Width();
         ti[2] = fetch.Height();
+        // REGPU_LEAN_FETCH=2 (hlsl.cpp TFetch2DV2): bit 7 marks a plain 2D texture, whose fetch is one sample: no
+        // 16-bit fixed conversion (bit 6), exponent (8-13), border (16-17), single-axis clamp (18-19), gamma
+        // (24-27) or mirror (28-31), no shader swizzle other than the identity, the whole image.
+        if (LeanFetchLevel() >= 2 && (ti[3] & 0xFFu) == 1 && !(ti[0] & 0xFF0F3F40u) && tb[2] == 1.0f && tb[3] == 1.0f &&
+            (!(ti[3] >> 31) || ((ti[3] >> 8) & 0xFFFu) == 0x688u))
+            ti[0] |= 1u << 7;
         memcpy(memo.fetch, fetch.dwords, sizeof(memo.fetch));
         memo.frame = g_r.frame;
         memo.epoch = g_resolveEpoch;
@@ -10760,7 +16199,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // pixel keeping its colour where alpha >= 1 - offset/4, the offsets RB_COLORCONTROL bits 24-31
     // (pinfo.z bit 6, offsets in bits 8-15). D3D's coverage cut everything at alpha 0.5: PGR4's menu
     // tyre smoke came out as hard-edged grey shapes. REGPU_NO_ALPHA_DITHER=1: D3D's coverage.
-    if (static LiveSwitch noAlphaDither("REGPU_NO_ALPHA_DITHER"); !noAlphaDither && g_msaa == 1 && edramMode != 5 && (colorControl >> 4) & 1)
+    // REGPU_A2M_AS_TEST (A2mAsTest): a plain alpha test at 0.5 instead (the dither with every offset 2).
+    if (A2mAsTest() && edramMode != 5 && (colorControl >> 4) & 1)
+        pc->info[2] |= 64u | 0xAAu << 8;
+    else if (static LiveSwitch noAlphaDither("REGPU_NO_ALPHA_DITHER"); !noAlphaDither && g_msaa == 1 && edramMode != 5 && (colorControl >> 4) & 1)
         pc->info[2] |= 64u | (colorControl >> 24) << 8;
     // The pixel position register (PsParamGen) holds the pixel's integer position, D3D9's convention
     // (Xenia: the host pixel rounded down, then the render scale undone); the host pixel's centre was
@@ -10876,11 +16318,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // A scissor narrower than the screen in a wide pass clips 2D content (a minimap),
     // which the vertex shader keeps in the centred 16:9 area: map it the same way. Not for
     // screen layers (post-processing done in halves would leave a seam).
-    if (WidePass() && ScaleWide() != ScaleY() && !g_drawSamplesResolve && (scissor.left > 0 || scissor.right < LONG(kWidth)))
+    // (The centred area's scale is the 16:9 one, ScaleWide / OutputWide: ScaleY for a 1280x720 frame, 2.5 at 1440p
+    // for PGR3's 1024x600 against ScaleY 2.4.)
+    if (const float wide = OutputWide(); WidePass() && std::abs(wide - 1.0f) > 1e-4f && !g_drawSamplesResolve && (scissor.left > 0 || scissor.right < LONG(FrameW())))
     {
-        const double centre = kWidth * ScaleWide() / 2.0, s = ScaleY();
-        hostScissor.left = LONG(std::lround(centre + (scissor.left - double(kWidth) / 2) * s));
-        hostScissor.right = LONG(std::lround(centre + (scissor.right - double(kWidth) / 2) * s));
+        const double frameW = FrameW(), centre = frameW * ScaleWide() / 2.0, s = ScaleWide() / wide;
+        hostScissor.left = LONG(std::lround(centre + (scissor.left - frameW / 2) * s));
+        hostScissor.right = LONG(std::lround(centre + (scissor.right - frameW / 2) * s));
     }
     DrawState& ds = g_drawState;
     if (memcmp(&ds.viewport, &vp, sizeof(vp)) != 0)
@@ -10893,6 +16337,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         ds.scissor = hostScissor;
         C().list->RSSetScissorRects(1, &hostScissor);
     }
+    TraceSurfaceUse(hostScissor);
     if (const uint32_t ref = gpureg::Get(RB_STENCILREFMASK) & 0xFF; ref != ds.stencilRef)
     {
         ds.stencilRef = ref;
@@ -10923,6 +16368,92 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             memcpy(ds.blendFactor, factor, sizeof(factor));
             C().list->OMSetBlendFactor(factor);
         }
+    }
+    // REGPU_FETCH_VARIANTS (FetchVariant): the slots whose fetch constant is plain this draw (pc->tinfo/tbias as
+    // just filled in), and the pixel shader's variant for them once compiled and its pipeline built.
+    if (static LiveSwitch fetchVariants("REGPU_FETCH_VARIANTS"); fetchVariants && psUsed && pso && LeanFetchLevel() >= 1 && !IsPsEditAlias(C().psHash))
+    {
+        uint32_t plain = 0;
+        for (uint32_t m = psUsed->info.usedTextureSlots; m; m &= m - 1)
+        {
+            const uint32_t slot = uint32_t(std::countr_zero(m));
+            const uint32_t* ti = pc->tinfo[slot];
+            const float* tb = pc->tbias[slot];
+            if ((ti[3] & 0xFFu) == 1 && !(ti[0] & 0xFF0F3F40u) && tb[2] == 1.0f && tb[3] == 1.0f && (!(ti[3] >> 31) || ((ti[3] >> 8) & 0xFFFu) == 0x688u))
+                plain |= 1u << slot;
+        }
+        // REGPU_TRACE_FETCH_PLAIN=1 (live; session 33): once per pixel shader and mask, the slots it reads, those plain
+        // this draw, and per other slot the fetch constant words that kept it out (dimension, clamp/format bits...).
+        if (static LiveSwitch tracePlain("REGPU_TRACE_FETCH_PLAIN"); tracePlain)
+        {
+            static std::mutex m;
+            static std::set<std::pair<uint64_t, uint32_t>> seen;
+            std::lock_guard lock(m);
+            if (seen.insert({ C().psHash, plain }).second && seen.size() < 400)
+            {
+                std::string why;
+                for (uint32_t mm = psUsed->info.usedTextureSlots & ~plain; mm; mm &= mm - 1)
+                {
+                    const uint32_t slot = uint32_t(std::countr_zero(mm));
+                    const uint32_t* ti = pc->tinfo[slot];
+                    const float* tb = pc->tbias[slot];
+                    char b[160];
+                    snprintf(b, sizeof(b), " | slot %u: kind %u, info bits %08X, scale %g %g, swizzle/sign %08X", slot, ti[3] & 0xFFu, ti[0] & 0xFF0F3F40u,
+                        tb[2], tb[3], ti[3] >> 8);
+                    why += b;
+                }
+                Log("fetch plain: ps %016llX slots %X plain %X%s", (unsigned long long)C().psHash, psUsed->info.usedTextureSlots, plain, why.c_str());
+            }
+        }
+        // REGPU_FETCH_SPECIALIZE (SpecVariant): every 2D slot specialised by its words this draw, instead of the plain mask.
+        static LiveSwitch specialize("REGPU_FETCH_SPECIALIZE");
+        if (specialize)
+        {
+            FetchSpec spec[32];
+            size_t n = 0;
+            for (uint32_t m = psUsed->info.usedTextureSlots; m; m &= m - 1)
+            {
+                const uint32_t slot = uint32_t(std::countr_zero(m));
+                const uint32_t* ti = pc->tinfo[slot];
+                // (L62: cube and 3D slots too, for the full-path TFetchK; REGPU_NO_FETCH_SPECIALIZE_FULL: 2D only.)
+                static LiveSwitch noFullSlots("REGPU_NO_FETCH_SPECIALIZE_FULL");
+                if ((ti[3] & 0xFFu) == 1 || (!noFullSlots && ((ti[3] & 0xFFu) == 2 || (ti[3] & 0xFFu) == 3)))
+                    spec[n++] = { slot, ti[0], ti[3] };
+            }
+            // Hyper (REGPU_HYPER_TAILSPEC=1): the export tail's words as literals too (SpecVariant's slots 0x100-0x102).
+            static const bool tailSpec = getenv("REGPU_HYPER_TAILSPEC") && atoi(getenv("REGPU_HYPER_TAILSPEC")) != 0;
+            // N3 (FM3 port session 43; REGPU_SPEC_CONSTANTS=1, start-time): the bool and loop words the pixel shader reads as
+            // literals too, so its static branches and loop counts compile away (Intel's guidance: control flow on
+            // constant-buffer data makes poor code). FM2's Intel thread measured bools alone on an HD 630: no gain.
+            static const bool specConstants = getenv("REGPU_SPEC_CONSTANTS") && atoi(getenv("REGPU_SPEC_CONSTANTS")) != 0;
+            FetchSpec all[56];
+            if ((tailSpec || specConstants) && !IsPsEditAlias(C().psHash))
+            {
+                std::copy(spec, spec + n, all);
+                size_t m = n;
+                if (tailSpec)
+                {
+                    uint32_t ceil;
+                    memcpy(&ceil, &pc->info2[3], 4);
+                    all[m++] = { 0x100, pc->info[0], pc->info[1] };
+                    all[m++] = { 0x101, pc->info[2], pc->info[3] };
+                    all[m++] = { 0x102, ceil, 0 };
+                }
+                if (specConstants && psUsed->info.readsBools)
+                    for (uint32_t k = 0; k < 4; k++)
+                        all[m++] = { 0x110 + k, pc->b[k * 2], pc->b[k * 2 + 1] };
+                if (specConstants && psUsed->info.readsLoops)
+                    for (uint32_t k = 0; k < 16; k++)
+                        all[m++] = { 0x120 + k, pc->l[k * 2], pc->l[k * 2 + 1] };
+                plain = m ? RegisterSpec(all, m) : 0u;
+            }
+            else
+                plain = n ? RegisterSpec(spec, n) : 0u;
+        }
+        if (plain)
+            if (const CompiledShader* f = FetchShader(*psUsed, plain))
+                if (ID3D12PipelineState* fp = GetPipeline(vs, *f, edramMode == 5, cullable, false, stripCut && directIndex, false, psUsed != &ps, plain))
+                    pso = fp;
     }
     if (motion != ds.motionRoot)
     {
@@ -11030,15 +16561,169 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             for (uint32_t k : vs.info.vertexFetchConstants)
                 fetches = std::max(fetches, k + 1);
             const size_t layouts = std::min<size_t>(vs.info.vertexFetchLayout.size(), 32);
-            const uint32_t slots = usedSlots ? 32 - uint32_t(__builtin_clz(usedSlots)) : 0;
-            put(vcRing, vc, vsFrom, offsetof(VSConstants, vf));
-            put(vcRing, vc, offsetof(VSConstants, vf), offsetof(VSConstants, vf) + fetches * sizeof(vc->vf[0]));
-            put(vcRing, vc, offsetof(VSConstants, info), offsetof(VSConstants, vfl));
-            put(vcRing, vc, offsetof(VSConstants, vfl), offsetof(VSConstants, vfl) + layouts * sizeof(vc->vfl[0]));
-            put(vcRing, vc, offsetof(VSConstants, vuser), sizeof(VSConstants));
-            put(pcRing, pc, psFrom, offsetof(PSConstants, tinfo));
-            put(pcRing, pc, offsetof(PSConstants, tinfo), offsetof(PSConstants, tinfo) + slots * sizeof(pc->tinfo[0]));
-            put(pcRing, pc, offsetof(PSConstants, tbias), offsetof(PSConstants, tbias) + slots * sizeof(pc->tbias[0]));
+            // The fetch table and the texture entries are written entry by entry: games pick vertex fetch
+            // constants near the top of the 96 (FM3: ~1.4 KB of unread entries below the used ones, per
+            // draw). REGPU_FETCH_TABLE_BY_RANGE=1 writes everything up to the highest one again (A/B).
+            static LiveSwitch byRangeSwitch("REGPU_FETCH_TABLE_BY_RANGE");
+            const bool byRange = byRangeSwitch;
+            const uint32_t slots = byRange && usedSlots ? 32 - uint32_t(__builtin_clz(usedSlots)) : 0;
+            // Bool and loop constants, the fetch layout and the game's vuser constants only for shaders that read
+            // them (ScanBlockUse): unread, they were ~400 of ~1,470 bytes a draw (FM3, session 30); everything
+            // for a hooked draw or a live shader edit. REGPU_WRITE_UNREAD_PARTS=1 writes them all again (A/B).
+            static LiveSwitch writeUnreadSwitch("REGPU_WRITE_UNREAD_PARTS");
+            const bool all = writeUnreadSwitch || hooked || IsPsEditAlias(C().psHash);
+            auto span = [](size_t from, size_t to, bool on) { return on ? std::pair<size_t, size_t>{ from, to } : std::pair<size_t, size_t>{ from, from }; };
+            const bool vsHook = hooked; // vsFrom = 0: c[] goes from the stage too
+            const std::pair<size_t, size_t> vsRanges[] = {
+                span(vsFrom, offsetof(VSConstants, b), vsHook),
+                span(offsetof(VSConstants, b), offsetof(VSConstants, l), all || vs.info.readsBools),
+                span(offsetof(VSConstants, l), offsetof(VSConstants, vf), all || vs.info.readsLoops),
+                { offsetof(VSConstants, vf), offsetof(VSConstants, vf) + (byRange ? fetches : 0) * sizeof(vc->vf[0]) },
+                { offsetof(VSConstants, info), offsetof(VSConstants, vfl) },
+                span(offsetof(VSConstants, vfl), offsetof(VSConstants, vfl) + layouts * sizeof(vc->vfl[0]), all || vs.info.readsFetchLayout),
+                span(offsetof(VSConstants, vuser), offsetof(VSConstants, vdepth), all || vs.info.readsUser),
+                { offsetof(VSConstants, vdepth), sizeof(VSConstants) },
+            };
+            const std::pair<size_t, size_t> psRanges[] = {
+                span(psFrom, offsetof(PSConstants, l), all || ps.info.readsBools),
+                span(offsetof(PSConstants, l), offsetof(PSConstants, info), all || ps.info.readsLoops),
+                { offsetof(PSConstants, info), offsetof(PSConstants, tinfo) },
+                { offsetof(PSConstants, tinfo), offsetof(PSConstants, tinfo) + slots * sizeof(pc->tinfo[0]) },
+                { offsetof(PSConstants, tbias), offsetof(PSConstants, tbias) + slots * sizeof(pc->tbias[0]) },
+            };
+            // The used entries (none when by range: the ranges hold them).
+            auto vfPut = [&](VSConstants* vd) {
+                uint32_t n = 0;
+                if (!byRange)
+                    for (uint32_t k : vs.info.vertexFetchConstants)
+                        memcpy(vd->vf[k], vc->vf[k], sizeof(vc->vf[0])), n += 16;
+                return n;
+            };
+            auto texPut = [&](PSConstants* pd) {
+                uint32_t n = 0;
+                if (!byRange)
+                    for (uint32_t m = usedSlots; m; m &= m - 1, n += 32)
+                    {
+                        const uint32_t s = uint32_t(__builtin_ctz(m));
+                        memcpy(pd->tinfo[s], pc->tinfo[s], sizeof(pc->tinfo[0]));
+                        memcpy(pd->tbias[s], pc->tbias[s], sizeof(pc->tbias[0]));
+                    }
+                return n;
+            };
+            if (!compareBlocks)
+            {
+                for (const auto& [from, to] : vsRanges)
+                    put(vcRing, vc, from, to);
+                for (const auto& [from, to] : psRanges)
+                    put(pcRing, pc, from, to);
+                vfPut(vcRing);
+                texPut(pcRing);
+            }
+            else
+            {
+                // The float constants the shader reads, from the stage (compared, then copied).
+                auto floatsSame = [](const float (*a)[4], const float (*b)[4], const std::array<uint64_t, 4>& mask) {
+                    for (uint32_t w = 0; w < 4; w++)
+                        for (uint64_t bits = mask[w]; bits; bits &= bits - 1)
+                        {
+                            const uint32_t i = w * 64 + uint32_t(_tzcnt_u64(bits));
+                            const __m128i x = _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a[i])), _mm_loadu_si128(reinterpret_cast<const __m128i*>(b[i])));
+                            if (!_mm_testz_si128(x, x))
+                                return false;
+                        }
+                    return true;
+                };
+                auto floatsPut = [](float (*dst)[4], const float (*src)[4], const std::array<uint64_t, 4>& mask) {
+                    uint32_t n = 0;
+                    for (uint32_t w = 0; w < 4; w++)
+                        for (uint64_t bits = mask[w]; bits; bits &= bits - 1, n++)
+                        {
+                            const uint32_t i = w * 64 + uint32_t(_tzcnt_u64(bits));
+                            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst[i]), _mm_loadu_si128(reinterpret_cast<const __m128i*>(src[i])));
+                        }
+                    return n * 16u;
+                };
+                auto rangesSame = [](const void* a, const void* b, const auto& ranges) {
+                    for (const auto& [from, to] : ranges)
+                        if (to > from && memcmp(static_cast<const uint8_t*>(a) + from, static_cast<const uint8_t*>(b) + from, to - from) != 0)
+                            return false;
+                    return true;
+                };
+                // Where the floats sit in the stage: by the mask, or the first ones for packed constants.
+                auto layoutMask = [](const TranslatedShader& info) {
+                    if (!info.packedConstants)
+                        return info.constantMask;
+                    std::array<uint64_t, 4> l{};
+                    uint32_t n = 0;
+                    for (uint64_t w : info.constantMask)
+                        n += uint32_t(__builtin_popcountll(w));
+                    for (uint32_t i = 0; i < n; i++)
+                        l[i >> 6] |= 1ull << (i & 63);
+                    return l;
+                };
+                const std::array<uint64_t, 4> vsFloats = layoutMask(vs.info), psFloats = layoutMask(ps.info);
+                const VSConstants* vcPrev = &vcStages[stageParity ^ 1];
+                const PSConstants* pcPrev = &pcStages[stageParity ^ 1];
+                const bool valid = lastBlocks.ring == f.ringCpu && lastBlocks.frame == g_r.frame && lastBlocks.parity == (stageParity ^ 1);
+                auto vfSame = [&] {
+                    for (uint32_t k : vs.info.vertexFetchConstants)
+                        if (memcmp(vc->vf[k], vcPrev->vf[k], sizeof(vc->vf[0])) != 0)
+                            return false;
+                    return true;
+                };
+                auto texSame = [&] {
+                    for (uint32_t m = usedSlots; m; m &= m - 1)
+                    {
+                        const uint32_t s = uint32_t(__builtin_ctz(m));
+                        if (memcmp(pc->tinfo[s], pcPrev->tinfo[s], sizeof(pc->tinfo[0])) != 0 || memcmp(pc->tbias[s], pcPrev->tbias[s], sizeof(pc->tbias[0])) != 0)
+                            return false;
+                    }
+                    return true;
+                };
+                const bool vsSame = valid && lastBlocks.vs == &vs && rangesSame(vc, vcPrev, vsRanges) && vfSame() && floatsSame(vc->c, vcPrev->c, vsFloats);
+                const bool psSame = valid && lastBlocks.ps == &ps && lastBlocks.psSlots == usedSlots && rangesSame(pc, pcPrev, psRanges) && texSame() &&
+                                    floatsSame(pc->c, pcPrev->c, psFloats);
+                uint64_t written = 0, part[4] = {};
+                if (vsSame && reuseSwitch)
+                    vsOffset = lastBlocks.vsOffset;
+                else
+                {
+                    for (const auto& [from, to] : vsRanges)
+                        put(vcRing, vc, from, to), part[1] += to > from ? to - from : 0;
+                    part[1] += vfPut(vcRing);
+                    part[0] = floatsPut(vcRing->c, vc->c, vsFloats);
+                }
+                if (psSame && reuseSwitch)
+                    psOffset = lastBlocks.psOffset;
+                else
+                {
+                    for (const auto& [from, to] : psRanges)
+                        put(pcRing, pc, from, to), part[3] += to > from ? to - from : 0;
+                    part[3] += texPut(pcRing);
+                    part[2] = floatsPut(pcRing->c, pc->c, psFloats);
+                }
+                lastBlocks = { f.ringCpu, g_r.frame, &vs, &ps, usedSlots, stageParity, vsOffset, psOffset };
+                if (traceBytes)
+                {
+                    written = part[0] + part[1] + part[2] + part[3];
+                    static uint64_t draws = 0, vsRepeat = 0, psRepeat = 0, bytes = 0, lastFrame = 0, parts[4] = {};
+                    draws++, vsRepeat += vsSame, psRepeat += psSame, bytes += written;
+                    for (int i = 0; i < 4; i++)
+                        parts[i] += part[i];
+                    if (g_r.frame >= lastFrame + 120)
+                    {
+                        const uint64_t frames = g_r.frame - lastFrame;
+                        lastFrame = g_r.frame;
+                        Log("constant blocks: %.0f draws a frame, vs repeats %.1f%%, ps repeats %.1f%%; %.0f bytes a draw, %.0f KB a frame written (reuse %s)",
+                            double(draws) / double(frames), 100.0 * double(vsRepeat) / double(std::max<uint64_t>(draws, 1)), 100.0 * double(psRepeat) / double(std::max<uint64_t>(draws, 1)),
+                            double(bytes) / double(std::max<uint64_t>(draws, 1)), double(bytes) / 1024.0 / double(frames), reuseSwitch ? "on" : "off");
+                        const double n = double(std::max<uint64_t>(draws, 1));
+                        Log("constant blocks: bytes a draw: vs floats %.0f, vs rest %.0f, ps floats %.0f, ps rest %.0f", parts[0] / n, parts[1] / n, parts[2] / n, parts[3] / n);
+                        draws = vsRepeat = psRepeat = bytes = 0;
+                        parts[0] = parts[1] = parts[2] = parts[3] = 0;
+                    }
+                }
+            }
         }
     }
     C().list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
@@ -11097,7 +16782,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             (unsigned long long)C().vsHash, (unsigned long long)C().psHash, initiator & 0x3F, list.size(), gpureg::Get(RB_BLENDCONTROL0),
             gpureg::Get(RB_COLOR_MASK) & 15, scissor.left, scissor.top, scissor.right, scissor.bottom, gpureg::Get(PA_CL_VTE_CNTL) & 0x3FF,
             int(WidePass()), int(g_drawSamplesResolve), gpureg::Get(RB_SURFACE_INFO) & 0x3FFF,
-            g_occlusionOpen ? " [in occlusion query]" : GetShader(C().vsHash, C().vsCode, false).info.memExport ? " [memexport]" : "", tex.c_str());
+            !C().worker && g_occlusionOpen ? " [in occlusion query]" : GetShader(C().vsHash, C().vsCode, false).info.memExport ? " [memexport]" : "", tex.c_str());
         Log("    host: scissor %ld,%ld-%ld,%ld viewport %g,%g %gx%g depth %p colour %p (bases %03X %03X)", hostScissor.left, hostScissor.top,
             hostScissor.right, hostScissor.bottom, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, static_cast<void*>(C().depth.Get()),
             static_cast<void*>(C().color.Get()), C().depthBase, C().colorBase);
@@ -11135,6 +16820,22 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             const uint32_t* v = GuestPtr<uint32_t>(GpuPhysToGuest(d0 & 0xFFFFFFFC));
             Log("    vf%u: %08X size %u endian %u: %08X %08X %08X %08X %08X %08X %08X %08X", k, d0 & 0xFFFFFFFC, ((d1 >> 2) & 0xFFFFFF) * 4, d1 & 3,
                 v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            // Small buffers (screen-space quads, rectangles) in full, as big-endian floats: the corners of a
+            // pass's geometry decide which rows it covers, and the buffer is gone by the time anyone peeks it.
+            if (const uint32_t dwords = (d1 >> 2) & 0xFFFFFF; dwords <= 64)
+            {
+                std::string all;
+                for (uint32_t i = 0; i < dwords; i++)
+                {
+                    const uint32_t b = __builtin_bswap32(v[i]);
+                    float f;
+                    memcpy(&f, &b, 4);
+                    char t[24];
+                    snprintf(t, sizeof(t), " %g", f);
+                    all += t;
+                }
+                Log("    vf%u floats:%s", k, all.c_str());
+            }
             if ((initiator & 0x3F) == 8)
             {
                 // Rectangle lists: print the corners as floats (big-endian vertex data).
@@ -11217,13 +16918,23 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             gpureg::Get(RB_DEPTHCONTROL), gpureg::Get(RB_STENCILREFMASK), gpureg::Get(RB_COLORCONTROL), gpureg::Get(PA_SU_SC_MODE_CNTL));
         for (uint32_t c = 0; c < 256; c++)
             if (c == 0 || c == 1 || c == 5 || c == 6 || c == 7 || c == 14 || c == 22 || c == 254 || c == 255 || ((ps.info.constantMask[c >> 6] >> (c & 63)) & 1))
-                Log("    pc%u = %g %g %g %g", c, pcRing->c[c][0], pcRing->c[c][1], pcRing->c[c][2], pcRing->c[c][3]); // (and every one the pixel shader reads)
+            {
+                // From the register file (the ring holds packed constants for most shaders: PackConstants).
+                float v[4];
+                for (int j = 0; j < 4; j++)
+                {
+                    const uint32_t bits = gpureg::Get(gpureg::AluConstants + (256 + c) * 4 + j);
+                    memcpy(&v[j], &bits, 4);
+                }
+                Log("    pc%u = %g %g %g %g", c, v[0], v[1], v[2], v[3]); // (and every one the pixel shader reads)
+            }
     }
     // A draw inside an occlusion query is also drawn with the depth test always passing, in a query of
     // its own: the samples it covers, the console's Total (a game fades a light flare by the share that
     // passed). From pgr4-native's occlusion pairs. REGPU_NO_OCCLUSION_COVERAGE=1: not drawn (Total = ZPass).
     static LiveSwitch noCoverage("REGPU_NO_OCCLUSION_COVERAGE");
-    ID3D12PipelineState* coveragePso = g_occlusionOpen && !noCoverage && !motion && g_occlusionCount + 2 <= kOcclusionPerFrame
+    // (A draw worker's draw is never inside the command processor's query: gpu.cpp seg::g_query.)
+    ID3D12PipelineState* coveragePso = !C().worker && g_occlusionOpen && !noCoverage && !motion && g_occlusionCount + 2 <= kOcclusionPerFrame
         ? GetPipeline(vs, ps, edramMode == 5, cullable, false, stripCut && directIndex, true) : nullptr;
     {
         const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -11233,17 +16944,93 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             g_drawState.topology = topology;
             C().list->IASetPrimitiveTopology(topology);
         }
-        if (indexedCount && memcmp(&indexView, &g_drawState.indexBuffer, sizeof(indexView)) != 0)
+        // Index buffers live in the index arena or this frame's upload ring: bound as a view of the whole buffer,
+        // with the draw's place as its start index, consecutive draws share one binding (a new view almost every
+        // indexed draw before: ~2,000 IASetIndexBuffer a frame in FM3, each a driver call on the replay thread).
+        // REGPU_NO_WIDE_INDEX_VIEWS=1 (live): one view per draw's indices, as before.
+        UINT startIndex = 0;
+        D3D12_INDEX_BUFFER_VIEW bindView = indexView;
+        if (LiveSwitch &noWide = g_sw_REGPU_NO_WIDE_INDEX_VIEWS; indexedCount && !noWide)
         {
-            g_drawState.indexBuffer = indexView;
-            C().list->IASetIndexBuffer(&indexView);
+            const UINT size = indexView.Format == DXGI_FORMAT_R32_UINT ? 4u : 2u;
+            auto widen = [&](ID3D12Resource* buffer, UINT64 bytes) {
+                if (!buffer)
+                    return false;
+                const D3D12_GPU_VIRTUAL_ADDRESS base = buffer->GetGPUVirtualAddress();
+                const UINT64 end = base + std::min<UINT64>(bytes, 0xFFFFFFF0ull);
+                if (indexView.BufferLocation < base || indexView.BufferLocation + indexView.SizeInBytes > end || (indexView.BufferLocation - base) % size)
+                    return false;
+                startIndex = UINT((indexView.BufferLocation - base) / size);
+                bindView = { base, UINT(end - base), indexView.Format };
+                return true;
+            };
+            if (!widen(g_indexArena.buffer.Get(), IndexArena::kBytes))
+                widen(f.ring.Get(), f.ringSize);
+        }
+        if (indexedCount && memcmp(&bindView, &g_drawState.indexBuffer, sizeof(bindView)) != 0)
+        {
+            g_drawState.indexBuffer = bindView;
+            C().list->IASetIndexBuffer(&bindView);
         }
         auto issue = [&] {
-            if (indexedCount)
-                C().list->DrawIndexedInstanced(indexedCount, 1, 0, 0, 0);
+            // REGPU_GPU_PASSES=2: this draw's pipeline statistics (begun and ended in the same list).
+            const UINT statFrame = UINT(&Frame() - g_r.frames);
+            const bool stat = g_gpuStats && g_statQueries && !C().worker && g_statDraws[statFrame].size() < kStatDraws;
+            const UINT statQuery = statFrame * kStatDraws + UINT(stat ? g_statDraws[statFrame].size() : 0);
+            if (stat)
+            {
+                g_statDraws[statFrame].push_back({ uint32_t(C().psHash), g_statPass });
+                C().list->BeginQuery(g_statQueries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, statQuery);
+            }
+            // REGPU_EXP_DRAW=N (live, FM3 port session 33, measuring what a draw costs on a small GPU; picture wrong):
+            // 1 = no draw call (all its state still set), 2 = one triangle per draw (fixed per-draw cost),
+            // 3 = 1x1 scissor (vertex work, no pixels).
+            static const auto expDraw = [] {
+                thread_local uint64_t frame = ~0ull;
+                thread_local int v = 0;
+                if (frame != g_r.frame)
+                {
+                    frame = g_r.frame;
+                    const char* e = getenv("REGPU_EXP_DRAW");
+                    v = e ? atoi(e) : 0;
+                }
+                return v;
+            };
+            const int exp = expDraw();
+            if (exp == 3)
+            {
+                const D3D12_RECT one{ 0, 0, 1, 1 };
+                C().list->RSSetScissorRects(1, &one);
+                g_drawState.scissor = one;
+            }
+            if (exp == 1)
+                ;
+            else if (indexedCount)
+                C().list->DrawIndexedInstanced(exp == 2 ? std::min<UINT>(indexedCount, 3) : indexedCount, 1, startIndex, 0, 0);
             else
-                C().list->DrawInstanced(directIndex ? directVertices : UINT(list.size()), 1, 0, 0);
+                C().list->DrawInstanced(exp == 2 ? std::min<UINT>(directIndex ? directVertices : UINT(list.size()), 3) : (directIndex ? directVertices : UINT(list.size())), 1, 0, 0);
+            if (stat)
+                C().list->EndQuery(g_statQueries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, statQuery);
         };
+        // REGPU_DRAW_CULL (DrawCull above): drawn inside a query of its own, or predicated on last frame's.
+        DrawCull::Decision cull;
+        if (static LiveSwitch noCull("REGPU_NO_DRAW_CULL"); DrawCull::Threshold() && !noCull && !coveragePso && !g_occlusionOpen && !C().worker &&
+                                                            !motion && prim != 8 && (edramMode == 4 || edramMode == 5) &&
+                                                            (gpureg::Get(RB_DEPTHCONTROL) & 7) == 6 && DrawCull::Init())
+        {
+            uint64_t key = 0xCBF29CE484222325ull;
+            for (uint64_t v : { C().vsHash, C().psHash, uint64_t(initiator), uint64_t(dmaBase), uint64_t(dmaSize), uint64_t(gpureg::Get(gpureg::FetchConstants)),
+                     uint64_t(gpureg::Get(gpureg::FetchConstants + 2)), uint64_t(gpureg::Get(RB_SURFACE_INFO)), uint64_t(gpureg::Get(RB_COLOR_INFO)),
+                     uint64_t(gpureg::Get(RB_DEPTH_INFO)), uint64_t(gpureg::Get(PA_SC_WINDOW_OFFSET)), uint64_t(gpureg::Get(PA_SC_WINDOW_SCISSOR_TL)),
+                     uint64_t(gpureg::Get(PA_SC_WINDOW_SCISSOR_BR)) })
+                key = (key ^ v) * 0x100000001B3ull;
+            const double samples = double(DrawCull::Threshold()) * g_msaa * ScaleX() * ScaleY();
+            cull = DrawCull::Decide(key, uint32_t(std::min(samples, 4.0e9)));
+        }
+        if (cull.mode == 1)
+            C().list->BeginQuery(DrawCull::g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, cull.query);
+        else if (cull.mode == 2)
+            C().list->SetPredication(DrawCull::g_predicates.Get(), UINT64(cull.slot) * 8, D3D12_PREDICATION_OP_EQUAL_ZERO);
         if (coveragePso)
         {
             // The open query's part so far ends; the coverage draw gets a query of its own; the query
@@ -11261,7 +17048,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             g_occlusionCurrent.main.push_back(g_occlusionIndex);
             C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
         }
+        const UINT hyperQuery = hyperCullMeasure && !coveragePso && cull.mode == 0 ? HyperCull::Begin() : ~0u;
         issue();
+        if (hyperQuery != ~0u)
+            C().list->EndQuery(HyperCull::g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, hyperQuery);
+        if (cull.mode == 1)
+            C().list->EndQuery(DrawCull::g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, cull.query);
+        else if (cull.mode == 2)
+            C().list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
         if (g_perfTiming)
         {
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -11273,7 +17067,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (C().worker)
         C().draws++;
     else
-        g_r.drawsThisFrame++;
+    {
+        // A plain load and store, not a locked add: only this thread counts the main context's draws (workers add
+        // theirs at the end of a piece; the count is statistics and draw numbering). A locked add is a full barrier
+        // that waits for the draw's write-combined ring writes to drain (PGR3 port: 8.6% of the draw thread at this
+        // line; +0.7% fps, the rest of the wait moves to the next locked instruction). REGPU_LOCKED_DRAW_COUNT=1: as before.
+        static LiveSwitch lockedCount("REGPU_LOCKED_DRAW_COUNT");
+        if (!lockedCount)
+            g_r.drawsThisFrame.store(g_r.drawsThisFrame.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        else
+            g_r.drawsThisFrame++;
+    }
     // REGPU_SUBMIT_DRAWS=<n>: submit the frame so far every n draws (never inside an occlusion query), so
     // the GPU starts on it while the rest is recorded (pgr4-native). Off by default: FM2's race, already
     // GPU-bound, lost 4-17% at n = 128-512. It may help a game whose GPU waits on recording.
@@ -11407,6 +17211,325 @@ void BenchmarkWriteReport(const char* path)
     Log("benchmark: report written to %s", path);
 }
 
+namespace PerfLite
+{
+// The light performance log (REGPU_PERF_LITE, session 31; idea from a ReGPU developer: "don't buffer the logs, have
+// them threaded: push them in a queue, pop the queue in the log thread"). REGPU_PERF times every draw (several clock
+// reads a draw) and formats its lines on the draw thread; this one does nothing per draw. At each swap the draw thread
+// writes one record of running totals into a single-producer/single-consumer ring (two atomics, no mutex: only the
+// draw thread writes `head`, only the log thread writes `tail`); the log thread wakes every 100 ms, pops what is
+// there, and once a second logs fps, frame-time p99/max, draws, GPU time and the draw thread's CPU use (read by the
+// log thread itself with GetThreadTimes, so that costs the draw thread nothing either). A full ring drops records.
+struct Record
+{
+    int64_t ns;        // steady_clock at the swap
+    uint64_t draws;    // draws so far
+    double gpuMs;      // GPU ms so far (timed frames)
+    uint64_t gpuFrames;
+};
+constexpr uint32_t kSize = 8192;
+Record g_ring[kSize];
+std::atomic<uint32_t> g_head{ 0 }, g_tail{ 0 };
+HANDLE g_drawThread = nullptr;
+
+// Long frames (LongFramesOn): one record per frame over twice the recent average, with what the draw thread did in
+// it, through a second ring of the same kind. Where the time went:
+//  idle      the draw thread waited for the command processor (the game, or ReGPU's command processor, was late)
+//  gpu wait  the draw thread waited for the host GPU to free a frame's resources (GPU-bound)
+//  builds    waits for shader/pipeline compiles (count, ms), pipelines started, committed resources created
+//  textures  uploads (new, changed), their guest bytes and the time spent hashing nothing, decoding and copying
+//  swap      the frame end itself (present, frame cap)
+//  fences    every host GPU fence wait on this thread (the frame-start one included: resolve write-backs, ...)
+//  replay    waits for the command list replay thread (it submits and, with async present, presents: a slow
+//            Present or capture hook shows here)
+//  cpu       the thread's own CPU time in the frame (QueryThreadCycleTime) and its recent average: a frame whose
+//            wall time is long but CPU time normal was spent blocked or not scheduled
+// The rest of the frame is the draw thread translating draws.
+struct LongRecord
+{
+    uint64_t frame;
+    float ms, avgMs, idleMs, gpuWaitMs, buildWaitMs, texMs, swapMs;
+    float fenceMs, replayMs, cpuMs, avgCpuMs; // all fence waits, waits for the replay thread, the thread's CPU time
+    uint32_t draws, buildWaits, pipelines, created, texNew, texChanged;
+    uint64_t texBytes;
+    float texCreateMs, texMaxMs;
+    char texMax[64];
+};
+constexpr uint32_t kLongSize = 256;
+LongRecord g_long[kLongSize];
+std::atomic<uint32_t> g_longHead{ 0 }, g_longTail{ 0 };
+std::atomic<uint32_t> g_longFrames{ 0 }; // long frames so far (the perf lite line shows the window's count)
+
+void PushLong(const LongRecord& r)
+{
+    g_longFrames.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t head = g_longHead.load(std::memory_order_relaxed);
+    if (head - g_longTail.load(std::memory_order_acquire) >= kLongSize)
+        return;
+    g_long[head % kLongSize] = r;
+    g_longHead.store(head + 1, std::memory_order_release);
+}
+
+void LogLong()
+{
+    // At most 30 lines a second: a loading screen can make every frame long.
+    static auto windowStart = std::chrono::steady_clock::now();
+    static uint32_t lines = 0, dropped = 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - windowStart >= std::chrono::seconds(1))
+    {
+        if (dropped)
+            Log("long frame: %u more not logged (over 30 a second)", dropped);
+        windowStart = now, lines = 0, dropped = 0;
+    }
+    const uint32_t head = g_longHead.load(std::memory_order_acquire);
+    for (uint32_t tail = g_longTail.load(std::memory_order_relaxed); tail != head; tail++)
+    {
+        const LongRecord r = g_long[tail % kLongSize];
+        g_longTail.store(tail + 1, std::memory_order_release);
+        if (lines >= 30)
+        {
+            dropped++;
+            continue;
+        }
+        lines++;
+        char texDetail[112] = "";
+        if (r.texMaxMs > 0)
+            snprintf(texDetail, sizeof(texDetail), " (create %.2f ms; slowest %s %.2f ms)", r.texCreateMs, r.texMax, r.texMaxMs);
+        Log("long frame %llu: %.2f ms (avg %.2f) | %u draws | idle %.2f ms | gpu wait %.2f ms | builds %u waits %.2f ms, %u pipelines, %u created | "
+            "textures %u new %u changed %.0f KB %.2f ms%s | swap %.2f ms | fences %.2f ms | replay %.2f ms | cpu %.2f ms (avg %.2f)",
+            (unsigned long long)r.frame, r.ms, r.avgMs, r.draws, r.idleMs, r.gpuWaitMs, r.buildWaits, r.buildWaitMs, r.pipelines, r.created,
+            r.texNew, r.texChanged, double(r.texBytes) / 1024.0, r.texMs, texDetail, r.swapMs, r.fenceMs, r.replayMs, r.cpuMs, r.avgCpuMs);
+    }
+}
+
+void LogThread()
+{
+    std::vector<float> frameMs;
+    frameMs.reserve(4096);
+    Record last{}, windowFirst{};
+    bool haveLast = false, haveWindow = false;
+    uint64_t cpuFirst = 0;
+    auto threadCpu = [] {
+        FILETIME c, e, k, u;
+        if (!g_drawThread || !GetThreadTimes(g_drawThread, &c, &e, &k, &u))
+            return uint64_t(0);
+        return ((uint64_t(k.dwHighDateTime) << 32 | k.dwLowDateTime) + (uint64_t(u.dwHighDateTime) << 32 | u.dwLowDateTime)) * 100; // ns
+    };
+    uint32_t longFirst = 0;
+    for (;;)
+    {
+        Sleep(100);
+        LogLong();
+        const uint32_t head = g_head.load(std::memory_order_acquire);
+        for (uint32_t tail = g_tail.load(std::memory_order_relaxed); tail != head; tail++)
+        {
+            const Record r = g_ring[tail % kSize];
+            g_tail.store(tail + 1, std::memory_order_release);
+            if (!haveWindow)
+            {
+                windowFirst = r, haveWindow = true, cpuFirst = threadCpu();
+                frameMs.clear();
+            }
+            else if (haveLast)
+                frameMs.push_back(float(double(r.ns - last.ns) / 1e6));
+            last = r, haveLast = true;
+            const double windowS = double(r.ns - windowFirst.ns) / 1e9;
+            if (windowS >= 1.0 && !frameMs.empty())
+            {
+                const size_t n = frameMs.size();
+                double sum = 0, worst = 0;
+                for (float x : frameMs)
+                    sum += x, worst = std::max(worst, double(x));
+                std::vector<float> sorted = frameMs;
+                const size_t k = std::min(n - 1, size_t(double(n) * 0.99));
+                std::nth_element(sorted.begin(), sorted.begin() + ptrdiff_t(k), sorted.end());
+                const uint64_t cpuNow = threadCpu();
+                const double busy = cpuFirst && cpuNow ? 100.0 * double(cpuNow - cpuFirst) / (windowS * 1e9) : -1.0;
+                const uint64_t gpuFrames = r.gpuFrames - windowFirst.gpuFrames;
+                const uint32_t longNow = g_longFrames.load(std::memory_order_relaxed);
+                char longText[32] = "";
+                if (LongFramesEnabled())
+                    snprintf(longText, sizeof(longText), " | %u long", longNow - longFirst);
+                longFirst = longNow;
+                Log("perf lite: %.1f fps, %.2f ms/frame (p99 %.2f ms, max %.2f ms) | %.0f draws/frame | GPU %.2f ms/frame | draw thread %.0f%% busy%s",
+                    double(n) / windowS, sum / double(n),
+                    double(sorted[k]), worst, double(r.draws - windowFirst.draws) / double(n),
+                    gpuFrames ? (r.gpuMs - windowFirst.gpuMs) / double(gpuFrames) : 0.0, busy, longText);
+                // REGPU_FRAME_HISTOGRAM=1 (start-time): the second's frame times in 0.25 ms buckets (frame pacing).
+                static const bool histogram = getenv("REGPU_FRAME_HISTOGRAM") != nullptr;
+                if (histogram)
+                {
+                    uint32_t bucket[41] = {};
+                    for (float x : frameMs)
+                        bucket[std::min(40, int(x * 4.0f))]++;
+                    std::string line;
+                    for (int i = 0; i <= 40; i++)
+                        if (bucket[i])
+                            line += " " + std::to_string(i * 0.25).substr(0, 4) + (i == 40 ? "+" : "") + ":" + std::to_string(bucket[i]);
+                    Log("perf lite: frame times (ms:count):%s", line.c_str());
+                }
+                // Video memory every 5th line (session 33 of the FM3 port: high resolutions): what the process uses of the
+                // budget the OS gives it, from DXGI on this log thread (nothing on the draw thread).
+                static uint32_t vramLines = 0;
+                if (vramLines++ % 5 == 0 && g_r.device)
+                {
+                    static ComPtr<IDXGIAdapter3> adapter = [] {
+                        ComPtr<IDXGIFactory4> factory;
+                        ComPtr<IDXGIAdapter3> a;
+                        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+                            factory->EnumAdapterByLuid(g_r.device->GetAdapterLuid(), IID_PPV_ARGS(&a));
+                        return a;
+                    }();
+                    DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
+                    if (adapter && SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+                        SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared)))
+                        Log("perf lite: VRAM %llu MB used of %llu MB budget | system memory for the GPU %llu MB of %llu MB",
+                            (unsigned long long)(local.CurrentUsage >> 20), (unsigned long long)(local.Budget >> 20),
+                            (unsigned long long)(shared.CurrentUsage >> 20), (unsigned long long)(shared.Budget >> 20));
+                }
+                windowFirst = r, cpuFirst = cpuNow;
+                frameMs.clear();
+            }
+        }
+    }
+}
+
+// Called by the draw thread at every swap.
+void Push(std::chrono::steady_clock::time_point now, uint64_t draws)
+{
+    static bool started = false;
+    if (!started)
+    {
+        started = true;
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_drawThread, THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0);
+        std::thread([] {
+            SetThreadDescription(GetCurrentThread(), L"perf lite log");
+            LogThread();
+        }).detach();
+        Log("perf lite: light performance log on (REGPU_PERF_LITE): one line a second, no per-draw timing");
+        if (LongFramesEnabled())
+            Log("perf lite: long-frame log on (REGPU_LONG_FRAMES): frames over 2x the recent average, with what they did");
+    }
+    const uint32_t head = g_head.load(std::memory_order_relaxed);
+    if (head - g_tail.load(std::memory_order_acquire) >= kSize)
+        return; // full: the log thread is behind
+    g_ring[head % kSize] = Record{ std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(), draws, g_liteGpuMs, g_liteGpuFrames };
+    g_head.store(head + 1, std::memory_order_release);
+}
+}
+
+bool RendererMainViewNow() { return WidePass(); }
+void RendererSetStereoEye(float clipX) { g_stereoClipX = clipX; }
+void RendererSetStereoReplay(bool on) { g_stereoReplay = on; }
+
+bool TripleMode()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_TRIPLE");
+        return v && *v && strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+void RendererSetTripleView(const float* view, bool side)
+{
+    for (int i = 0; i < 5; i++)
+        g_tripleView[i] = view ? view[i] : 0.0f;
+    g_tripleSide = side;
+}
+
+// A pass's front buffer, graded as the presenter grades, into screen `slot` of the triple-wide picture (COPY_SOURCE
+// between frames). The swap shows that picture once the last screen is in.
+void RendererTripleCapture(int slot, uint32_t frontBuffer)
+{
+    if (!g_r.ok || slot < 0 || slot > 2)
+        return;
+    auto it = g_r.resolved.find(frontBuffer);
+    if (it == g_r.resolved.end() || it->second.width != FrameW() || it->second.height != FrameH() || it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM)
+        return;
+    ID3D12Resource* image = it->second.resource.Get();
+    const D3D12_RESOURCE_DESC d = image->GetDesc();
+    const UINT w = UINT(d.Width), h = d.Height;
+    BeginFrameIfNeeded();
+    auto make = [&](ComPtr<ID3D12Resource>& t, UINT tw, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state, const char* name) {
+        if (t && t->GetDesc().Width == tw && t->GetDesc().Height == h)
+            return true;
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = tw;
+        td.Height = h;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Flags = flags;
+        RetireTexture(std::move(t));
+        t = CreateTexture(td, state, name);
+        return bool(t);
+    };
+    if (!make(g_tripleImage, w * 3, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_SOURCE, "triple screen") ||
+        !make(g_tripleScreen[slot], w, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, "triple screen part"))
+        return;
+    // Graded into the screen's own image (COMMON), or the front buffer as it is where grading is off.
+    ID3D12Resource* src = GradeFrontBuffer(image, it->second.guestFormat == 7, nullptr, g_tripleScreen[slot].Get()) ? g_tripleScreen[slot].Get() : image;
+    const D3D12_RESOURCE_STATES srcState = src == image ? (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+                                                        : D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RESOURCE_BARRIER b[2]{};
+    for (auto& x : b)
+        x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition.pResource = src;
+    b[0].Transition.StateBefore = srcState;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.pResource = g_tripleImage.Get();
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    C().list->ResourceBarrier(2, b);
+    D3D12_TEXTURE_COPY_LOCATION dst{ g_tripleImage.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, from{ src, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    dst.SubresourceIndex = from.SubresourceIndex = 0;
+    C().list->CopyTextureRegion(&dst, UINT(slot) * w, 0, 0, &from, nullptr);
+    for (auto& x : b)
+        std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    C().list->ResourceBarrier(2, b);
+    g_drawState.Invalidate();
+    if (slot == 2)
+        g_tripleReady = true;
+}
+
+void RendererStereoCaptureEye(int eye, uint32_t frontBuffer)
+{
+    if (!g_r.ok)
+        return;
+    auto it = g_r.resolved.find(frontBuffer);
+    if (it == g_r.resolved.end() || it->second.width != FrameW() || it->second.height != FrameH() || it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM)
+        return;
+    ID3D12Resource* image = it->second.resource.Get();
+    const D3D12_RESOURCE_DESC d = image->GetDesc();
+    ID3D12Resource* target = regpu::xr::StereoTarget(eye, uint32_t(d.Width), d.Height);
+    if (!target)
+        return;
+    BeginFrameIfNeeded();
+    // The presenter's grading (the display's gamma table), so both eyes look as the desktop picture does.
+    if (GradeFrontBuffer(image, it->second.guestFormat == 7, nullptr, target))
+        return;
+    D3D12_RESOURCE_BARRIER b[2]{};
+    for (auto& x : b)
+        x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition.pResource = image;
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.pResource = target;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    C().list->ResourceBarrier(2, b);
+    D3D12_TEXTURE_COPY_LOCATION dst{ target, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, src{ image, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    dst.SubresourceIndex = src.SubresourceIndex = 0;
+    C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    for (auto& x : b)
+        std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    C().list->ResourceBarrier(2, b);
+}
+
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer);
 void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
 {
@@ -11415,6 +17538,63 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
     const auto now = std::chrono::steady_clock::now();
     g_perf.swapSeconds += std::chrono::duration<double>(now - t0).count();
     g_perf.frames++;
+    if (PerfLiteOn() || LongFramesEnabled())
+        PerfLite::Push(now, g_perf.draws + g_perfDrawsLogged);
+    if (LongFramesEnabled())
+    {
+        // A frame over twice the recent average (and 1 ms over it): logged with what this frame did. The average is
+        // an exponential one over ~32 frames.
+        static auto last = now;
+        static double avg = 0, gpuWaitBefore = 0, fenceBefore = 0, replayBefore = 0, avgCpu = 0;
+        static uint64_t cyclesBefore = 0, tsc0 = 0;
+        static auto time0 = now;
+        t_countFenceWaits = true;
+        // The thread's CPU time: QueryThreadCycleTime counts TSC ticks while it runs; the TSC rate is learnt from the
+        // wall clock since the first frame.
+        ULONG64 cycles = 0;
+        QueryThreadCycleTime(GetCurrentThread(), &cycles);
+        const uint64_t tsc = __rdtsc();
+        if (!tsc0)
+            tsc0 = tsc;
+        const double wallMs = std::chrono::duration<double, std::milli>(now - time0).count();
+        const double ticksPerMs = wallMs > 100.0 ? double(tsc - tsc0) / wallMs : 0.0;
+        const double cpuMs = ticksPerMs > 0 && cyclesBefore ? double(cycles - cyclesBefore) / ticksPerMs : 0.0;
+        const double fenceNow = g_fenceWaitMs, replayNow = g_r.recorder.m_drainWaitMs;
+        static uint64_t drawsBefore = 0, frames = 0;
+        const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+        last = now;
+        const uint64_t drawsNow = g_perf.draws + g_perfDrawsLogged;
+        const double gpuWaitNow = g_gpuWaitSeconds * 1000.0;
+        const double gpuWaitMs = gpuWaitNow >= gpuWaitBefore ? gpuWaitNow - gpuWaitBefore : gpuWaitNow; // (the full perf log resets it)
+        const bool isLong = frames > 60 && avg > 0 && ms > avg * 2.0 && ms > avg + 1.0;
+        if (isLong)
+        {
+            PerfLite::LongRecord r{};
+            r.frame = frameNumber;
+            r.ms = float(ms), r.avgMs = float(avg), r.idleMs = float(g_drawIdleMs), r.gpuWaitMs = float(gpuWaitMs);
+            r.buildWaitMs = float(g_frameEvents.waitMs), r.texMs = float(g_frameEvents.texMs);
+            r.swapMs = float(std::chrono::duration<double, std::milli>(now - t0).count());
+            r.draws = uint32_t(drawsNow - drawsBefore), r.buildWaits = g_frameEvents.waits, r.pipelines = g_frameEvents.pipelines;
+            r.created = g_frameEvents.created, r.texNew = g_frameEvents.texNew, r.texChanged = g_frameEvents.texChanged;
+            r.texBytes = g_frameEvents.texBytes;
+            r.texCreateMs = float(g_frameEvents.texCreateMs), r.texMaxMs = float(g_frameEvents.texMaxMs);
+            memcpy(r.texMax, g_frameEvents.texMax, sizeof(r.texMax));
+            r.fenceMs = float(fenceNow - fenceBefore), r.replayMs = float(replayNow - replayBefore);
+            r.cpuMs = float(cpuMs), r.avgCpuMs = float(avgCpu);
+            PerfLite::PushLong(r);
+            if (auto callback = g_longFrameCallback.load(std::memory_order_relaxed))
+                callback(frameNumber, ms, cpuMs);
+        }
+        // Every frame feeds the average, a long one capped at 3x it: a new steady level (a menu to a race) is
+        // learnt in ~30 frames, a single 200 ms hitch moves it by a few percent. (The first interval is from start-up.)
+        if (frames > 0)
+            avg = avg > 0 ? avg + (std::min(ms, avg * 3.0) - avg) / 32.0 : ms;
+        if (frames > 0 && cpuMs > 0)
+            avgCpu = avgCpu > 0 ? avgCpu + (std::min(cpuMs, avgCpu * 3.0) - avgCpu) / 32.0 : cpuMs;
+        frames++;
+        drawsBefore = drawsNow, gpuWaitBefore = gpuWaitNow, fenceBefore = fenceNow, replayBefore = replayNow, cyclesBefore = cycles;
+        g_drawIdleMs = 0;
+    }
     static LiveSwitch perf("REGPU_PERF");
     static auto lastSwap = now;
     static double frameDraw = 0, lastDrawTotal = 0;
@@ -11544,6 +17724,7 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         g_pipelineLibrary.MaybeSave();
         g_created.clear();
         g_gpuWaitSeconds = 0;
+        g_perfDrawsLogged += g_perf.draws;
         g_perf = Perf{};
     }
 }
@@ -11573,14 +17754,15 @@ void BuildSeedPipelines()
         p = end ? end + 1 : p + line.size();
         PipelineKey key{};
         unsigned long long vs, ps;
-        if (sscanf(line.c_str(), "P %llx %llx %x %x %x %x %x %x", &vs, &ps, &key.blend, &key.depth, &key.stencilMaskMode, &key.flags,
-                   &key.biasScale, &key.biasOffset) < 6)
+        if (sscanf(line.c_str(), "P %llx %llx %x %x %x %x %x %x %x", &vs, &ps, &key.blend, &key.depth, &key.stencilMaskMode, &key.flags,
+                   &key.biasScale, &key.biasOffset, &key.fetchMask) < 6)
             continue;
         key.vs = vs;
         key.ps = ps;
         key.biasOffset = RoundedBias(key.biasOffset);
         if (!seen.insert(PipelineKeyHash{}(key)).second)
             continue;
+        g_seedKeys.insert(key);
         listed++;
         if (g_manifest.known.count(key) || g_r.pipelines.count(key))
         {
@@ -11601,6 +17783,16 @@ void BuildSeedPipelines()
         todo.size(), missing, missingShaders.size());
     if (todo.empty())
         return;
+    // Flag 0x400 pipelines use the pixel shader's alpha-test-free variant (ManifestPixelShader), as the warm-up
+    // and the draws do: queue every variant's compile first so they build in parallel (before, the seed built
+    // these with the base shader: the right picture, without the variant's speed).
+    size_t variantsQueued = 0;
+    for (const auto& [key, shaders] : todo)
+        if ((key.flags & 0x400) && shaders.second->IsReady())
+            if (const CompiledShader* k = NoKillVariantOf(*shaders.second); k && k->state.load() == CompiledShader::Pending)
+                variantsQueued++;
+    if (variantsQueued)
+        Log("seed pipelines: %zu alpha-test-free pixel shader variants to compile", variantsQueued);
     std::vector<std::shared_ptr<PipelineEntry>> building;
     std::vector<uint8_t> frame;
     size_t next = 0, failed = 0;
@@ -11612,9 +17804,26 @@ void BuildSeedPipelines()
                building.size() - size_t(std::count_if(building.begin(), building.end(), [](const auto& e) { return e->state.load() != 0; })) < 32)
         {
             const auto& [key, shaders] = todo[next++];
-            const auto [vs, ps] = shaders;
-            while (vs->state.load() == CompiledShader::Pending || ps->state.load() == CompiledShader::Pending)
-                Sleep(1);
+            const CompiledShader* vs = shaders.first;
+            const CompiledShader* ps = shaders.second;
+            // A shader still compiling (one the static wait left behind): build when the game needs it.
+            if (vs->state.load() == CompiledShader::Pending || ps->state.load() == CompiledShader::Pending)
+            {
+                g_seedLater.push_back(key);
+                continue;
+            }
+            if ((key.flags & 0x400 || key.fetchMask) && ps->IsReady())
+            {
+                // (Flag 0x400 and a fetch mask: the alpha-test-free variant first, then its fetch variant.)
+                const CompiledShader* base = ps;
+                while ((ps = ManifestPixelShader(key, *base)) && ps->state.load() == CompiledShader::Pending)
+                    Sleep(1);
+                if (!ps)
+                {
+                    failed++;
+                    continue;
+                }
+            }
             if (vs->IsReady() && ps->IsReady())
                 building.push_back(EnsurePipeline(*vs, *ps, key));
             else
@@ -11709,6 +17918,18 @@ void PrecompileAll()
             }
             // A shader not stored (a static one from Host::staticShaders, installed after this): skip the
             // pipeline. Waiting for it, as before, waited for good (FH1 on the FX: a black screen).
+            // Flag 0x400: the pixel shader's alpha-test-free variant (made from the ready base; its compile, if the
+            // shader cache doesn't have it, is waited for like any other). Can't be made: the pipeline is skipped.
+            if (vs && ps && ps->IsReady() && (key.flags & 0x400 || key.fetchMask))
+            {
+                ps = ManifestPixelShader(key, *ps);
+                if (!ps)
+                {
+                    nextKey++;
+                    g_stats.warmDone++;
+                    continue;
+                }
+            }
             if (vs && ps && (vs->state.load() == CompiledShader::Pending || ps->state.load() == CompiledShader::Pending))
                 break; // wait for this one to finish compiling before going on
             if (vs && ps && vs->state.load() == CompiledShader::Ready && ps->state.load() == CompiledShader::Ready)
@@ -11836,6 +18057,12 @@ void PrecompileAll()
     g_stats.staticDone = 0;
     const auto compileStart = std::chrono::steady_clock::now();
     auto lastShown = std::chrono::steady_clock::time_point{}, lastScan = std::chrono::steady_clock::now();
+    // A single shader can take far longer than the rest (FM3: one vertex shader, never drawn in play, 37 s of a
+    // 55 s first boot). Once only a few are left and they have run for 5 s, the boot goes on and they finish in
+    // the background; a draw that needs one waits for it as usual. REGPU_STATIC_WAIT_ALL=1 waits for every one.
+    static const bool waitAll = getenv("REGPU_STATIC_WAIT_ALL") != nullptr;
+    auto fewSince = std::chrono::steady_clock::time_point{};
+    size_t leftBehind = 0;
     for (size_t next = 0;;)
     {
         while (next < compiling.size() && compiling[next]->state.load() != CompiledShader::Pending)
@@ -11843,6 +18070,24 @@ void PrecompileAll()
         if (next == compiling.size())
             break;
         const auto now = std::chrono::steady_clock::now();
+        if (!waitAll && compiling.size() > 8)
+        {
+            const size_t pending = size_t(std::count_if(compiling.begin() + next, compiling.end(),
+                [](const CompiledShader* cs) { return cs->state.load() == CompiledShader::Pending; }));
+            if (pending > 3)
+                fewSince = {};
+            else if (fewSince == std::chrono::steady_clock::time_point{})
+                fewSince = now;
+            else if (now - fewSince > std::chrono::seconds(5))
+            {
+                leftBehind = pending;
+                for (size_t i = next; i < compiling.size(); i++)
+                    if (compiling[i]->state.load() == CompiledShader::Pending)
+                        Log("static shaders: not waiting for %s %016llx (still compiling, finishes in the background)",
+                            compiling[i]->pixel ? "ps" : "vs", (unsigned long long)compiling[i]->hash);
+                break;
+            }
+        }
         // The game keeps running meanwhile and builds the shaders it makes at runtime (the
         // title's among them): compile those in the same wait.
         if (now - lastScan > std::chrono::milliseconds(1500))
@@ -11871,11 +18116,13 @@ void PrecompileAll()
     g_hold.active = false;
     g_stats.staticTotal = 0;
     g_lastLongHold = std::chrono::steady_clock::now();
-    Log("static shaders: %zu compiled in %.1f s (%zu found in memory meanwhile)", compiling.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - compileStart).count(), compiling.size() - size_t(toCompile));
+    Log("static shaders: %zu compiled in %.1f s (%zu found in memory meanwhile, %zu left to finish in the background)", compiling.size() - leftBehind,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - compileStart).count(), compiling.size() - size_t(toCompile), leftBehind);
 }
 
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
 {
+    LogSurfaceUse();
     if (regpu::GetHost().onSwap)
         regpu::GetHost().onSwap(g_r.frame);
     if (!g_r.ok)
@@ -11903,6 +18150,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     {
         UpscaleResolved(frontBuffer);
         g_sceneScale = 1.0f;
+        BumpPassEpoch();
         g_scenePhase = false;
         g_upscale.retryFrame = g_r.frame + 120;
         g_upscale.reset = true; // the next scene has no usable history
@@ -11912,13 +18160,30 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     ID3D12Resource* image = C().color.Get();
     D3D12_RESOURCE_STATES imageState = D3D12_RESOURCE_STATE_COPY_SOURCE;
     auto it = g_r.resolved.find(frontBuffer);
-    const bool fromResolve = it != g_r.resolved.end() && it->second.width == kWidth && it->second.height == kHeight &&
-        it->second.format == DXGI_FORMAT_R8G8B8A8_UNORM;
+    // The console's display scaler takes a front buffer of any size up to the output (PGR3's races resolve a 1024x600
+    // front buffer; its menus are 1280x720). Only the exact output size was accepted before, so a smaller front buffer
+    // was never presented and the window kept the last menu frame. A smaller one is shown at its own size, centred
+    // (the presenter's letterbox path); not yet scaled up. REGPU_FRONT_BUFFER_EXACT=1 (live): only 1280x720, as before.
+    static LiveSwitch frontExact("REGPU_FRONT_BUFFER_EXACT");
+    const bool frontFound = it != g_r.resolved.end() && it->second.format == DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (frontFound)
+        NoteFrontBuffer(it->second.width, it->second.height);
+    const bool frontFullSize = frontFound && it->second.width == FrameW() && it->second.height == FrameH();
+    const bool fromResolve = frontFound && (frontFullSize || (!frontExact && it->second.width <= kWidth && it->second.height <= kHeight));
     ID3D12Resource* graded = nullptr; // the front buffer through the display's gamma table
+    GradeJob* gradeJob = nullptr;     // ... graded straight into the back buffer at the frame end
     if (fromResolve)
     {
         image = it->second.resource.Get();
-        graded = GradeFrontBuffer(image, it->second.guestFormat == 7);
+        static LiveSwitch gammaCopy("REGPU_GAMMA_COPY");
+        GradeJob& job = g_gradeJobs[g_r.frameIndex];
+        job.valid = false;
+        // (Supersampling grades into a texture first: the downsample reads it.)
+        // (A smaller front buffer is graded into its own image: grading straight into the back buffer needs equal sizes.)
+        graded = GradeFrontBuffer(image, it->second.guestFormat == 7,
+            gammaCopy || GetSettings().enhance || GetSettings().ssaa > 1.0f || TripleMode() || !frontFullSize ? nullptr : &job);
+        if (job.valid)
+            gradeJob = &job;
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.pResource = image;
@@ -11932,14 +18197,52 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     if (fromResolve)
         g_hold.image = it->second.resource;
     ID3D12Resource* overlay = fromResolve ? PrepareOverlay() : nullptr;
+    ID3D12Resource* timer = fromResolve ? PrepareTimer() : nullptr;
+    ID3D12Resource* fps = fromResolve ? PrepareFps() : nullptr;
     ID3D12Resource* shown = graded ? graded : image;
+    // Triple screen: the three screens' graded pictures side by side (RendererTripleCapture), in COPY_SOURCE.
+    const bool tripleShown = fromResolve && g_tripleReady && g_tripleImage;
+    g_tripleReady = false;
     if (fromResolve)
         if (ID3D12Resource* enhanced = EnhanceFrontBuffer(shown))
             shown = enhanced;
+    // Supersampling (Config::ssaa, session 36): the supersized frame filtered down to the shown size.
+    if (fromResolve)
+        shown = SsaaDownsample(shown);
+    if (tripleShown)
+        shown = g_tripleImage.Get();
     if (fromResolve)
         if (ID3D12Resource* view = ViewFrontBuffer(shown))
             shown = view;
-    const bool presenting = fromResolve && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH);
+    // REGPU_ASYNC_PRESENT=1 (live; FM3 port, PERF-PLAN L12): the frame's end (back-buffer copy, close, submit, Present,
+    // fence) runs on the replay thread when it reaches this point, and the draw thread goes on with the next frame. It
+    // otherwise waited for the replay here (Real) and then in the driver's Present (frame-queue throttling): ~10% of
+    // its time on FM3's CPU-bound grid. Each frame end is one or the other; the next frame start follows its own read.
+    static LiveSwitch asyncPresentSwitch("REGPU_ASYNC_PRESENT");
+    const bool asyncPresent = asyncPresentSwitch;
+    struct AsyncEnd
+    {
+        bool copy = false;
+        ID3D12Resource *shown = nullptr, *overlay = nullptr, *timer = nullptr;
+        UINT64 fence = 0;
+        ID3D12Resource* fps = nullptr;
+        GradeJob* grade = nullptr;
+        uint32_t vrTag = 0; // the frame's VR pose tag (ScanVrTag)
+    };
+    static AsyncEnd asyncEnds[kFrames];
+    AsyncEnd& asyncEnd = asyncEnds[g_r.frameIndex];
+    bool presenting = false;
+    const uint32_t vrTag = g_frameVrTag | regpu::xr::TakeFrameFlags(); // (the frame's own: carried to its copy)
+    g_frameVrTag = 0;
+    g_frameVrScans = 0;
+    if (asyncPresent)
+        asyncEnd = { fromResolve, shown, overlay, timer, 0, fps, gradeJob, vrTag };
+    else
+    {
+        regpu::xr::SetCaptureTag(vrTag);
+        presenting = fromResolve && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH, timer, kTimerW, kTimerH, fps, kFpsW, kFpsH,
+            gradeJob ? GradeIntoBackBuffer : nullptr, gradeJob);
+    }
     {
         const uint64_t traceFrame = TraceFrame();
         if (traceFrame && g_r.frame + 1 == traceFrame)
@@ -11999,6 +18302,13 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     const bool shot = fromResolve && DebugShotPending(shotPath);
     if (shot)
         dumpFrame = g_r.frame;
+    bool midDumps = false;
+    {
+        std::lock_guard lock(g_midDumpLock);
+        midDumps = !g_midDumps.empty();
+    }
+    if (midDumps && fromResolve)
+        dumpFrame = g_r.frame;
     // REGPU_DUMP_AT=<seconds>: dump the first resolved frame after that long (comparable
     // screenshots whatever the frame rate).
     {
@@ -12018,16 +18328,44 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         D3D12_TEXTURE_COPY_LOCATION dst{};
         dst.pResource = g_r.readback.Get();
         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, OutputWidth(), OutputHeight(), 1, (OutputWidth() * 4 + 255) & ~255u };
         D3D12_TEXTURE_COPY_LOCATION src{};
-        src.pResource = shown;
+        src.pResource = gradeJob ? GradeIntoTexture(gradeJob) : shown; // (graded only into the back buffer otherwise)
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        // (Triple screen: the shown picture is three screens wide; a frame drawn once is one.)
+        g_dumpWidth = UINT(std::min<UINT64>(src.pResource->GetDesc().Width, DumpWidth()));
+        // (A smaller front buffer: copied at its own height; a box past its bottom made the copy invalid and the shot
+        // read an unmapped buffer.)
+        g_dumpHeight = UINT(std::min<UINT64>(src.pResource->GetDesc().Height, OutputHeight()));
+        dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, g_dumpWidth, g_dumpHeight, 1, (g_dumpWidth * 4 + 255) & ~255u };
+        const D3D12_BOX box{ 0, 0, 0, g_dumpWidth, g_dumpHeight, 1 };
+        C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
     }
     // REGPU_DUMP_RESOLVES=1 (with REGPU_DUMP_FRAME): also write every resolved texture to out/res.
     static std::vector<ResolveDump> resolveDumps;
     resolveDumps.clear();
-    if (dump && (getenv("REGPU_DUMP_RESOLVES") || (g_hotkeyFrame.load() && g_r.frame == dumpFrame)))
+    if (dump)
+    {
+        std::lock_guard lock(g_midDumpLock);
+        for (ResolveDump& d : g_midDumps)
+            resolveDumps.push_back(std::move(d));
+        g_midDumps.clear();
+    }
+    // (Only the captured frame itself: g_hotkeyFrame keeps its value after a capture, and every later debug-server
+    // shot, which sets dumpFrame to its frame, wrote all resolves too: ~30 s per shot with thousands of them.)
+    // REGPU_DUMP_RESOLVES_AT=<hex base>[,<hex base>...] (live, e.g. the debug server's env): the next dumped frame (a
+    // debug-server shot) also writes those resolved images, spares included, to out/res. Images stay between the
+    // passes that build them, so an editor's preview passes can be read while it sits idle.
+    std::vector<uint32_t> dumpOnly;
+    if (const char* at = getenv("REGPU_DUMP_RESOLVES_AT"); dump && at && *at)
+        for (const char* p = at; *p;)
+        {
+            dumpOnly.push_back(uint32_t(strtoul(p, nullptr, 16)) & 0x1FFFFFFF);
+            const char* comma = strchr(p, ',');
+            if (!comma)
+                break;
+            p = comma + 1;
+        }
+    if (dump && (getenv("REGPU_DUMP_RESOLVES") || !dumpOnly.empty() || (g_hotkeyFrame.load() && g_r.frame == dumpFrame && dumpFrame == g_hotkeyFrame.load())))
     {
         auto add = [&](uint32_t base, ResolvedTexture& r, int variant) {
             if (!r.resource)
@@ -12061,6 +18399,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         };
         for (auto& [base, r] : g_r.resolved)
         {
+            if (!dumpOnly.empty() && std::find(dumpOnly.begin(), dumpOnly.end(), base) == dumpOnly.end())
+                continue;
             add(base, r, 0);
             int v = 1;
             for (ResolvedTexture& spare : r.spares)
@@ -12086,6 +18426,9 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     }
 
     FlushIndexCopies(); // this frame's index uploads into the arena, after its draws
+    FlushVertexCopies(); // and the vertex arena's
+    DrawCull::EndFrame(); // this frame's culling counts into next frame's predicates
+    HyperCull::EndFrame(); // and Hyper culling's counts into its readback
     if (g_gpuPasses && g_passQueries && !g_passMarks[UINT(&Frame() - g_r.frames)].empty())
     {
         const UINT frameIndex = UINT(&Frame() - g_r.frames);
@@ -12093,6 +18436,12 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         const UINT n = UINT(g_passMarks[frameIndex].size());
         C().list->ResolveQueryData(g_passQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * kPassMarks, n, g_passReadback.Get(),
             UINT64(frameIndex) * kPassMarks * 8);
+    }
+    if (g_gpuStats && g_statQueries && !g_statDraws[UINT(&Frame() - g_r.frames)].empty())
+    {
+        const UINT frameIndex = UINT(&Frame() - g_r.frames);
+        C().list->ResolveQueryData(g_statQueries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, frameIndex * kStatDraws,
+            UINT(g_statDraws[frameIndex].size()), g_statReadback.Get(), UINT64(frameIndex) * kStatDraws * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
     }
     if (g_timestamps)
     {
@@ -12105,14 +18454,43 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     // ended after) made Close fail and removed the device. Its end then answers fully visible.
     if (g_occlusionOpen)
         EndOcclusionQuery();
-    C().list->Close();
-    ID3D12CommandList* lists[] = { C().list->Real() };
-    SubmitLists(1, lists);
-    if (presenting)
-        PresenterPresent();
-    Frame().fence = g_r.nextFence++;
-    g_r.queue->Signal(g_r.fence.Get(), Frame().fence);
-    overwrite::EndFrame(g_r.frameIndex, Frame().fence, g_r.frame);
+    else if (g_occlusionPaused)
+        g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent);
+    g_occlusionPaused = false;
+    if (asyncPresent)
+    {
+        // (The fence value is taken here, in order with the draw thread's other signals, which all wait for the replay
+        // first: Real.) The next frame starts in a pool list (BeginFrameIfNeeded): this one is closed over there.
+        Frame().fence = g_r.nextFence++;
+        asyncEnd.fence = Frame().fence;
+        overwrite::EndFrame(g_r.frameIndex, Frame().fence, g_r.frame);
+        C().list->Call(
+            [](ID3D12GraphicsCommandList* l, void* ctx) {
+                const AsyncEnd& e = *static_cast<const AsyncEnd*>(ctx);
+                regpu::xr::SetCaptureTag(e.vrTag);
+                const bool show = e.copy && PresenterRecordCopy(l, e.shown, e.overlay, kOverlayW, kOverlayH, e.timer, kTimerW, kTimerH, e.fps, kFpsW, kFpsH,
+                    e.grade ? GradeIntoBackBuffer : nullptr, e.grade);
+                l->Close();
+                ID3D12CommandList* lists[] = { l };
+                SubmitLists(1, lists);
+                if (show)
+                    PresenterPresent();
+                g_r.queue->Signal(g_r.fence.Get(), e.fence);
+            },
+            &asyncEnd);
+        g_asyncFrameEnded = true;
+    }
+    else
+    {
+        C().list->Close();
+        ID3D12CommandList* lists[] = { C().list->Real() };
+        SubmitLists(1, lists);
+        if (presenting)
+            PresenterPresent();
+        Frame().fence = g_r.nextFence++;
+        g_r.queue->Signal(g_r.fence.Get(), Frame().fence);
+        overwrite::EndFrame(g_r.frameIndex, Frame().fence, g_r.frame);
+    }
     g_r.listOpen = false;
 
     if (dump)
@@ -12175,13 +18553,20 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         }
         resolveDumps.clear();
         uint8_t* data = nullptr;
-        g_r.readback->Map(0, nullptr, reinterpret_cast<void**>(&data));
+        if (FAILED(g_r.readback->Map(0, nullptr, reinterpret_cast<void**>(&data))) || !data)
+        {
+            Log("dump: the readback buffer could not be mapped; no shot this frame");
+            data = nullptr;
+        }
         // Written at the render size; the region probes below work on a 1280x720 copy.
-        const uint32_t dw = OutputWidth(), dh = OutputHeight(), dpitch = (dw * 4 + 255) & ~255u;
+        const uint32_t dw = g_dumpWidth ? g_dumpWidth : OutputWidth(), dh = g_dumpHeight ? g_dumpHeight : OutputHeight(), dpitch = (dw * 4 + 255) & ~255u;
         std::vector<uint8_t> full(size_t(dw) * dh * 4);
-        for (uint32_t y = 0; y < dh; y++)
-            memcpy(&full[size_t(y) * dw * 4], data + size_t(y) * dpitch, size_t(dw) * 4);
-        g_r.readback->Unmap(0, nullptr);
+        if (data)
+        {
+            for (uint32_t y = 0; y < dh; y++)
+                memcpy(&full[size_t(y) * dw * 4], data + size_t(y) * dpitch, size_t(dw) * 4);
+            g_r.readback->Unmap(0, nullptr);
+        }
         for (size_t i = 3; i < full.size(); i += 4)
             full[i] = 255;
         std::vector<uint8_t> rgba(size_t(kWidth) * kHeight * 4);
@@ -12265,6 +18650,19 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     if (frameNumber % 600 == 0)
         Log("renderer: frame %llu: %u draws, %u skipped, %zu shaders, %zu pipelines, %zu textures", (unsigned long long)frameNumber,
             g_r.drawsThisFrame.load(), g_r.skippedThisFrame.load(), g_r.shaders.size(), g_r.pipelines.size(), g_r.textures.size());
+    if (frameNumber % 600 == 0)
+    {
+        static uint32_t loggedDrawn = 0;
+        uint32_t drawn, unseeded, unprepared;
+        {
+            std::lock_guard lock(g_shaderMutex);
+            drawn = g_drawnPipelines, unseeded = g_drawnUnseeded, unprepared = g_drawnUnprepared;
+        }
+        if (drawn != loggedDrawn)
+            Log("seed coverage: %u pipelines drawn, %u not in the seed (%.1f%%), %u built while drawing", drawn, unseeded,
+                drawn ? 100.0 * unseeded / drawn : 0.0, unprepared);
+        loggedDrawn = drawn;
+    }
     g_lastFrameDraws.store(g_r.drawsThisFrame.load(), std::memory_order_relaxed);
     g_r.drawsThisFrame = g_r.skippedThisFrame = 0;
     g_r.frameIndex = (g_r.frameIndex + 1) % kFrames;
@@ -12323,6 +18721,7 @@ uint64_t RendererEditPixelShader(uint64_t hash, const std::string& expr)
         g_psEditAlias[hash] = alias;
         g_psEditExpr[alias] = expr;
         g_psEditEver.insert(alias);
+        g_psEditAny.store(true, std::memory_order_release);
     }
     g_psEdits = !g_psEditAlias.empty();
     return alias;

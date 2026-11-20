@@ -24,14 +24,23 @@ struct Config
     bool enhance = false;                // enhanced lighting post pass (experimental)
     uint32_t msaa = 1;                   // samples per pixel: 1 (off), 2, 4 or 8
     // Upscaling: the 3D scene renders smaller and is upscaled before post-processing and the
-    // HUD, which stay at full resolution. Fsr3, Fsr4 and Dlss need REGPU_FSR3 / REGPU_DLSS builds.
-    // Fsr4: the FidelityFX ML upscaler where the GPU lists it, and only with REGPU_FSR4=1 (it hung some
-    // RDNA 2/3 devices in the FM4 port); FSR 3 otherwise. The temporal ones (Fsr3, Fsr4, Dlss) run only on
-    // frames with a 3D scene of their own, and need MSAA off: with one chosen the scene draws at 1x.
-    enum class Upscaler : uint32_t { Off, Fsr1, Fsr3, Dlss, Fsr4 };
+    // HUD, which stay at full resolution. Fsr3, Fsr4 and Dlss need REGPU_FSR3 / REGPU_DLSS builds. The temporal ones
+    // (Fsr3, Fsr4, Dlss) run only on frames with a 3D scene of their own, and need MSAA off: with one chosen the scene
+    // draws at 1x. Fsr4: FSR 4 where the GPU offers it (RDNA 4), else FSR 3. Xess: Intel XeSS (libxess.dll beside the
+    // exe), else FSR 1.
+    enum class Upscaler : uint32_t { Off, Fsr1, Fsr3, Dlss, Fsr4, Xess };
     Upscaler upscaler = Upscaler::Off;
     uint32_t quality = 1;   // 0 native (anti-aliasing only), 1 quality, 2 balanced, 3 performance, 4 ultra performance
     float sharpness = 0.5f; // 0-1
+    // Anti-aliasing filters (FM3 port, session 36). postAA: a filter on the finished 3D scene, before the title's own
+    // post-processing and HUD (FXAA, SMAA, CMAA 2: need a REGPU_AA_DIR build; TAA: the motion vectors and jitter of the
+    // temporal upscalers, so not together with DLSS or FSR 3). ssaa: the game renders at this multiple of the shown size
+    // and each frame is filtered down at the present (1 = off; 1.5 and 2 sensible). eqaa: AMD's enhanced quality AA
+    // (more coverage than colour samples) where the driver offers it as an MSAA quality level.
+    enum class PostAA : uint32_t { Off, Fxaa, Smaa, Cmaa2, Taa };
+    PostAA postAA = PostAA::Off;
+    float ssaa = 1.0f;
+    bool eqaa = false;
     std::filesystem::path userDir = "."; // shader and pipeline caches, dumps, regpu.log, regpu-bad-pipelines.txt
     std::wstring windowTitle = L"ReGPU";
     // A window the host already owns (an HWND): ReGPU presents into it instead of opening its own.
@@ -50,6 +59,8 @@ struct Config
     // The size the game renders at: the resolution, narrowed or shortened to the forced aspect
     // ratio (the rest of the screen is black bars).
     void RenderSize(uint32_t& w, uint32_t& h) const;
+    // The size the frame is shown at: RenderSize without supersampling.
+    void ShownSize(uint32_t& w, uint32_t& h) const;
 };
 
 // A shader found in the game's files or memory: its microcode as in guest memory (big endian).
@@ -57,6 +68,7 @@ struct ScannedShader
 {
     bool pixel;
     std::vector<uint32_t> code;
+    uint32_t address = 0; // guest address of the microcode (0: not from guest memory)
 };
 
 // A resolve (an EDRAM copy to memory), as offered to Host::resolveWriteback.
@@ -142,6 +154,13 @@ struct Host
     void (*logThreadStacks)(const char* why) = nullptr;
     std::string (*currentStack)(int maxFrames) = nullptr;
     void (*slowFrame)(double ms) = nullptr;
+    // Optional: write tracking of guest physical memory, for the vertex arena (REGPU_VERTEX_ARENA). watchArm makes the
+    // pages of [offset, offset + bytes) (physical offsets) report their next write, false if they can't be watched;
+    // watchClean: no page of the range written since it was armed, nor since sequence `since`; watchSeq: the current
+    // write sequence number. Without them the arena hashes each buffer once a frame.
+    bool (*watchArm)(uint32_t offset, uint32_t bytes) = nullptr;
+    bool (*watchClean)(uint32_t offset, uint32_t bytes, uint64_t since) = nullptr;
+    uint64_t (*watchSeq)() = nullptr;
 };
 
 Config& GetConfig();
@@ -201,4 +220,50 @@ void SetFrameLimit(uint32_t maxFps, bool vsync);
 // that many samples at most (2-16) for every wrapping linear fetch. Applies to the 2D pixel fetches of
 // REGPU_LEAN_FETCH (its sampler table); others keep their samplers.
 void SetAnisotropy(int maxAnisotropy);
+
+// VR (REGPU_VR, a build with OpenXR; src/render/xr.cpp). The host poses its camera with the headset and tells ReGPU
+// which pose each game frame was rendered with; frames without one go on the virtual screen.
+namespace vr
+{
+struct HeadPose
+{
+    float orientation[4] = { 0, 0, 0, 1 }; // x, y, z, w (OpenXR: right-handed, y up, -z forward)
+    float position[3] = {};                 // metres from where the runtime was recentred
+    float fovLeft = 0, fovRight = 0, fovUp = 0, fovDown = 0; // the headset's eye field of view (radians, left eye)
+};
+// The head's pose predicted for the next headset frame. false: no running headset session.
+bool GetHeadPose(HeadPose& out);
+// Once per game frame: whether the newest game frame's 3D view is head-tracked (pose or nullptr) and its vertical field
+// of view (radians, the whole angle). Decides stereo and the HUD panel; the pose a presented frame was drawn with comes
+// from SubmitTaggedPose.
+void SubmitFramePose(const HeadPose* pose, float renderFovY);
+// Exact pairing of poses with frames (FM3 port, session 39): a title whose logic runs more often than it draws (or on
+// another thread than the one that draws) can't pair poses with frames by counting. The host puts `tag` (1-65535) into
+// a vertex shader constant of the main view as the float bits 0x00C00000 | tag (a denormal: e.g. a view matrix's
+// unused m03, which changes nothing drawn) and hands the pose here; the draw thread reads the newest tag of each frame's
+// main view and the headset gets that frame with that pose.
+constexpr uint32_t kPoseTagBits = 0x00C00000u;
+void SubmitTaggedPose(uint32_t tag, const HeadPose& pose, float renderFovY);
+// The head's present place and heading become the origin (straight ahead, level): poses, the virtual screen and the
+// HUD panel follow. F8 in the game window does the same.
+void Recentre();
+} // namespace vr
+
+// Triple screen (REGPU_TRIPLE=1, FM3 port session 39): one simulation, three screens. The main view (the frame from
+// its first full-width draw to the swap) is drawn three times, once per screen, side by side in a window three screens
+// wide (the resolution is the three together). The title's camera must draw with a frustum wide enough for all three
+// (its culling); each screen's pass maps that frustum's clip position (x, y, z, w) to the screen's own projection:
+//   x' = a x + b w,  w' = c x + d w,  y' = e y,  z' = z + (w' - w)
+// (a turn about the eye and an off-axis projection onto the screen's plane; depth exact for z = w + B). The host works
+// these out from its screens' layout (sizes, distance, bezels, gaps, angles) in the camera's own clip convention.
+// views: 0 left, 1 centre, 2 right. Once per game frame while a 3D view is drawn; without a recent call a frame is
+// drawn once, in the middle.
+namespace triple
+{
+struct View
+{
+    float a = 0, b = 0, c = 0, d = 1, e = 0;
+};
+void SubmitViews(const View (&views)[3]);
+} // namespace triple
 } // namespace regpu

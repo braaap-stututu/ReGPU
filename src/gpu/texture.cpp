@@ -5,7 +5,12 @@
 #include "gpu/texture.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <thread>
 
 #include "gpu/regs.h"
 #include "live_switch.h"
@@ -18,6 +23,7 @@ enum Format : uint32_t
     k_1_5_5_5 = 3,
     k_5_6_5 = 4,
     k_8_8_8_8 = 6,
+    k_2_10_10_10 = 7, // X in bits 0-9, Y 10-19, Z 20-29, W 30-31 of the (swapped) word
     k_8_8 = 10,
     k_4_4_4_4 = 15,
     k_DXT1 = 18,
@@ -46,6 +52,16 @@ bool Info(uint32_t format, FormatInfo& out)
     case k_16:
     case k_4_4_4_4: out = { 1, 1 }; return true;
     case k_8_8_8_8: out = { 1, 2 }; return true;
+    // Unsupported, it decoded to nothing: a cube map of it came out black (FM3's showroom reflection cube, so chrome
+    // was black and paint lost its shine). REGPU_NO_2_10_10_10=1: unsupported again (A/B, for textures decoded after).
+    case k_2_10_10_10:
+    {
+        static LiveSwitch off("REGPU_NO_2_10_10_10");
+        if (off)
+            return false;
+        out = { 1, 2 };
+        return true;
+    }
     case k_DXT1: out = { 4, 3 }; return true;
     case k_DXT2_3:
     case k_DXT4_5: out = { 4, 4 }; return true;
@@ -270,6 +286,16 @@ void DecodeTexel(uint32_t format, const uint8_t* t, uint8_t* out)
         out[3] = uint8_t(((c >> 12) & 15) * 17);
         break;
     }
+    case k_2_10_10_10:
+    {
+        // Like k_8_8_8_8, X comes first (the low bits); the fetch swizzle is applied afterwards. 8 bits kept of the 10;
+        // the fetch's exponent adjust is applied in the shader.
+        const uint32_t c = uint32_t(t[0]) | uint32_t(t[1]) << 8 | uint32_t(t[2]) << 16 | uint32_t(t[3]) << 24;
+        for (int i = 0; i < 3; i++)
+            out[i] = uint8_t((((c >> (i * 10)) & 1023) * 255 + 511) / 1023);
+        out[3] = uint8_t((c >> 30) * 85);
+        break;
+    }
     case k_8_8_8_8:
         // The channels in memory order after the swap (R G B A). The title's fetch constants for
         // these textures carry the BGRA swizzle (applied below), so what it samples is B G R A of
@@ -324,6 +350,7 @@ const char* TextureFormatName(uint32_t format)
     case k_1_5_5_5: return "1555";
     case k_5_6_5: return "565";
     case k_8_8_8_8: return "8888";
+    case k_2_10_10_10: return "2101010";
     case k_8_8: return "88";
     case k_16: return "16";
     case k_4_4_4_4: return "4444";
@@ -379,6 +406,83 @@ void PackedMipOffset(const TextureFetch& fetch, uint32_t blockSize, uint32_t& xB
         xBlocks = 16 / blockSize;
 }
 
+// Texture rows on helper threads (session 33 of the FM3 port): untiling and decoding ran on the draw thread at
+// 1-2 GB/s, a 1-5 ms frame whenever a track streamed in a few MB of textures. A texture of 256 KB or more is split
+// into bands of block rows taken by REGPU_TEXTURE_THREADS helpers (default 3, 0 = all on the calling thread; read at
+// start) and the caller. Each row is written by exactly one thread, as before: the result is identical.
+// REGPU_NO_TEXTURE_THREADS=1 (live): on the caller only (A/B).
+namespace TextureRows
+{
+std::mutex g_busy; // one texture at a time (a second caller does its own rows)
+std::mutex g_mutex;
+std::condition_variable g_wake, g_done;
+const std::function<void(uint32_t, uint32_t)>* g_job = nullptr;
+uint32_t g_rows = 0, g_band = 0, g_working = 0;
+uint64_t g_generation = 0;
+std::atomic<uint32_t> g_next{ 0 };
+
+void Take(const std::function<void(uint32_t, uint32_t)>& job, uint32_t rows, uint32_t band)
+{
+    for (uint32_t from; (from = g_next.fetch_add(band)) < rows;)
+        job(from, std::min(rows, from + band));
+}
+
+uint32_t Threads()
+{
+    static const uint32_t n = [] {
+        const char* e = getenv("REGPU_TEXTURE_THREADS");
+        const uint32_t v = e ? uint32_t(atoi(e)) : 3u;
+        const uint32_t cores = std::max(1u, std::thread::hardware_concurrency());
+        const uint32_t threads = std::min(v, cores > 2 ? cores - 2 : 0u);
+        for (uint32_t i = 0; i < threads; i++)
+            std::thread([] {
+                uint64_t seen = 0;
+                for (;;)
+                {
+                    const std::function<void(uint32_t, uint32_t)>* job;
+                    uint32_t rows, band;
+                    {
+                        std::unique_lock lock(g_mutex);
+                        g_wake.wait(lock, [&] { return g_generation != seen; });
+                        seen = g_generation;
+                        job = g_job, rows = g_rows, band = g_band;
+                    }
+                    Take(*job, rows, band);
+                    std::lock_guard lock(g_mutex);
+                    if (--g_working == 0)
+                        g_done.notify_one();
+                }
+            }).detach();
+        return threads;
+    }();
+    return n;
+}
+
+// Calls job(from, to) over [0, rows) block rows; on helpers too when the texture is big enough.
+void For(uint32_t rows, size_t bytes, const std::function<void(uint32_t, uint32_t)>& job)
+{
+    static LiveSwitch off("REGPU_NO_TEXTURE_THREADS");
+    const uint32_t threads = Threads();
+    std::unique_lock busy(g_busy, std::try_to_lock);
+    if (off || !threads || bytes < (256u << 10) || rows < 16 || !busy.owns_lock())
+    {
+        job(0, rows);
+        return;
+    }
+    const uint32_t band = std::max(4u, rows / ((threads + 1) * 4));
+    {
+        std::lock_guard lock(g_mutex);
+        g_job = &job, g_rows = rows, g_band = band, g_working = threads;
+        g_next.store(0);
+        g_generation++;
+    }
+    g_wake.notify_all();
+    Take(job, rows, band);
+    std::unique_lock lock(g_mutex);
+    g_done.wait(lock, [] { return g_working == 0; });
+}
+} // namespace TextureRows
+
 bool DecodeTexture(const TextureFetch& fetch, const uint8_t* source, std::vector<uint8_t>& rgba)
 {
     FormatInfo info;
@@ -398,9 +502,10 @@ bool DecodeTexture(const TextureFetch& fetch, const uint8_t* source, std::vector
     uint32_t packX, packY;
     PackedMipOffset(fetch, info.blockSize, packX, packY);
     rgba.assign(size_t(width) * height * 4, 0);
+    TextureRows::For(blocksY, rgba.size(), [&](uint32_t byFrom, uint32_t byTo) {
     uint8_t block[32];
     uint8_t texels[16][4];
-    for (uint32_t by = 0; by < blocksY; by++)
+    for (uint32_t by = byFrom; by < byTo; by++)
     {
         const int32_t rowOffset = fetch.Tiled() ? TiledOffset2DOuter(by + packY, pitchBlocks, info.log2Bytes) : 0;
         for (uint32_t bx = 0; bx < blocksX; bx++)
@@ -426,6 +531,7 @@ bool DecodeTexture(const TextureFetch& fetch, const uint8_t* source, std::vector
                 DecodeTexel(fetch.Format(), block, &rgba[(size_t(by) * width + bx) * 4]);
         }
     }
+    });
 
     // Swizzle: per output channel, 0-3 select X/Y/Z/W, 4 = 0, 5 = 1.
     const uint32_t swizzle = fetch.Swizzle();
@@ -561,7 +667,8 @@ bool CopyTextureBlocks(const TextureFetch& fetch, uint8_t* dst, uint32_t dstRowP
         pitchBlocks = (pitchBlocks + 31) & ~31u;
     uint32_t packX, packY;
     PackedMipOffset(fetch, bs, packX, packY);
-    for (uint32_t by = 0; by < blocksY; by++)
+    TextureRows::For(blocksY, size_t(blocksY) * blocksX * blockBytes, [&](uint32_t byFrom, uint32_t byTo) {
+    for (uint32_t by = byFrom; by < byTo; by++)
     {
         uint8_t* row = dst + size_t(by) * dstRowPitch;
         const int32_t rowOffset = fetch.Tiled() ? TiledOffset2DOuter(by + packY, pitchBlocks, info.log2Bytes) : 0;
@@ -576,6 +683,7 @@ bool CopyTextureBlocks(const TextureFetch& fetch, uint8_t* dst, uint32_t dstRowP
             memcpy(row + size_t(bx) * blockBytes, block, blockBytes);
         }
     }
+    });
     return true;
 }
 
