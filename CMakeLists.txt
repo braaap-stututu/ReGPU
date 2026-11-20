@@ -49,19 +49,12 @@ if(NOT REGPU_FSR1_CS AND NOT EXISTS "${REGPU_FFX}/upscalers/fsr3/include/gpu/fsr
 endif()
 
 file(GLOB_RECURSE REGPU_SOURCES CONFIGURE_DEPENDS src/*.cpp)
-# The Vulkan backend (src/gpu/vk, from the FM2 port's experimental renderer; REGPU_RENDERER=vulkan at run time). Vulkan
-# itself is loaded at run time (gpu/vk/vk_loader.h), so only the headers are needed. The shaders go to SPIR-V through
-# dxcompiler.dll (DirectXShaderCompiler, with dxil.dll), which the port ships beside its executable.
-option(REGPU_VULKAN "Build the Vulkan renderer backend (experimental)" OFF)
-set(REGPU_VULKAN_HEADERS "" CACHE PATH "Vulkan headers (the folder containing vulkan/vulkan.h); empty: find_package(Vulkan)")
-if(REGPU_VULKAN)
-    if(NOT REGPU_VULKAN_HEADERS)
-        find_package(Vulkan REQUIRED)
-        set(REGPU_VULKAN_HEADERS "${Vulkan_INCLUDE_DIR}")
-    endif()
-else()
-    list(FILTER REGPU_SOURCES EXCLUDE REGEX "src/gpu/vk/")
-endif()
+# Vulkan (branch `vulkan`: becoming ReGPU's one render backend, docs/vulkan-conversion-plan.md). Always built. Vulkan
+# itself is loaded at run time through volk (thirdparty/volk), so only headers are needed: the vendored
+# thirdparty/Vulkan-Headers unless REGPU_VULKAN_HEADERS names others. Memory: VMA (thirdparty/vma). The shaders go to
+# SPIR-V through dxcompiler.dll (DirectXShaderCompiler, with dxil.dll), which the port ships beside its executable.
+set(REGPU_VULKAN ON)
+set(REGPU_VULKAN_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/Vulkan-Headers/include" CACHE PATH "Vulkan headers (the folder containing vulkan/vulkan.h)")
 if(NOT REGPU_FSR3)
     list(REMOVE_ITEM REGPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/fsr3.cpp")
 endif()
@@ -122,8 +115,9 @@ endif()
 
 add_library(regpu STATIC ${REGPU_SOURCES})
 if(REGPU_VULKAN)
-    target_include_directories(regpu PRIVATE "${REGPU_VULKAN_HEADERS}")
+    target_include_directories(regpu PRIVATE "${REGPU_VULKAN_HEADERS}" thirdparty/volk thirdparty/vma)
     target_compile_definitions(regpu PUBLIC REGPU_VULKAN=1)
+    target_compile_definitions(regpu PRIVATE VK_NO_PROTOTYPES $<$<BOOL:${WIN32}>:VK_USE_PLATFORM_WIN32_KHR>)
 endif()
 target_include_directories(regpu PUBLIC include ${REGPU_GUEST_INCLUDES})
 target_compile_definitions(regpu PUBLIC ${REGPU_GUEST_DEFINES})
@@ -183,5 +177,6 @@ target_link_libraries(regpu_dis PRIVATE regpu d3dcompiler)
 if(REGPU_VULKAN)
     add_executable(regpu_vkprobe EXCLUDE_FROM_ALL tests/vkprobe.cpp)
     target_link_libraries(regpu_vkprobe PRIVATE regpu)
-    target_include_directories(regpu_vkprobe PRIVATE src "${REGPU_VULKAN_HEADERS}")
+    target_include_directories(regpu_vkprobe PRIVATE src "${REGPU_VULKAN_HEADERS}" thirdparty/volk)
+    target_compile_definitions(regpu_vkprobe PRIVATE VK_NO_PROTOTYPES)
 endif()
