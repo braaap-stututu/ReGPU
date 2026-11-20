@@ -54,3 +54,9 @@ bool BakedVertexFetch();
 const char* HlslPreamble();
 // REGPU_LEAN_FETCH=1: lean 2D pixel fetches through a sampler table (root parameter 4, space1).
 bool LeanFetch();
+// REGPU_LEAN_FETCH=2: also the plain-texture fast path (tinfo.x bit 7, set by the renderer).
+int LeanFetchLevel();
+// REGPU_LEAN_VFETCH=1: vertex fetches load only the dwords their format holds.
+bool LeanVertexFetch();
+// REGPU_PLAIN_MUL_PS=1: pixel shaders multiply as IEEE (vertex shaders keep D3D9's 0 x anything = 0).
+bool PlainMulPixel();

@@ -21,7 +21,7 @@
 
 // REGPU_PERF: calls recorded, by op (RecordedList::Op), and resource barriers in them (counted only then:
 // an atomic increment per recorded call was ~1% of the command processor).
-inline std::atomic<uint64_t> g_recordedOps[32];
+inline std::atomic<uint64_t> g_recordedOps[40];
 inline std::atomic<uint64_t> g_recordedBarriers{ 0 };
 inline const bool g_countRecorded = getenv("REGPU_PERF") != nullptr;
 
@@ -105,6 +105,9 @@ public:
         Put(kComputeRoot32, &a, sizeof(a), data, n * 4);
     }
     void Dispatch(UINT x, UINT y, UINT z) { UINT a[3] = { x, y, z }; Put(kDispatch, a, sizeof(a)); }
+    void SetComputeRootShaderResourceView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS v) { struct A { UINT i; D3D12_GPU_VIRTUAL_ADDRESS v; } a{ i, v }; Put(kComputeSrv, &a, sizeof(a)); }
+    void SetComputeRootUnorderedAccessView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS v) { struct A { UINT i; D3D12_GPU_VIRTUAL_ADDRESS v; } a{ i, v }; Put(kComputeUav, &a, sizeof(a)); }
+    void SetPredication(ID3D12Resource* r, UINT64 offset, D3D12_PREDICATION_OP op) { struct A { ID3D12Resource* r; UINT64 offset; D3D12_PREDICATION_OP op; } a{ r, offset, op }; Put(kPredication, &a, sizeof(a)); }
     void SetGraphicsRootDescriptorTable(UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) { struct A { UINT i; D3D12_GPU_DESCRIPTOR_HANDLE h; } a{ i, h }; Put(kTable, &a, sizeof(a)); }
     void SetGraphicsRootConstantBufferView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS v) { struct A { UINT i; D3D12_GPU_VIRTUAL_ADDRESS v; } a{ i, v }; Put(kCbv, &a, sizeof(a)); }
     void SetGraphicsRoot32BitConstants(UINT i, UINT n, const void* data, UINT offset)
@@ -173,7 +176,7 @@ private:
     {
         kBarrier, kCopyTexture, kRootSignature, kTable, kCbv, kRoot32, kTargets, kPipeline, kViewports, kScissors, kStencilRef, kBlendFactor,
         kTopology, kHeaps, kDraw, kEndQuery, kResolveQuery, kClearRtv, kClearDsv, kCreateRtv, kCreateDsv, kDrawIndexed, kIndexBuffer, kCopyBuffer,
-        kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch, kBeginQuery, kHandOff
+        kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch, kBeginQuery, kHandOff, kComputeSrv, kComputeUav, kPredication
     };
     static constexpr size_t kChunk = 64 << 10;
 
@@ -329,6 +332,24 @@ private:
                 h.fn(h.next ? l : nullptr, h.ctx);
                 if (h.next)
                     l = m_real = h.next;
+                break;
+            }
+            case kComputeSrv:
+            {
+                struct A { UINT i; D3D12_GPU_VIRTUAL_ADDRESS v; };
+                l->SetComputeRootShaderResourceView(At<A>(a).i, At<A>(a).v);
+                break;
+            }
+            case kComputeUav:
+            {
+                struct A { UINT i; D3D12_GPU_VIRTUAL_ADDRESS v; };
+                l->SetComputeRootUnorderedAccessView(At<A>(a).i, At<A>(a).v);
+                break;
+            }
+            case kPredication:
+            {
+                struct A { ID3D12Resource* r; UINT64 offset; D3D12_PREDICATION_OP op; };
+                l->SetPredication(At<A>(a).r, At<A>(a).offset, At<A>(a).op);
                 break;
             }
             case kBeginQuery:
