@@ -210,4 +210,22 @@ void SetFrameLimit(uint32_t maxFps, bool vsync);
 // that many samples at most (2-16) for every wrapping linear fetch. Applies to the 2D pixel fetches of
 // REGPU_LEAN_FETCH (its sampler table); others keep their samplers.
 void SetAnisotropy(int maxAnisotropy);
+
+// VR (REGPU_VR, a build with OpenXR; src/render/xr.cpp). The host poses its camera with the headset and tells ReGPU
+// which pose each game frame was rendered with; frames without one go on the virtual screen.
+namespace vr
+{
+struct HeadPose
+{
+    float orientation[4] = { 0, 0, 0, 1 }; // x, y, z, w (OpenXR: right-handed, y up, -z forward)
+    float position[3] = {};                 // metres from where the runtime was recentred
+    float fovLeft = 0, fovRight = 0, fovUp = 0, fovDown = 0; // the headset's eye field of view (radians, left eye)
+};
+// The head's pose predicted for the next headset frame. false: no running headset session.
+bool GetHeadPose(HeadPose& out);
+// Once per game frame, in frame order: the head pose the frame's 3D view was rendered with and the vertical field of
+// view it used (radians, the whole angle), or nullptr for a frame shown on the virtual screen. Paired with the
+// presented frames in order.
+void SubmitFramePose(const HeadPose* pose, float renderFovY);
+} // namespace vr
 } // namespace regpu
