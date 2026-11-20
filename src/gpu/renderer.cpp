@@ -16,6 +16,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -1073,7 +1074,22 @@ struct FrameEvents
     uint32_t texNew = 0, texChanged = 0;
     uint64_t texBytes = 0;
     double texMs = 0;
+    double texCreateMs = 0;     // of texMs: creating texture resources (CreateTexture, cube resources)
+    double texMaxMs = 0;        // the slowest upload, described in texMax
+    char texMax[64] = {};
 } g_frameEvents;
+// One texture upload for the long-frame log: counted, and kept as the frame's slowest if it is.
+void NoteTextureUpload(bool isNew, size_t bytes, double ms, const char* what, uint32_t w, uint32_t h, uint32_t mips)
+{
+    (isNew ? g_frameEvents.texNew : g_frameEvents.texChanged)++;
+    g_frameEvents.texBytes += bytes;
+    g_frameEvents.texMs += ms;
+    if (ms > g_frameEvents.texMaxMs)
+    {
+        g_frameEvents.texMaxMs = ms;
+        snprintf(g_frameEvents.texMax, sizeof(g_frameEvents.texMax), "%s %ux%u %u mips %s", what, w, h, mips, isNew ? "new" : "changed");
+    }
+}
 // The long-frame log (REGPU_LONG_FRAMES, session 33 of the FM3 port): every frame that takes over twice the recent
 // average is logged with what the renderer did in it (see PerfLite). On with the light performance log
 // (REGPU_PERF_LITE) unless REGPU_LONG_FRAMES=0; REGPU_LONG_FRAMES=1 turns it on alone. Start-time.
@@ -1116,11 +1132,25 @@ struct TexturePool
     std::unordered_map<uint64_t, std::vector<Block>> free; // by size
     std::unordered_map<ID3D12Resource*, Block> live;
     std::deque<std::pair<uint64_t, Block>> retired; // frame retired, block
+    // The next heap, made on another thread once the current one is three-quarters used: making a 128 MB heap on
+    // the draw thread cost a few ms mid-race (session 33 of the FM3 port). REGPU_NO_HEAP_AHEAD=1 (live): made when
+    // needed, as before.
+    std::future<ComPtr<ID3D12Heap>> ahead;
 } g_texturePool;
 
 // A texture in the pool (or committed, if it does not fit a heap). Starts in `state`.
+bool LongFramesEnabled();
 ComPtr<ID3D12Resource> CreateTexture(const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state, const char* kind)
 {
+    struct CreateTime // (for the long-frame log)
+    {
+        std::chrono::steady_clock::time_point start = LongFramesEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~CreateTime()
+        {
+            if (start != std::chrono::steady_clock::time_point{})
+                g_frameEvents.texCreateMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        }
+    } createTime;
     static LiveSwitch committed("REGPU_COMMITTED_TEXTURES"); // A/B
     TexturePool& pool = g_texturePool;
     const D3D12_RESOURCE_ALLOCATION_INFO info = g_r.device->GetResourceAllocationInfo(0, 1, &desc);
@@ -1137,8 +1167,7 @@ ComPtr<ID3D12Resource> CreateTexture(const D3D12_RESOURCE_DESC& desc, D3D12_RESO
         }
         else
         {
-            if (pool.used + size > TexturePool::kHeapBytes)
-            {
+            auto makeHeap = [] {
                 D3D12_HEAP_DESC hd{};
                 hd.SizeInBytes = TexturePool::kHeapBytes;
                 hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1146,12 +1175,22 @@ ComPtr<ID3D12Resource> CreateTexture(const D3D12_RESOURCE_DESC& desc, D3D12_RESO
                 hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
                 ComPtr<ID3D12Heap> heap;
                 Check(g_r.device->CreateHeap(&hd, IID_PPV_ARGS(&heap)), "CreateHeap(textures)");
+                return heap;
+            };
+            if (pool.used + size > TexturePool::kHeapBytes)
+            {
+                ComPtr<ID3D12Heap> heap = pool.ahead.valid() ? pool.ahead.get() : nullptr;
+                if (!heap)
+                    heap = makeHeap();
                 CountCreate("texture heap");
                 pool.heaps.push_back(heap);
                 pool.used = 0;
             }
             block = { pool.heaps.back().Get(), pool.used, size };
             pool.used += size;
+            static LiveSwitch noAhead("REGPU_NO_HEAP_AHEAD");
+            if (!noAhead && !pool.ahead.valid() && pool.used > TexturePool::kHeapBytes / 4 * 3)
+                pool.ahead = std::async(std::launch::async, makeHeap);
         }
         if (SUCCEEDED(g_r.device->CreatePlacedResource(block.heap, block.offset, &desc, state, nullptr, IID_PPV_ARGS(&r))))
         {
@@ -5680,6 +5719,23 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
         return cached.resource.Get();
     }
     cached.checkedFrame = g_r.frame;
+    // (Long-frame log: a cube read from memory and decoded, or a cube resource created, counts as an upload.)
+    struct CubeLog
+    {
+        std::chrono::steady_clock::time_point start = LongFramesEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        bool counted = false, isNew = false;
+        size_t bytes = 0;
+        uint32_t format = 0, size = 0, mips = 1;
+        ~CubeLog()
+        {
+            if (!counted || start == std::chrono::steady_clock::time_point{})
+                return;
+            char what[32];
+            snprintf(what, sizeof(what), "cube %s", TextureFormatName(format));
+            NoteTextureUpload(isNew, bytes, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), what, size, size, mips);
+        }
+    } cubeLog;
+    cubeLog.format = fetch.Format(), cubeLog.size = w, cubeLog.isNew = !cached.resource;
 
     // Faces the title resolved into?
     const ResolvedTexture* faces[6]{};
@@ -5745,12 +5801,26 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
         td.MipLevels = mips;
         td.SampleDesc.Count = 1;
         td.Format = want;
-        if (cached.resource)
-            Frame().garbage.push_back(std::move(cached.resource));
-        Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
-                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                  IID_PPV_ARGS(&cached.resource)),
-            "CreateCommittedResource(cube)"); CountCreate("cube");
+        cubeLog.counted = true;
+        // Placed in the texture pool's heaps, as 2D textures are (session 33 of the FM3 port): a committed resource cost
+        // the draw thread ~1.2 ms per new cube as a track streamed in its reflection cubes. REGPU_COMMITTED_CUBES=1
+        // (live): committed, as before.
+        static LiveSwitch committedCubes("REGPU_COMMITTED_CUBES");
+        RetireTexture(std::move(cached.resource));
+        if (!committedCubes)
+            cached.resource = CreateTexture(td, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "cube");
+        else
+        {
+            struct AddCreate
+            {
+                std::chrono::steady_clock::time_point s = std::chrono::steady_clock::now();
+                ~AddCreate() { g_frameEvents.texCreateMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s).count(); }
+            } addCreate;
+            Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                      IID_PPV_ARGS(&cached.resource)),
+                "CreateCommittedResource(cube)"); CountCreate("cube");
+        }
         cached.width = cw;
         cached.height = ch;
         cached.format = want;
@@ -5831,6 +5901,7 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             hash ^= ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(levelBase[1])), size_t(levelBase[mips - 1] - levelBase[1]) + size_t(levelStride[mips - 1]) * 6) * 31;
         if (cached.contentHash == hash)
             return cached.resource.Get();
+        cubeLog.counted = true, cubeLog.bytes = size_t(stride) * 6, cubeLog.mips = mips;
         const UINT rowPitch = (w * 4 + 255) & ~255u;
         const UINT64 faceBytes = (UINT64(rowPitch) * h + 511) & ~511ull;
         const UINT64 offset = RingAlloc(faceBytes * 6 * 2, 512, RingTexture); // all levels fit in twice level 0
@@ -6218,21 +6289,22 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         const TextureFetch& fetch;
         bool isNew;
         size_t bytes;
+        const UINT16& mips;
         ~UploadLog()
         {
             if (!g_perfTiming && !LongFramesEnabled())
                 return;
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-            (isNew ? g_frameEvents.texNew : g_frameEvents.texChanged)++;
-            g_frameEvents.texBytes += bytes;
-            g_frameEvents.texMs += ms;
+            NoteTextureUpload(isNew, bytes, ms, TextureFormatName(fetch.Format()), fetch.Width(), fetch.Height(), mips);
             if (!g_perfTiming)
                 return;
             if (ms > 2.0)
                 Log("perf: texture %08X %s %ux%u %s took %.1f ms", fetch.Address(), TextureFormatName(fetch.Format()), fetch.Width(), fetch.Height(),
                     isNew ? "new" : "changed", ms);
         }
-    } uploadLog{ uploadStart, fetch, wasNew, sourceBytes };
+    };
+    UINT16 loggedMips = 1;
+    UploadLog uploadLog{ uploadStart, fetch, wasNew, sourceBytes, loggedMips };
     // The title's own mip levels (distant surfaces sample the smaller, averaged ones: without
     // them the road and grass shimmer and look grainy). Down to the packed tail.
     LiveSwitch &noMips = g_sw_REGPU_NO_MIPS; // A/B
@@ -6245,6 +6317,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         levels.push_back(level);
     }
     const UINT16 mipCount = UINT16(levels.size());
+    loggedMips = mipCount;
     if (bc)
     {
         static const DXGI_FORMAT bcFormats[] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC3_UNORM,
@@ -13162,6 +13235,8 @@ struct LongRecord
     float fenceMs, replayMs, cpuMs, avgCpuMs; // all fence waits, waits for the replay thread, the thread's CPU time
     uint32_t draws, buildWaits, pipelines, created, texNew, texChanged;
     uint64_t texBytes;
+    float texCreateMs, texMaxMs;
+    char texMax[64];
 };
 constexpr uint32_t kLongSize = 256;
 LongRecord g_long[kLongSize];
@@ -13201,10 +13276,13 @@ void LogLong()
             continue;
         }
         lines++;
+        char texDetail[112] = "";
+        if (r.texMaxMs > 0)
+            snprintf(texDetail, sizeof(texDetail), " (create %.2f ms; slowest %s %.2f ms)", r.texCreateMs, r.texMax, r.texMaxMs);
         Log("long frame %llu: %.2f ms (avg %.2f) | %u draws | idle %.2f ms | gpu wait %.2f ms | builds %u waits %.2f ms, %u pipelines, %u created | "
-            "textures %u new %u changed %.0f KB %.2f ms | swap %.2f ms | fences %.2f ms | replay %.2f ms | cpu %.2f ms (avg %.2f)",
+            "textures %u new %u changed %.0f KB %.2f ms%s | swap %.2f ms | fences %.2f ms | replay %.2f ms | cpu %.2f ms (avg %.2f)",
             (unsigned long long)r.frame, r.ms, r.avgMs, r.draws, r.idleMs, r.gpuWaitMs, r.buildWaits, r.buildWaitMs, r.pipelines, r.created,
-            r.texNew, r.texChanged, double(r.texBytes) / 1024.0, r.texMs, r.swapMs, r.fenceMs, r.replayMs, r.cpuMs, r.avgCpuMs);
+            r.texNew, r.texChanged, double(r.texBytes) / 1024.0, r.texMs, texDetail, r.swapMs, r.fenceMs, r.replayMs, r.cpuMs, r.avgCpuMs);
     }
 }
 
@@ -13339,6 +13417,8 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
             r.draws = uint32_t(drawsNow - drawsBefore), r.buildWaits = g_frameEvents.waits, r.pipelines = g_frameEvents.pipelines;
             r.created = g_frameEvents.created, r.texNew = g_frameEvents.texNew, r.texChanged = g_frameEvents.texChanged;
             r.texBytes = g_frameEvents.texBytes;
+            r.texCreateMs = float(g_frameEvents.texCreateMs), r.texMaxMs = float(g_frameEvents.texMaxMs);
+            memcpy(r.texMax, g_frameEvents.texMax, sizeof(r.texMax));
             r.fenceMs = float(fenceNow - fenceBefore), r.replayMs = float(replayNow - replayBefore);
             r.cpuMs = float(cpuMs), r.avgCpuMs = float(avgCpu);
             PerfLite::PushLong(r);
