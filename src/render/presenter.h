@@ -29,7 +29,9 @@ ID3D12CommandQueue* RenderQueue();
 // buffer; returns false when there is no window. Call PresenterPresent()
 // after executing the list.
 // overlay (COPY_SOURCE RGBA8, overlayW x overlayH) is copied over the top-left corner when given.
-bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, ID3D12Resource* overlay = nullptr, uint32_t overlayW = 0, uint32_t overlayH = 0);
+// timer (same kind, timerW x timerH) goes in the very corner, the overlay below it.
+bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, ID3D12Resource* overlay = nullptr, uint32_t overlayW = 0, uint32_t overlayH = 0,
+    ID3D12Resource* timer = nullptr, uint32_t timerW = 0, uint32_t timerH = 0);
 void PresenterPresent();
 // The swap chain to a new output size (host GPU idle; renderer.cpp ApplyOutputSize).
 void PresenterResize(uint32_t width, uint32_t height);
