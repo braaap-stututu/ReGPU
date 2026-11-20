@@ -553,6 +553,7 @@ enum RingKind { RingOther, RingConstants, RingIndexList, RingVertexUpload, RingV
 std::atomic<uint64_t> g_ringKindBytes[kRingKinds], g_ringKindCount[kRingKinds];
 bool g_traceRingKinds = false; // REGPU_TRACE_RING_KINDS, read at each frame start (the counts cost ~2% of the draw thread)
 UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256, RingKind kind = RingOther);
+std::atomic<uint64_t> g_ringGeneration{ 0 }; // counts ring resets (RingAlloc's chunks)
 constexpr UINT kDescriptorsPerFrame = 8192; // per frame: ring + guest memory views, then resolve-blit views
 constexpr UINT kBindless = 1u << 16;      // permanent texture descriptors (0 null 2D, 1 null cube)
 constexpr UINT kBindlessBase = kDescriptorsPerFrame * 3;
@@ -3759,6 +3760,7 @@ void BeginFrameIfNeeded()
         Log("renderer: upload ring grown to %llu MB", (unsigned long long)(want >> 20));
     }
     f.ringUsed = 0;
+    g_ringGeneration.fetch_add(1, std::memory_order_relaxed); // (threads' ring chunks from before are void: RingAlloc)
     f.uploads.clear();
     // Guest memory not mapped at init: try again a few times (see MapGuestMemory).
     if (!g_r.physical && (g_r.frame == 30 || g_r.frame == 120 || g_r.frame == 600 || g_r.frame == 2400) && !getenv("REGPU_NO_MAP_RETRY"))
@@ -3807,6 +3809,46 @@ UINT64 RingAlloc(UINT64 bytes, UINT64 alignment, RingKind kind)
         g_ringKindCount[kind].fetch_add(1, std::memory_order_relaxed);
     }
     FrameResources& f = Frame();
+    // Small allocations come from a 64 KB chunk this thread took from the ring: one locked compare-and-swap per chunk,
+    // not per allocation (two to three a draw). A locked instruction waits for the draw's write-combined ring writes to
+    // drain (PGR3 port, session 4: RingAlloc 4.4% of the draw thread, nearly all on its compare-and-swap). A chunk is
+    // void once the ring is reset (g_ringGeneration) or the frame's resources change. REGPU_NO_RING_CHUNKS=1: every
+    // allocation from the ring as before (live).
+    static LiveSwitch noChunks("REGPU_NO_RING_CHUNKS");
+    constexpr UINT64 kChunk = 64 << 10;
+    struct Chunk
+    {
+        const FrameResources* f = nullptr;
+        uint64_t generation = ~0ull;
+        UINT64 at = 0, end = 0;
+    };
+    thread_local Chunk chunk;
+    if (!noChunks && bytes <= kChunk / 4 && alignment <= 256)
+    {
+        const uint64_t generation = g_ringGeneration.load(std::memory_order_relaxed);
+        if (chunk.f == &f && chunk.generation == generation)
+        {
+            const UINT64 offset = (chunk.at + alignment - 1) & ~(alignment - 1);
+            if (offset + bytes <= chunk.end)
+            {
+                chunk.at = offset + bytes;
+                return offset;
+            }
+        }
+        UINT64 used = f.ringUsed.load(std::memory_order_relaxed), start;
+        for (;;)
+        {
+            start = (used + 255) & ~UINT64(255);
+            if (start + kChunk > f.ringSize || f.ringUsed.compare_exchange_weak(used, start + kChunk, std::memory_order_relaxed))
+                break;
+        }
+        if (start + kChunk <= f.ringSize)
+        {
+            chunk = { &f, generation, start + bytes, start + kChunk };
+            return start; // (256-aligned)
+        }
+        // Full: the allocation itself below (grows the ring, logs).
+    }
     UINT64 used = f.ringUsed.load(std::memory_order_relaxed), offset;
     for (;;)
     {
