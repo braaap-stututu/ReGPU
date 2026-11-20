@@ -95,6 +95,11 @@ std::atomic<uint32_t> g_outputWidth{ 0 }, g_outputHeight{ 0 };
 // scene scale, the tall pass, the native MSAA table): PassScales' memo compares it instead of each input.
 std::atomic<uint32_t> g_passEpoch{ 0 };
 void BumpPassEpoch() { g_passEpoch.fetch_add(1, std::memory_order_relaxed); }
+// The debug shot's width: the shown picture's (three screens in triple mode, else the render width).
+uint32_t OutputWidth();
+uint32_t DumpWidth() { return ::TripleMode() ? OutputWidth() * 3 : OutputWidth(); }
+uint32_t g_dumpWidth = 0; // the last shot's (set where it is copied)
+
 void LoadOutputSize()
 {
     uint32_t w, h;
@@ -425,6 +430,11 @@ bool WidePass() { return (gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF) ==
 // VR stereo (gpu.cpp stereo::): the eye being drawn, as a clip-space x offset (0: none).
 float g_stereoClipX = 0.0f;
 bool g_stereoReplay = false; // the second eye's pass (no write-backs to guest memory)
+// Triple screen (FM3 port, session 39): the pass's view (RendererSetTripleView) and the triple-wide picture.
+float g_tripleAngle = 0.0f, g_tripleK = 0.0f, g_tripleP00 = 0.0f;
+bool g_tripleSide = false;
+bool g_tripleReady = false; // all three screens captured this frame (the swap shows g_tripleImage)
+ComPtr<ID3D12Resource> g_tripleImage, g_tripleScreen[3];
 // REGPU_NO_PASS_SNAPSHOT=1: worked out at every call (A/B, live).
 LiveSwitch g_passNoSnapshot("REGPU_NO_PASS_SNAPSHOT"), g_passFullCheck("REGPU_PASS_SNAPSHOT_FULL_CHECK");
 // Inside DrawImpl: a number for the draw this thread is translating (0 outside one). A draw's surface registers can't
@@ -2413,7 +2423,7 @@ void Init()
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.blitRtvHeap)), "CreateDescriptorHeap(blit rtv)");
     InitDepthBlit();
-    g_r.readback = CreateBuffer(UINT64((OutputWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    g_r.readback = CreateBuffer(UINT64((DumpWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
     kRingSize = (getenv("REGPU_RING_MB") ? std::clamp<UINT64>(UINT64(atoi(getenv("REGPU_RING_MB"))), 16, 2048)
         // (128 MB with the zero-copy mapping, not 64: new vertex buffers are copied for their first 16 frames,
@@ -2499,7 +2509,7 @@ void ApplyOutputSize()
     C().colorBase = C().depthBase = ~0u; // nothing bound: the frame start selects the new surfaces
     C().color.Reset();
     C().depth.Reset();
-    g_r.readback = CreateBuffer(UINT64((OutputWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    g_r.readback = CreateBuffer(UINT64((DumpWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     g_upscale.depth.Reset();
     g_upscale.motion.Reset();
     g_upscale.dlaaOut.Reset();
@@ -3121,7 +3131,7 @@ void BeginFrameIfNeeded()
                 Log("vr: stereo: upscalers and anti-aliasing filters are off");
             return on;
         }();
-        g_scenePhase = !stereo && (upscale || taa || filter) && g_r.frame >= g_upscale.retryFrame && (!(temporalUpscaler || taa) || TemporalInit());
+        g_scenePhase = !stereo && !TripleMode() && (upscale || taa || filter) && g_r.frame >= g_upscale.retryFrame && (!(temporalUpscaler || taa) || TemporalInit());
         g_temporal = g_scenePhase && (temporalUpscaler || taa);
         g_sceneScale = g_scenePhase ? scale : 1.0f;
         BumpPassEpoch();
@@ -12209,7 +12219,7 @@ bool StereoHudDraw()
     }();
     static LiveSwitch inView("REGPU_VR_HUD_IN_VIEW");
     // (Not the resolve that follows: a copy packet runs with the composite's shaders still loaded.)
-    return hudUnder && (g_stereoClipX != 0.0f || regpu::xr::MonoHudPanel()) && C().psHash == hudUnder && WidePass() && !inView && C().color && !RendererIsResolveDraw();
+    return hudUnder && (g_stereoClipX != 0.0f || regpu::xr::MonoHudPanel() || g_tripleSide) && C().psHash == hudUnder && WidePass() && !inView && C().color && !RendererIsResolveDraw();
 }
 
 void StereoCaptureHud()
@@ -13350,6 +13360,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // VR stereo: this eye's clip-space x offset for the main view's perspective geometry (hlsl.cpp; RendererSetStereoEye).
     vc->vdepth[1] = WidePass() ? g_stereoClipX : 0.0f;
     vc->vdepth[2] = vc->vdepth[3] = 0;
+    // Triple screen: the pass's turn (y), k (z, 0 = no turn: outside the main view) and the screen's P00 (w) (hlsl.cpp).
+    if (g_tripleK != 0.0f && WidePass())
+    {
+        vc->vdepth[1] = g_tripleAngle;
+        vc->vdepth[2] = g_tripleK;
+        vc->vdepth[3] = g_tripleP00;
+    }
     // Viewport transform in the vertex shader (see hlsl.cpp).
     vc->vscale[0] = RegFloat(PA_CL_VPORT_XSCALE);
     vc->vscale[1] = RegFloat(PA_CL_VPORT_YSCALE);
@@ -14959,6 +14976,77 @@ bool RendererMainViewNow() { return WidePass(); }
 void RendererSetStereoEye(float clipX) { g_stereoClipX = clipX; }
 void RendererSetStereoReplay(bool on) { g_stereoReplay = on; }
 
+bool TripleMode()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_TRIPLE");
+        return v && *v && strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+void RendererSetTripleView(float angle, float k, float p00, bool side)
+{
+    g_tripleAngle = angle, g_tripleK = k, g_tripleP00 = p00, g_tripleSide = side;
+}
+
+// A pass's front buffer, graded as the presenter grades, into screen `slot` of the triple-wide picture (COPY_SOURCE
+// between frames). The swap shows that picture once the last screen is in.
+void RendererTripleCapture(int slot, uint32_t frontBuffer)
+{
+    if (!g_r.ok || slot < 0 || slot > 2)
+        return;
+    auto it = g_r.resolved.find(frontBuffer);
+    if (it == g_r.resolved.end() || it->second.width != kWidth || it->second.height != kHeight || it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM)
+        return;
+    ID3D12Resource* image = it->second.resource.Get();
+    const D3D12_RESOURCE_DESC d = image->GetDesc();
+    const UINT w = UINT(d.Width), h = d.Height;
+    BeginFrameIfNeeded();
+    auto make = [&](ComPtr<ID3D12Resource>& t, UINT tw, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state, const char* name) {
+        if (t && t->GetDesc().Width == tw && t->GetDesc().Height == h)
+            return true;
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = tw;
+        td.Height = h;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Flags = flags;
+        RetireTexture(std::move(t));
+        t = CreateTexture(td, state, name);
+        return bool(t);
+    };
+    if (!make(g_tripleImage, w * 3, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_SOURCE, "triple screen") ||
+        !make(g_tripleScreen[slot], w, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, "triple screen part"))
+        return;
+    // Graded into the screen's own image (COMMON), or the front buffer as it is where grading is off.
+    ID3D12Resource* src = GradeFrontBuffer(image, it->second.guestFormat == 7, nullptr, g_tripleScreen[slot].Get()) ? g_tripleScreen[slot].Get() : image;
+    const D3D12_RESOURCE_STATES srcState = src == image ? (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+                                                        : D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RESOURCE_BARRIER b[2]{};
+    for (auto& x : b)
+        x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition.pResource = src;
+    b[0].Transition.StateBefore = srcState;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.pResource = g_tripleImage.Get();
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    C().list->ResourceBarrier(2, b);
+    D3D12_TEXTURE_COPY_LOCATION dst{ g_tripleImage.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, from{ src, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    dst.SubresourceIndex = from.SubresourceIndex = 0;
+    C().list->CopyTextureRegion(&dst, UINT(slot) * w, 0, 0, &from, nullptr);
+    for (auto& x : b)
+        std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    C().list->ResourceBarrier(2, b);
+    g_drawState.Invalidate();
+    if (slot == 2)
+        g_tripleReady = true;
+}
+
 void RendererStereoCaptureEye(int eye, uint32_t frontBuffer)
 {
     if (!g_r.ok)
@@ -15620,7 +15708,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         GradeJob& job = g_gradeJobs[g_r.frameIndex];
         job.valid = false;
         // (Supersampling grades into a texture first: the downsample reads it.)
-        graded = GradeFrontBuffer(image, it->second.guestFormat == 7, gammaCopy || GetSettings().enhance || GetSettings().ssaa > 1.0f ? nullptr : &job);
+        graded = GradeFrontBuffer(image, it->second.guestFormat == 7, gammaCopy || GetSettings().enhance || GetSettings().ssaa > 1.0f || TripleMode() ? nullptr : &job);
         if (job.valid)
             gradeJob = &job;
         D3D12_RESOURCE_BARRIER b{};
@@ -15639,12 +15727,17 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     ID3D12Resource* timer = fromResolve ? PrepareTimer() : nullptr;
     ID3D12Resource* fps = fromResolve ? PrepareFps() : nullptr;
     ID3D12Resource* shown = graded ? graded : image;
+    // Triple screen: the three screens' graded pictures side by side (RendererTripleCapture), in COPY_SOURCE.
+    const bool tripleShown = fromResolve && g_tripleReady && g_tripleImage;
+    g_tripleReady = false;
     if (fromResolve)
         if (ID3D12Resource* enhanced = EnhanceFrontBuffer(shown))
             shown = enhanced;
     // Supersampling (Config::ssaa, session 36): the supersized frame filtered down to the shown size.
     if (fromResolve)
         shown = SsaaDownsample(shown);
+    if (tripleShown)
+        shown = g_tripleImage.Get();
     // REGPU_ASYNC_PRESENT=1 (live; FM3 port, PERF-PLAN L12): the frame's end (back-buffer copy, close, submit, Present,
     // fence) runs on the replay thread when it reaches this point, and the draw thread goes on with the next frame. It
     // otherwise waited for the replay here (Real) and then in the driver's Present (frame-queue throttling): ~10% of
@@ -15752,11 +15845,14 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         D3D12_TEXTURE_COPY_LOCATION dst{};
         dst.pResource = g_r.readback.Get();
         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, OutputWidth(), OutputHeight(), 1, (OutputWidth() * 4 + 255) & ~255u };
         D3D12_TEXTURE_COPY_LOCATION src{};
         src.pResource = gradeJob ? GradeIntoTexture(gradeJob) : shown; // (graded only into the back buffer otherwise)
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        // (Triple screen: the shown picture is three screens wide; a frame drawn once is one.)
+        g_dumpWidth = UINT(std::min<UINT64>(src.pResource->GetDesc().Width, DumpWidth()));
+        dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, g_dumpWidth, OutputHeight(), 1, (g_dumpWidth * 4 + 255) & ~255u };
+        const D3D12_BOX box{ 0, 0, 0, g_dumpWidth, OutputHeight(), 1 };
+        C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
     }
     // REGPU_DUMP_RESOLVES=1 (with REGPU_DUMP_FRAME): also write every resolved texture to out/res.
     static std::vector<ResolveDump> resolveDumps;
@@ -15948,7 +16044,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         uint8_t* data = nullptr;
         g_r.readback->Map(0, nullptr, reinterpret_cast<void**>(&data));
         // Written at the render size; the region probes below work on a 1280x720 copy.
-        const uint32_t dw = OutputWidth(), dh = OutputHeight(), dpitch = (dw * 4 + 255) & ~255u;
+        const uint32_t dw = g_dumpWidth ? g_dumpWidth : OutputWidth(), dh = OutputHeight(), dpitch = (dw * 4 + 255) & ~255u;
         std::vector<uint8_t> full(size_t(dw) * dh * 4);
         for (uint32_t y = 0; y < dh; y++)
             memcpy(&full[size_t(y) * dw * 4], data + size_t(y) * dpitch, size_t(dw) * 4);

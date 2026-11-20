@@ -238,4 +238,15 @@ void SubmitTaggedPose(uint32_t tag, const HeadPose& pose, float renderFovY);
 // HUD panel follow. F8 in the game window does the same.
 void Recentre();
 } // namespace vr
+
+// Triple screen (REGPU_TRIPLE=1, FM3 port session 39): one simulation, three screens. The main view (the frame from
+// its first full-width draw to the swap) is drawn three times, each turned about the eye to face its screen, side by
+// side in a window three screens wide (the resolution is the three together). The title's camera must draw with a
+// frustum wide enough for all three (its culling): `gameFovY` is the vertical field of view it was given (radians,
+// 16:9), `screenFovY` each screen's, `angle` the turn between the centre screen's axis and a side screen's. Once per
+// game frame while a 3D view is drawn; without a recent call a frame is drawn once, in the middle.
+namespace triple
+{
+void SubmitFrame(float gameFovY, float screenFovY, float angle);
+} // namespace triple
 } // namespace regpu
