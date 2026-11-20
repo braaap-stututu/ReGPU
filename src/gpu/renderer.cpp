@@ -16518,7 +16518,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // title draws blinking text with MAX and SRC_ALPHA / ONE from an image whose transparent texels
         // are white with alpha 0: without the factor the whole quad came out white. A SRC_ALPHA source
         // factor (SRC_COLOR too for the alpha channel, where it is the source alpha) is applied in the
-        // pixel shader (pinfo.z bits 17 colour, 18 alpha); ONE needs nothing. The alpha is not multiplied
+        // pixel shader (pinfo.z bits 19 colour, 20 alpha); ONE needs nothing. The alpha is not multiplied
         // when a colour operation other than min / max reads the source alpha (its factor would become
         // alpha squared). Other source factors, and every destination factor but ONE, are ignored (logged
         // once; a SRC_ALPHA source is still applied beside them). The motion variant's reactive mask
@@ -16532,9 +16532,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             const bool colorReadsSrcAlpha = !colorMinMax && (readsSrcAlpha(srcFactor) || readsSrcAlpha(dstFactor));
             const bool alphaSrcIsSrcAlpha = srcA == 6 || srcA == 4;
             if (colorMinMax && srcFactor == 6)
-                pc->info[2] |= 1u << 17;
+                pc->info[2] |= 1u << 19;
             if (alphaMinMax && alphaSrcIsSrcAlpha && !colorReadsSrcAlpha)
-                pc->info[2] |= 1u << 18;
+                pc->info[2] |= 1u << 20;
             const bool colorEmulated = !colorMinMax || ((srcFactor == 6 || srcFactor == 1) && dstFactor == 1);
             const bool alphaEmulated = !alphaMinMax || (((alphaSrcIsSrcAlpha && !colorReadsSrcAlpha) || srcA == 1) && dstA == 1);
             static std::atomic<bool> minMaxLogged{ false };
