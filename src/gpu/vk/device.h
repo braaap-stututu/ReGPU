@@ -57,6 +57,10 @@ struct Device
     // VK_EXT_primitive_topology_list_restart: a pipeline made for the triangle-list class may enable primitive restart
     // (the draw then sets the strip topology dynamically). Without it such pipelines drop the restart.
     bool listRestart = false;
+    // VK_KHR_compute_shader_derivatives (or the NV one): FidelityFX's FSR 3/4 compute shaders declare
+    // ComputeDerivativeGroupLinear (their mips are sampled with derivatives in compute).
+    bool computeDerivatives = false;
+    bool mutableDescriptors = false; // VK_EXT_mutable_descriptor_type: XeSS's descriptor sets use it
     bool ngx = false;                  // VK_NVX_binary_import and VK_NVX_image_view_handle (DLSS through NGX)
     bool storageReadWithoutFormat = false; // shaderStorageImageReadWithoutFormat (the post filters read storage images)
     bool occlusionPrecise = false;     // occlusionQueryPrecise (sample counts, not just zero / non-zero)

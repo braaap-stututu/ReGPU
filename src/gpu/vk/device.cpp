@@ -410,6 +410,9 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     d.pushDescriptor = optional(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     d.memoryBudget = optional(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     d.listRestart = optional(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME);
+    const bool derivativesKhr = optional(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+    const bool derivativesNv = !derivativesKhr && optional(VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+    d.mutableDescriptors = optional(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
     // NVIDIA's NGX (DLSS on Vulkan, dlss.cpp) needs these two where the driver has them.
     d.ngx = optional("VK_NVX_binary_import") && optional("VK_NVX_image_view_handle");
 
@@ -421,9 +424,26 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     VkPhysicalDeviceConditionalRenderingFeaturesEXT haveCond{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT };
     VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT haveRestart{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT };
     have.pNext = &have11;
+    VkPhysicalDeviceVulkan13Features have13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
     have11.pNext = &have12;
-    have12.pNext = &haveCond;
+    have12.pNext = &have13;
+    have13.pNext = &haveCond;
     haveCond.pNext = d.listRestart ? &haveRestart : nullptr;
+    // (The KHR and NV feature structures are the same but for their type.)
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR haveDerivatives{ derivativesKhr
+            ? VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR
+            : VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV };
+    if (derivativesKhr || derivativesNv)
+    {
+        haveDerivatives.pNext = haveCond.pNext;
+        haveCond.pNext = &haveDerivatives;
+    }
+    VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT haveMutable{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT };
+    if (d.mutableDescriptors)
+    {
+        haveMutable.pNext = haveCond.pNext;
+        haveCond.pNext = &haveMutable;
+    }
     vkGetPhysicalDeviceFeatures2(d.physical, &have);
     const VkPhysicalDeviceFeatures& h = have.features;
 
@@ -481,10 +501,19 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     w12.separateDepthStencilLayouts = have12.separateDepthStencilLayouts;
     w12.bufferDeviceAddress = have12.bufferDeviceAddress;
     w12.drawIndirectCount = have12.drawIndirectCount;
+    // FSR 4's and XeSS's networks: 8-bit integers and packed integer dot products (FidelityFX and XeSS create their
+    // pipelines on our device).
+    w12.shaderInt8 = have12.shaderInt8;
+    w12.storageBuffer8BitAccess = have12.storageBuffer8BitAccess;
+    w12.uniformAndStorageBuffer8BitAccess = have12.uniformAndStorageBuffer8BitAccess;
     VkPhysicalDeviceVulkan13Features w13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
     w13.dynamicRendering = VK_TRUE;
     w13.synchronization2 = VK_TRUE;
     w13.maintenance4 = VK_TRUE;
+    // FidelityFX's FSR 4 pipelines ask for a subgroup size (VkPipelineShaderStageRequiredSubgroupSizeCreateInfo).
+    w13.subgroupSizeControl = have13.subgroupSizeControl;
+    w13.computeFullSubgroups = have13.computeFullSubgroups;
+    w13.shaderIntegerDotProduct = have13.shaderIntegerDotProduct;
     VkPhysicalDeviceRobustness2FeaturesEXT robust{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT };
     robust.nullDescriptor = VK_TRUE;
     VkPhysicalDeviceConditionalRenderingFeaturesEXT cond{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT };
@@ -506,7 +535,24 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
         tail = &cond.pNext;
     }
     if (d.listRestart)
+    {
         *tail = &listRestart;
+        tail = &listRestart.pNext;
+    }
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{ haveDerivatives.sType };
+    derivatives.computeDerivativeGroupLinear = haveDerivatives.computeDerivativeGroupLinear;
+    derivatives.computeDerivativeGroupQuads = haveDerivatives.computeDerivativeGroupQuads;
+    d.computeDerivatives = (derivativesKhr || derivativesNv) && (derivatives.computeDerivativeGroupLinear || derivatives.computeDerivativeGroupQuads);
+    if (d.computeDerivatives)
+    {
+        *tail = &derivatives;
+        tail = &derivatives.pNext;
+    }
+    VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mutableDescriptors{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT };
+    mutableDescriptors.mutableDescriptorType = haveMutable.mutableDescriptorType;
+    d.mutableDescriptors = d.mutableDescriptors && haveMutable.mutableDescriptorType;
+    if (d.mutableDescriptors)
+        *tail = &mutableDescriptors;
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };

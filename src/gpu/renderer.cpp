@@ -1488,6 +1488,14 @@ void NoteTextureUpload(bool isNew, size_t bytes, double ms, const char* what, ui
 // average is logged with what the renderer did in it (see PerfLite). On with the light performance log
 // (REGPU_PERF_LITE) unless REGPU_LONG_FRAMES=0; REGPU_LONG_FRAMES=1 turns it on alone. Start-time.
 bool PerfLiteOn();
+bool LongFramesEnabled();
+// The frame timestamps (GPU ms a frame) are taken whenever the light performance log writes its lines, which the
+// long-frame log also starts: with that one alone (FM3's default) the lines said "GPU 0.00 ms/frame".
+bool GpuFrameTiming()
+{
+    static const bool on = PerfLiteOn() || LongFramesEnabled();
+    return on;
+}
 bool LongFramesEnabled()
 {
     static const bool on = [] {
@@ -2819,9 +2827,15 @@ vk::Targets SurfaceTargets(uint32_t extraCount = 0, vk::Image* const* extraColor
         t.color[t.colorCount++] = C().vkColor->target;
         t.extent = C().vkColor->Extent();
     }
+    // (The motion targets are output size, the scene surface can be larger (the EDRAM's pitch): the render area is the
+    // smallest, as D3D12 draws with targets of different sizes.)
     for (uint32_t i = 0; i < extraCount; i++)
         if (extraColor[i] && *extraColor[i])
+        {
+            const VkExtent2D e = extraColor[i]->Extent();
+            t.extent = t.colorCount ? VkExtent2D{ std::min(t.extent.width, e.width), std::min(t.extent.height, e.height) } : e;
             t.color[t.colorCount++] = extraColor[i]->target;
+        }
     if (C().vkDepth && *C().vkDepth)
     {
         t.depth = C().vkDepth->target;
@@ -3441,7 +3455,7 @@ void BeginFrameIfNeeded()
         }
     }
     g_passMarks[frameIndex].clear();
-    if ((perf || PerfLiteOn()) && f.timed && g_timestamps)
+    if ((perf || GpuFrameTiming()) && f.timed && g_timestamps)
     {
         // This slot's previous frame has completed (waited for above).
         if (const uint64_t* t = reinterpret_cast<const uint64_t*>(QueryResults(g_timestamps, frameIndex)))
@@ -3476,7 +3490,7 @@ void BeginFrameIfNeeded()
     else
         g_r.vkRecorder.Rebind(AcquireVkList(f, 0)); // (the last frame's buffer was ended and submitted at its end)
     // The timing queries, made at the first frame that wants them; this slot's queries reset for this frame.
-    if ((perf || PerfLiteOn()) && !g_timestamps)
+    if ((perf || GpuFrameTiming()) && !g_timestamps)
         g_timestamps = MakeQueries(VK_QUERY_TYPE_TIMESTAMP, 2, kFrames, 0, 1, true, "frame timestamps");
     if (g_gpuPasses && !g_passQueries)
     {
@@ -3508,7 +3522,13 @@ void BeginFrameIfNeeded()
         static LiveSwitch anyFrame("REGPU_TEMPORAL_ANY_FRAME");
         // Anti-aliasing filters (session 36) need the scene's end too: TAA the temporal path (not with DLSS/FSR 3, which
         // do their own), FXAA/SMAA/CMAA 2 the plain one.
-        const bool taa = st.postAA == Settings::PostAA::Taa && !temporalUpscaler;
+        // TAA uses the same temporal path (motion targets, the scene depth copy), made for a single-sampled scene: with
+        // MSAA its motion draws bound 1x targets beside the multisampled surface and the depth copy read a multisampled
+        // depth as single-sampled (both invalid; the D3D12 renderer did the same). It waits for MSAA off, as the
+        // temporal upscalers do.
+        const bool taa = st.postAA == Settings::PostAA::Taa && !temporalUpscaler && g_msaa == 1;
+        if (st.postAA == Settings::PostAA::Taa && !temporalUpscaler && g_msaa > 1)
+            LOG_ONCE("upscale: TAA needs MSAA off (%ux now): no TAA until the anti-aliasing is set again", g_msaa);
         const bool filter = st.postAA != Settings::PostAA::Off && st.postAA != Settings::PostAA::Taa;
         const bool upscale = st.upscaler != Settings::Upscaler::Off && (temporalUpscaler || scale < 1.0f);
         // VR stereo draws the scene twice from the same commands: the upscalers' and filters' per-frame state (history,
@@ -3528,7 +3548,7 @@ void BeginFrameIfNeeded()
             BeginTemporalFrame();
     }
     PassMark("frame start %u%u", 0, 0);
-    if ((perf || PerfLiteOn()) && g_timestamps)
+    if ((perf || GpuFrameTiming()) && g_timestamps)
         C().vkList->WriteTimestamp(g_timestamps.pool, frameIndex * 2);
     // REGPU_TRACE_RING_KINDS: what fills the upload ring, KB a frame by kind (RingKind), every 120 frames.
     static LiveSwitch traceKinds("REGPU_TRACE_RING_KINDS");
@@ -7385,6 +7405,13 @@ GpuImage* ResolvedMipChain(const TextureFetch& fetch, const ResolvedTexture& lev
     const uint32_t hw = std::max(uint32_t(uint64_t(level0.hostWidth) * w / std::max(level0.width, 1u)), 1u);
     const uint32_t hh = std::max(uint32_t(uint64_t(level0.hostHeight) * h / std::max(level0.height, 1u)), 1u);
 
+    // A host chain smaller than the guest one (a render scale under 1) holds fewer levels: the guest's last ones,
+    // smaller than a host texel, are left out (Vulkan and D3D12 refuse more levels than the size has).
+    const size_t hostLevels = size_t(std::bit_width(std::max(hw, hh)));
+    if (levels.size() > hostLevels)
+        levels.resize(hostLevels);
+    if (levels.size() < 2)
+        return nullptr;
     const UINT count = UINT(levels.size());
     // One per shape too: a base fetched with two sizes or level counts in a frame recreated its chain
     // at each change (PGR4's races: 160 textures created a second).
