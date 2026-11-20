@@ -14398,6 +14398,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         ~PsAlias() { C().psHash = real; C().vsHash = realVs; }
     } psAlias;
     const CompiledShader& vs = GetShader(C().vsHash, C().vsCode, false);
+    // Memory export (eA/eM registers) is not emulated: its writes are dropped. Say so once per shader, so a title that
+    // builds data with it (PGR3 port: a lighting table that stays zero) shows up in the log, not only in a capture.
+    if (vs.info.memExport)
+    {
+        static std::mutex memExportMutex;
+        static std::unordered_set<uint64_t> memExportSeen;
+        std::lock_guard lock(memExportMutex);
+        if (memExportSeen.insert(C().vsHash).second)
+            Log("memexport: vertex shader %016llx drawn (frame %llu): its memory writes are dropped", (unsigned long long)C().vsHash,
+                (unsigned long long)g_r.frame);
+    }
     if (g_drawStats.load(std::memory_order_relaxed) == 2) // the debug server's drawstats: every draw of a frame
     {
         std::lock_guard lock(g_drawStatsMutex);
