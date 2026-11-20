@@ -426,8 +426,10 @@ std::string Handle(const std::string& line)
     // hlsl HASH [path]: the shader's translated HLSL, written to path (default out/hlsl/<hash>.hlsl)
     if (cmd == "hlsl")
     {
+        // (The path is the rest of the line, so it may have spaces.)
         std::string h, path;
-        in >> h >> path;
+        in >> h;
+        std::getline(in >> std::ws, path);
         const std::string src = RendererShaderHlsl(strtoull(h.c_str(), nullptr, 16));
         if (src.empty())
             return Error("no such shader (not drawn yet?)");
