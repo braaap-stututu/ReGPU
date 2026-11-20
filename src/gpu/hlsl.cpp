@@ -1550,6 +1550,16 @@ bool TranslateVertexFetchLayout(const Shader& shader, TranslatedShader& out)
     for (const Cf& cf : shader.cf)
         if (cf.op() == CfOp::CondCall)
             return false;
+    // (Likewise a jump or loop past the first end: that code is reached too, so translate in full. PGR3 port.)
+    for (size_t i = 0, firstEnd = shader.cf.size(); i < shader.cf.size(); i++)
+    {
+        const Cf& cf = shader.cf[i];
+        if (cf.IsEnd() && firstEnd == shader.cf.size())
+            firstEnd = i;
+        const CfOp op = cf.op();
+        if ((op == CfOp::CondJmp || op == CfOp::LoopStart || op == CfOp::LoopEnd) && (cf.lo & 0x1FFF) > firstEnd)
+            return false;
+    }
     for (const Cf& cf : shader.cf)
     {
         if (cf.IsExec())

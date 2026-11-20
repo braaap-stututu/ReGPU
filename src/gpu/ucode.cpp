@@ -177,14 +177,34 @@ Shader Parse(const uint32_t* microcodeBE, uint32_t dwords, bool pixel)
             // Subroutines live after the end: while a call targets an instruction not parsed yet, the
             // control flow area is read on (up to the first exec's code). Programs without calls stop
             // at the end as before. From the FM4 port.
+            // Jumps too (PGR3 port): PGR3's compiler places whole branches after the end, reached by conditional
+            // jumps (its building shader jumps from CF 2 to CF 39 past an end at 28). They were never parsed, the
+            // translation had no block for them, and the pixels on that path came out 0 (black buildings).
+            // REGPU_NO_JUMP_PAST_END=1: only calls, as before (read at translation).
+            static const bool callsOnly = getenv("REGPU_NO_JUMP_PAST_END") != nullptr;
             const auto unparsedCall = [&] {
                 for (const Cf& c : shader.cf)
-                    if (c.op() == CfOp::CondCall && (c.lo & 0x1FFF) >= shader.cf.size())
+                {
+                    const CfOp op = c.op();
+                    const bool target = op == CfOp::CondCall || (!callsOnly && (op == CfOp::CondJmp || op == CfOp::LoopStart || op == CfOp::LoopEnd));
+                    if (target && (c.lo & 0x1FFF) >= shader.cf.size())
                         return true;
+                }
                 return false;
             };
-            for (triple++; unparsedCall() && triple < cfEnd && triple * 3 + 2 < dwords; triple++)
+            // A branch reached past the end falls through until its own end (or a return or an unconditional jump):
+            // keep reading while the last instruction parsed after the end leaves the tail open.
+            bool parsedMore = false;
+            const auto tailOpen = [&] {
+                if (callsOnly || !parsedMore)
+                    return false;
+                const Cf& last = shader.cf.back();
+                const bool unconditionalJump = last.op() == CfOp::CondJmp && ((last.lo >> 13) & 1);
+                return !last.IsEnd() && last.op() != CfOp::Return && !unconditionalJump;
+            };
+            for (triple++; (unparsedCall() || tailOpen()) && triple < cfEnd && triple * 3 + 2 < dwords; triple++)
             {
+                parsedMore = true;
                 const uint32_t* v = &shader.words[triple * 3];
                 Cf more[2];
                 more[0].lo = v[0];
