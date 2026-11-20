@@ -5095,7 +5095,10 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     pd.RTVFormats[0] = kColorFormat;
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     pd.SampleDesc.Count = g_msaa;
-    const bool motion = key.flags & 4; // motion-vector variants: a second target for the motion
+    // Motion-vector variants: a second target for the motion. Flag 0x800 (it was 4, which MakePipelineKey also sets for
+    // draws without depth clipping: those were built with the motion root signature and two targets, and left out
+    // of the manifest).
+    const bool motion = key.flags & 0x800;
     if (motion)
     {
         pd.pRootSignature = g_r.motionRootSignature.Get();
@@ -5277,7 +5280,7 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         key.flags |= 0x200;
     }
     if (motion)
-        key.flags |= 4;
+        key.flags |= 0x800; // (EnsurePipeline)
     if (stripCut)
         key.flags |= 0x100; // strips restart at index 0xFFFF (DrawImpl)
     thread_local std::unordered_map<PipelineKey, ID3D12PipelineState*, PipelineKeyHash> ready; // (pipelines are never removed)
