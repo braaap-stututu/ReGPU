@@ -84,7 +84,14 @@ FH1/Glue2GPU and the rest) described in the README.
 - **Debugging.**
   - The debug server, captures and `regpuctl` keep working; screenshots read back a VkImage.
   - Validation layers on behind `REGPU_VK_VALIDATION`.
-  - RenderDoc and RGP for GPU work.
+  - RenderDoc and RGP for GPU work. RGA compiles a SPIR-V shader to RDNA ISA, to see its register use and
+    instruction count (the road shader from Tankyx's notes). GFXReconstruct (in the Vulkan SDK) captures a frame and
+    replays it without the game.
+- **Upscalers on Vulkan:** the FSR SDK 2.4.0 ships signed Vulkan DLLs (`amd_fidelityfx_loader_vk`, `upscaler_vk`,
+  `framegeneration_vk`) at parity with DX12, FSR 4 included.
+  - Its Vulkan entry point is `ffx_api_vk.h`. Inputs go to `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`.
+  - The SDK needs Vulkan 1.2; ReGPU's baseline is 1.3.
+- **Linux testing:** the user's Steam Deck (RADV) and a Linux boot of their PC with the RX 7900 XTX.
 
 ## Lessons from FM2's Vulkan backend
 
