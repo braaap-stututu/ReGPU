@@ -627,6 +627,7 @@ void WorkerLoop()
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_profiledWorker, 0, FALSE, DUPLICATE_SAME_ACCESS);
     gpureg::t_file = work::g_file.data();
     t_drawThread = true;
+    const bool timeIdle = LongFramesOn();
     for (;;)
     {
         uint64_t tail = work::g_tail.load(std::memory_order_relaxed);
@@ -635,7 +636,14 @@ void WorkerLoop()
         {
             if (seg::g_open)
                 seg::Flush(); // caught up: translate the open segment before waiting
-            work::g_head.wait(head, std::memory_order_acquire);
+            if (timeIdle)
+            {
+                const auto w0 = std::chrono::steady_clock::now();
+                work::g_head.wait(head, std::memory_order_acquire);
+                RendererDrawThreadIdle(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
+            }
+            else
+                work::g_head.wait(head, std::memory_order_acquire);
         }
         // Everything published so far, then let the command processor know.
         while (tail != head)

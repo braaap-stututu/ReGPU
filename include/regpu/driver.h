@@ -21,6 +21,10 @@ void SetRefreshRate(double hz);
 // environment variable, this also reaches switches read when the library loads.
 void SetSwitch(const char* name, bool on);
 
+// Called on the draw thread at the end of a long frame (the long-frame log: REGPU_LONG_FRAMES or REGPU_PERF_LITE),
+// with its length and the draw thread's CPU time in it. Keep it short: it runs inside the frame's swap.
+void SetLongFrameCallback(void (*callback)(uint64_t frame, double ms, double cpuMs));
+
 // The register file (guest 0x7FC80000 + index * 4), for the host's MMIO handler. Without
 // REGPU_GUEST_EXPORTS the registers live in host memory, so guest accesses must come here.
 uint32_t ReadRegister(uint32_t index);

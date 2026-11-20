@@ -28,6 +28,10 @@ void RendererSetGammaPwl(uint32_t index, uint32_t component, uint32_t data);
 // Benchmark: frame times are recorded while on; the report summarises them.
 void BenchmarkRecord(bool on);
 void BenchmarkWriteReport(const char* path);
+// The long-frame log (REGPU_LONG_FRAMES, renderer.cpp): whether it is on, and the draw thread's waits for the
+// command processor (ms), summed per frame.
+bool LongFramesOn();
+void RendererDrawThreadIdle(double ms);
 // True while REGPU_TRACE_DRAWS's frame is being recorded.
 bool RendererTracing();
 
