@@ -1228,6 +1228,16 @@ const char kPlainMulAll[] = R"(float4 Mul9(float4 a, float4 b) { return a * b; }
 float Mul9(float a, float b) { return a * b; }
 float Dot9(float4 a, float4 b) { return dot(a, b); })";
 
+// REGPU_VR=stereo (read once): the vertex shaders take the eye offset (see the viewport transform below).
+bool StereoShaders()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_VR");
+        return v && strcmp(v, "stereo") == 0;
+    }();
+    return on;
+}
+
 std::string Preamble(bool plainMul, bool plainMulVertex = false)
 {
     std::string h = kPreamble;
@@ -1623,8 +1633,13 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    // per-axis scale and offset to screen pixels; back to D3D clip space after.\n"
              "    // Hor+: on a wider-than-16:9 output a full-width pass is drawn wider; perspective\n"
              "    // geometry is narrowed to match, so the view widens instead of stretching.\n"
-             "    const bool flat = abs(r.pos.w - 1.0) <= 1e-4;\n"
-             "    if (!flat) r.pos.xy *= vwide.xy;\n"
+             "    const bool flat = abs(r.pos.w - 1.0) <= 1e-4;\n";
+        // VR stereo (REGPU_VR=stereo): perspective geometry seen from one eye, the view moved sideways in the camera's
+        // space: clip x moves by -P00 * eye offset, the same at every depth (vdepth.y, renderer.cpp; 0 outside the
+        // main view). Only in stereo mode, so the shaders (and their cache entries) stay as they were otherwise.
+        if (StereoShaders())
+            h += "    if (!flat) r.pos.x += vdepth.y;\n";
+        h += "    if (!flat) r.pos.xy *= vwide.xy;\n"
              "    float w = r.pos.w;\n"
              "    // (VTX_W0_FMT set means w is the true W0, the normal case.)\n"
              "    float3 p = r.pos.xyz;\n"

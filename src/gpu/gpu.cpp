@@ -28,6 +28,7 @@ using Clock = std::chrono::steady_clock;
 #include "gpu/regs.h"
 #include "render/presenter.h"
 #include "gpu/renderer.h"
+#include "render/xr.h"
 #include "precise_sleep.h"
 
 extern HANDLE g_profiledWorker; // renderer.cpp
@@ -651,6 +652,148 @@ void SegDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     FrameOnDraw(initiator, dmaBase, dmaSize);
 }
 
+// ---- VR stereo (REGPU_VR=stereo) ---------------------------------------------------------
+// The frame's main view drawn a second time, for the other eye (the design Forza Horizon 1: ReImagined describes; our
+// own code). The draw thread keeps every record from the frame's first main-view draw (the full-width surface: before
+// it come the shadow maps, reflections and the mirror, which both eyes share) to the swap, with the register file and
+// the current shaders as they were at that draw. At the swap the front buffer holds the first eye's picture: it goes to
+// the headset, then the records run again from the saved state for the second eye and that picture follows. The eye is
+// one constant: the main view's perspective geometry moves sideways in clip space by P00 * half the eye distance
+// (hlsl.cpp, renderer.cpp RendererSetStereoEye; post-processing quads and the HUD are flat and stay put). The game's CPU
+// side, its command stream and the guest's view of the GPU run once: the second pass skips fence writes, ordered
+// stores, occlusion queries (and their draws) and resolve write-backs to guest memory.
+// REGPU_VR_SHOW_LEFT=1 (live): the right eye first, so the desktop shows the left one. REGPU_VR_EYE_FLIP=1 (live):
+// the eyes' offsets swapped, for a title that draws its main view mirrored in x (camera +x at clip -x) and turns it
+// back later (FM3 draws its scene turned 180 degrees; the port sets it).
+namespace stereo
+{
+bool Mode()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_VR");
+        return v && strcmp(v, "stereo") == 0;
+    }();
+    return on;
+}
+bool g_checked = false; // this frame's first main-view draw seen (and the frame's choice made)
+bool g_armed = false;   // recording this frame for the second eye
+float g_clip = 0;       // P00 * half the eye distance: the left eye's clip x offset (the right eye's negated)
+int g_firstEye = 0;     // the eye drawn by the game's own pass (0 left)
+std::vector<uint32_t> g_log;            // the records since the first main-view draw (headers included)
+std::vector<uint8_t> g_startFile, g_endFile;
+std::vector<uint32_t> g_shader[2], g_startShader[2]; // the newest shader load of each type (now / at that draw)
+uint32_t g_shaderAddress[2] = {}, g_startShaderAddress[2] = {};
+uint64_t g_frames = 0, g_words = 0;
+constexpr size_t kMaxWords = 24u << 20; // 96 MB: a frame past this is drawn once
+
+float EyeClip(int eye) { return eye == 0 ? g_clip : -g_clip; }
+
+void OnShader(uint32_t type, uint32_t address, const uint32_t* code, uint32_t dwords)
+{
+    if (!Mode() || type > 1)
+        return;
+    g_shader[type].assign(code, code + dwords);
+    g_shaderAddress[type] = address;
+}
+
+// Before a draw record runs: the frame's first main-view draw starts the recording.
+void BeforeDraw()
+{
+    if (!Mode() || g_checked || !RendererMainViewNow())
+        return;
+    g_checked = true;
+    float p00 = 0, half = 0;
+    if (!regpu::xr::StereoFrame(p00, half))
+        return;
+    static LiveSwitch showLeft("REGPU_VR_SHOW_LEFT"), flip("REGPU_VR_EYE_FLIP");
+    g_clip = p00 * half * (flip ? -1.0f : 1.0f);
+    g_firstEye = showLeft ? 1 : 0;
+    g_startFile = work::g_file;
+    for (int t = 0; t < 2; t++)
+        g_startShader[t] = g_shader[t], g_startShaderAddress[t] = g_shaderAddress[t];
+    g_log.clear();
+    g_armed = true;
+    RendererSetStereoEye(EyeClip(g_firstEye));
+}
+
+void Append(const uint32_t* record, uint32_t words)
+{
+    if (!g_armed)
+        return;
+    if (g_log.size() + words > kMaxWords)
+    {
+        g_armed = false; // too long: this frame stays mono (its first pass still has the eye offset)
+        g_log.clear();
+        return;
+    }
+    g_log.insert(g_log.end(), record, record + words);
+}
+
+// At the swap, before the frame is presented: the second eye.
+void AtSwap(uint32_t frontBuffer)
+{
+    const bool armed = g_armed;
+    g_armed = false;
+    g_checked = false;
+    if (!armed)
+    {
+        RendererSetStereoEye(0);
+        return;
+    }
+    RendererStereoCaptureEye(g_firstEye, frontBuffer);
+    // REGPU_VR_NO_SECOND_EYE=1 (live): the records are kept but not drawn again (the second eye's cost; which pass the
+    // desktop shows).
+    static LiveSwitch noSecond("REGPU_VR_NO_SECOND_EYE");
+    if (noSecond)
+    {
+        RendererSetStereoEye(0);
+        return;
+    }
+    g_endFile = work::g_file;
+    memcpy(work::g_file.data(), g_startFile.data(), g_startFile.size());
+    for (int t = 0; t < 2; t++)
+        if (!g_startShader[t].empty())
+            FrameOnShaderLoad(ShaderType(t), g_startShader[t].data(), uint32_t(g_startShader[t].size()), g_startShaderAddress[t]);
+    RendererSetStereoEye(EyeClip(1 - g_firstEye));
+    RendererSetStereoReplay(true);
+    bool inQuery = false;
+    for (size_t i = 0; i < g_log.size();)
+    {
+        const uint32_t* p = &g_log[i];
+        const uint32_t type = p[0] >> 24, words = p[0] & 0xFFFFFF;
+        const uint32_t* a = p + 1;
+        switch (type)
+        {
+        case work::kRegs:
+            memcpy(work::g_file.data() + a[0] * 4, a + 1, size_t(words - 1) * 4);
+            break;
+        case work::kShader:
+            FrameOnShaderLoad(ShaderType(a[0]), a + 3, a[2], a[1]);
+            break;
+        case work::kDraw:
+            if (!inQuery)
+                FrameOnDraw(a[0], a[1], a[2]);
+            break;
+        case work::kQuery:
+            inQuery = a[0] == 0;
+            break;
+        default: // fences, ordered stores: the guest saw them once
+            break;
+        }
+        i += size_t(words) + 1;
+    }
+    RendererSetStereoReplay(false);
+    RendererSetStereoEye(0);
+    memcpy(work::g_file.data(), g_endFile.data(), g_endFile.size()); // (the same values: the records ran in full)
+    RendererStereoCaptureEye(1 - g_firstEye, frontBuffer);
+    g_frames++;
+    g_words += g_log.size();
+    if (g_frames == 1 || g_frames % 3600 == 0)
+        Log("vr: stereo frame %llu: %zu KB of records drawn again for the second eye (clip offset %.4f)", (unsigned long long)g_frames,
+            g_log.size() * 4 / 1024, g_clip);
+}
+}
+
 void WorkerLoop()
 {
     SetThreadDescription(GetCurrentThread(), L"gpu draw worker");
@@ -688,6 +831,8 @@ void WorkerLoop()
             const uint32_t* p = &work::g_ring[tail % work::kWords];
             const uint32_t type = p[0] >> 24, words = p[0] & 0xFFFFFF;
             const uint32_t* a = p + 1;
+            if (stereo::g_armed && type != work::kSwap && type != work::kPad)
+                stereo::Append(p, words + 1);
             switch (type)
             {
             case work::kRegs:
@@ -696,13 +841,18 @@ void WorkerLoop()
                     seg::Append(seg::kRegs, a, words);
                 break;
             case work::kShader:
+                stereo::OnShader(a[0], a[1], a + 3, a[2]);
                 SegShaderLoad(ShaderType(a[0]), a + 3, a[2], a[1]);
                 break;
             case work::kDraw:
+                stereo::BeforeDraw();
+                if (stereo::g_armed && stereo::g_log.empty())
+                    stereo::Append(p, words + 1); // (the draw that started the recording)
                 SegDraw(a[0], a[1], a[2]);
                 break;
             case work::kSwap:
                 seg::Flush();
+                stereo::AtSwap(a[2]);
                 seg::EndFrame();
                 seg::g_tile = RendererTile{};
                 seg::g_query = false;

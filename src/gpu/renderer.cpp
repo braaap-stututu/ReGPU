@@ -40,6 +40,7 @@
 #include "gpu/dlss.h"
 #include "gpu/fsr3.h"
 #include "gpu/recorded_list.h"
+#include "render/xr.h"
 #include "fsr1_cs.h"
 #include "postaa_cs.h"
 #if REGPU_POSTAA_FILTERS
@@ -421,6 +422,9 @@ float HelperPassScale(float passScale, uint32_t big)
 }
 
 bool WidePass() { return (gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF) == kWidth; }
+// VR stereo (gpu.cpp stereo::): the eye being drawn, as a clip-space x offset (0: none).
+float g_stereoClipX = 0.0f;
+bool g_stereoReplay = false; // the second eye's pass (no write-backs to guest memory)
 // REGPU_NO_PASS_SNAPSHOT=1: worked out at every call (A/B, live).
 LiveSwitch g_passNoSnapshot("REGPU_NO_PASS_SNAPSHOT"), g_passFullCheck("REGPU_PASS_SNAPSHOT_FULL_CHECK");
 // Inside DrawImpl: a number for the draw this thread is translating (0 outside one). A draw's surface registers can't
@@ -3108,7 +3112,16 @@ void BeginFrameIfNeeded()
         const bool taa = st.postAA == Settings::PostAA::Taa && !temporalUpscaler;
         const bool filter = st.postAA != Settings::PostAA::Off && st.postAA != Settings::PostAA::Taa;
         const bool upscale = st.upscaler != Settings::Upscaler::Off && (temporalUpscaler || scale < 1.0f);
-        g_scenePhase = (upscale || taa || filter) && g_r.frame >= g_upscale.retryFrame && (!(temporalUpscaler || taa) || TemporalInit());
+        // VR stereo draws the scene twice from the same commands: the upscalers' and filters' per-frame state (history,
+        // jitter, the scene's end) would run twice too, so they are off with it.
+        static const bool stereo = [] {
+            const char* v = getenv("REGPU_VR");
+            const bool on = v && strcmp(v, "stereo") == 0;
+            if (on)
+                Log("vr: stereo: upscalers and anti-aliasing filters are off");
+            return on;
+        }();
+        g_scenePhase = !stereo && (upscale || taa || filter) && g_r.frame >= g_upscale.retryFrame && (!(temporalUpscaler || taa) || TemporalInit());
         g_temporal = g_scenePhase && (temporalUpscaler || taa);
         g_sceneScale = g_scenePhase ? scale : 1.0f;
         BumpPassEpoch();
@@ -8552,7 +8565,8 @@ ID3D12Resource* GradeIntoTexture(GradeJob* job)
 // Returns the graded copy of `image` (in COPY_SOURCE state), or null to show it as is. `pwl`: the
 // front buffer is k_2_10_10_10, so the display uses the PWL ramp. REGPU_NO_GAMMA_PWL=1: always the table.
 // With `direct`, a pass that grades fills *direct (valid) for the frame end and returns null.
-ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl, GradeJob* direct = nullptr)
+// `into` (VR stereo): graded into that image (UAV-capable, state COMMON before and after) instead of g_gammaOut.
+ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl, GradeJob* direct = nullptr, ID3D12Resource* into = nullptr)
 {
     static LiveSwitch off("REGPU_NO_GAMMA"), noPwl("REGPU_NO_GAMMA_PWL");
     pwl = pwl && !noPwl && g_gammaPwlSet.load(std::memory_order_relaxed);
@@ -8594,7 +8608,7 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl, GradeJob* dire
     FrameResources& f = Frame();
     if (f.descriptorsUsed + 2 > kDescriptorsPerFrame)
         return nullptr;
-    if (direct && g_upscale.gammaDraw)
+    if (direct && !into && g_upscale.gammaDraw)
     {
         direct->slots = f.descriptorBase + f.descriptorsUsed;
         f.descriptorsUsed += 1;
@@ -8613,7 +8627,7 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl, GradeJob* dire
         g_drawState.Invalidate(); // (the frame end sets the compute pipeline)
         return nullptr;
     }
-    if (!g_gammaOut || g_gammaOut->GetDesc().Width != desc.Width || g_gammaOut->GetDesc().Height != desc.Height)
+    if (!into && (!g_gammaOut || g_gammaOut->GetDesc().Width != desc.Width || g_gammaOut->GetDesc().Height != desc.Height))
     {
         D3D12_RESOURCE_DESC td = desc;
         td.MipLevels = 1;
@@ -8633,7 +8647,17 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl, GradeJob* dire
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
     uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    g_r.device->CreateUnorderedAccessView(g_gammaOut.Get(), nullptr, &uav, Cpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    ID3D12Resource* out = into ? into : g_gammaOut.Get();
+    g_r.device->CreateUnorderedAccessView(out, nullptr, &uav, Cpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    if (into)
+    {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = into;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        C().list->ResourceBarrier(1, &b);
+    }
     uint32_t c[24] = {};
     memcpy(c, points, sizeof(points));
     c[20] = uint32_t(desc.Width);
@@ -8646,12 +8670,12 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl, GradeJob* dire
     C().list->Dispatch(UINT((desc.Width + 7) / 8), (desc.Height + 7) / 8, 1);
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = g_gammaOut.Get();
+    b.Transition.pResource = out;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = into ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_SOURCE;
     C().list->ResourceBarrier(1, &b);
     g_drawState.Invalidate(); // the compute pipeline replaced the draw's
-    return g_gammaOut.Get();
+    return out;
 }
 
 // Enhanced lighting (Settings::enhance): the frame through the local-contrast pass. `image` is
@@ -9707,7 +9731,9 @@ void Resolve()
         if (request.mode == regpu::Writeback::Mode::None && !keepMark)
             if (auto it = g_r.resolved.find(base); it != g_r.resolved.end())
                 it->second.writtenBack = false;
-        if (request.mode == regpu::Writeback::Mode::Now && !depth && anyFormat)
+        if (g_stereoReplay)
+            ; // (VR stereo's second eye: the guest has the first eye's)
+        else if (request.mode == regpu::Writeback::Mode::Now && !depth && anyFormat)
             WriteResolveToGuest(base, width, height, info);
         else if (request.mode == regpu::Writeback::Mode::Deferred && (depth || anyFormat))
             QueueDeferredWriteback(base, width, height, info, depth, rect, request);
@@ -13212,7 +13238,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     vc->info[0] = uint32_t(listOffset);
     vc->info[1] = (initiator & 0x3F) == 1 ? 2 : 0;
     vc->vdepth[0] = PolygonOffsetDepth();
-    vc->vdepth[1] = vc->vdepth[2] = vc->vdepth[3] = 0;
+    // VR stereo: this eye's clip-space x offset for the main view's perspective geometry (hlsl.cpp; RendererSetStereoEye).
+    vc->vdepth[1] = WidePass() ? g_stereoClipX : 0.0f;
+    vc->vdepth[2] = vc->vdepth[3] = 0;
     // Viewport transform in the vertex shader (see hlsl.cpp).
     vc->vscale[0] = RegFloat(PA_CL_VPORT_XSCALE);
     vc->vscale[1] = RegFloat(PA_CL_VPORT_YSCALE);
@@ -14816,6 +14844,44 @@ void Push(std::chrono::steady_clock::time_point now, uint64_t draws)
     g_ring[head % kSize] = Record{ std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(), draws, g_liteGpuMs, g_liteGpuFrames };
     g_head.store(head + 1, std::memory_order_release);
 }
+}
+
+bool RendererMainViewNow() { return WidePass(); }
+void RendererSetStereoEye(float clipX) { g_stereoClipX = clipX; }
+void RendererSetStereoReplay(bool on) { g_stereoReplay = on; }
+
+void RendererStereoCaptureEye(int eye, uint32_t frontBuffer)
+{
+    if (!g_r.ok)
+        return;
+    auto it = g_r.resolved.find(frontBuffer);
+    if (it == g_r.resolved.end() || it->second.width != kWidth || it->second.height != kHeight || it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM)
+        return;
+    ID3D12Resource* image = it->second.resource.Get();
+    const D3D12_RESOURCE_DESC d = image->GetDesc();
+    ID3D12Resource* target = regpu::xr::StereoTarget(eye, uint32_t(d.Width), d.Height);
+    if (!target)
+        return;
+    BeginFrameIfNeeded();
+    // The presenter's grading (the display's gamma table), so both eyes look as the desktop picture does.
+    if (GradeFrontBuffer(image, it->second.guestFormat == 7, nullptr, target))
+        return;
+    D3D12_RESOURCE_BARRIER b[2]{};
+    for (auto& x : b)
+        x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition.pResource = image;
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.pResource = target;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    C().list->ResourceBarrier(2, b);
+    D3D12_TEXTURE_COPY_LOCATION dst{ target, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, src{ image, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    dst.SubresourceIndex = src.SubresourceIndex = 0;
+    C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    for (auto& x : b)
+        std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    C().list->ResourceBarrier(2, b);
 }
 
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer);

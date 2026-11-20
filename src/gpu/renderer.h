@@ -8,6 +8,14 @@ void RendererSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t used
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize);
 // frontBuffer: physical address of the resolved image to show.
 void RendererOnSwap(uint64_t frame, uint32_t frontBuffer);
+// VR stereo (gpu.cpp stereo::): the draw is in the main view (the full-width surface); the eye being drawn (clip-space x
+// offset of the main view's perspective geometry, 0 none); the front buffer as resolved so far, graded as the presenter
+// shows it, into the headset's image for `eye`.
+bool RendererMainViewNow();
+void RendererSetStereoEye(float clipX);
+// The second eye's pass runs: resolves are not written back to guest memory (the first pass did).
+void RendererSetStereoReplay(bool on);
+void RendererStereoCaptureEye(int eye, uint32_t frontBuffer);
 // Lookahead hooks (see GpuLookahead): shader loads and draws the command processor has
 // not executed yet, seen on a shadow copy of the registers.
 void RendererPredictBegin();

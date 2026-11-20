@@ -19,4 +19,12 @@ void Start(ID3D12Device* device, ID3D12CommandQueue* queue);
 // The back buffer holds the finished frame (state COPY_DEST, left so): copies it for the headset. No-op unless a
 // headset session runs.
 void CaptureFrame(ID3D12GraphicsCommandList* list, ID3D12Resource* backBuffer);
+
+// Step 3, true stereo (REGPU_VR=stereo, gpu.cpp stereo::): the frame's main view drawn twice, once per eye.
+// StereoFrame: this frame is to be drawn in stereo (a head-tracked frame, from SubmitFramePose; or REGPU_VR_STEREO_TEST
+// without a headset); `clipPerMetre` = P00 of the frame's projection (clip x per metre of sideways offset at w 1),
+// `halfIpd` = half the eye distance (metres).
+bool StereoFrame(float& clipPerMetre, float& halfIpd);
+// The headset's image for eye 0 (left) or 1 (right) at w x h, state COMMON (to be left so), or null without a session.
+ID3D12Resource* StereoTarget(int eye, uint32_t w, uint32_t h);
 }

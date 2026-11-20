@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string>
 
+#include "live_switch.h"
 #include "log.h"
 #include "regpu/regpu.h"
 
@@ -25,6 +26,8 @@ bool Wanted()
 }
 void Start(ID3D12Device*, ID3D12CommandQueue*) {}
 void CaptureFrame(ID3D12GraphicsCommandList*, ID3D12Resource*) {}
+bool StereoFrame(float&, float&) { return false; }
+ID3D12Resource* StereoTarget(int, uint32_t, uint32_t) { return nullptr; }
 }
 namespace regpu::vr
 {
@@ -97,6 +100,16 @@ XrSpace g_poseLocal = XR_NULL_HANDLE, g_poseView = XR_NULL_HANDLE;
 std::atomic<int64_t> g_predicted{ 0 };
 XrFovf g_eyeFov{};
 std::atomic<uint64_t> g_captured{ 0 };
+// Stereo (REGPU_VR=stereo): the two eyes' images of the newest stereo frame (renderer.cpp RendererStereoCaptureEye
+// grades into them; COMMON between uses), and whether the frame CaptureFrame took was one.
+ComPtr<ID3D12Resource> g_eyes[2];          // (g_screenMutex)
+std::atomic<bool> g_eyesThisFrame{ false }; // both eyes written since the last CaptureFrame
+bool g_screenStereo = false;                // (g_screenMutex) the captured frame has its eyes in g_eyes
+// The newest frame pose handed in (for StereoFrame on the draw thread): head-tracked or not, its field of view; and the
+// headset's eye distance.
+std::atomic<bool> g_lastPosed{ false };
+std::atomic<float> g_lastFovY{ 0.0f };
+std::atomic<float> g_ipd{ 0.064f };
 ComPtr<ID3D12Device> g_device;
 ComPtr<ID3D12CommandQueue> g_queue;
 
@@ -156,6 +169,22 @@ bool LoadInstanceFunctions(XrInstance instance)
     return ok;
 }
 
+// Half the eye distance for stereo: the headset's (from its two views), or REGPU_VR_IPD (millimetres).
+float HalfIpd()
+{
+    static const float fixed = EnvFloat("REGPU_VR_IPD", 0.0f) * 0.001f;
+    return 0.5f * (fixed > 0.0f ? fixed : g_ipd.load(std::memory_order_relaxed));
+}
+
+bool StereoMode()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_VR");
+        return v && strcmp(v, "stereo") == 0;
+    }();
+    return on;
+}
+
 // One OpenXR instance + session at a time; the thread makes a new one after a loss or when no headset was there yet.
 struct Session
 {
@@ -165,6 +194,10 @@ struct Session
     XrSpace local = XR_NULL_HANDLE, view = XR_NULL_HANDLE;
     XrSwapchain quad = XR_NULL_HANDLE;
     uint32_t quadW = 0, quadH = 0;
+    // Stereo: one swapchain image holding both eyes side by side (left in the left half).
+    XrSwapchain pair = XR_NULL_HANDLE;
+    uint32_t pairW = 0, pairH = 0;
+    std::vector<ID3D12Resource*> pairImages;
     int64_t quadFormat = 0;
     std::vector<ID3D12Resource*> images;
     static constexpr uint32_t kLists = 3;
@@ -188,6 +221,8 @@ struct Session
             xrDestroySpace(view);
         if (quad)
             xrDestroySwapchain(quad);
+        if (pair)
+            xrDestroySwapchain(pair);
         if (local)
             xrDestroySpace(local);
         if (session)
@@ -342,6 +377,46 @@ struct Session
         return true;
     }
 
+    // The stereo pair's swapchain: two eyes of w x h side by side.
+    bool EnsurePair(uint32_t w, uint32_t h)
+    {
+        if (pair && pairW == w && pairH == h)
+            return true;
+        if (pair)
+        {
+            WaitIdle();
+            xrDestroySwapchain(pair);
+            pair = XR_NULL_HANDLE;
+            pairImages.clear();
+        }
+        if (!quadFormat && !EnsureQuad(w, h)) // (picks the format)
+            return false;
+        XrSwapchainCreateInfo ci{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
+        ci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        ci.format = quadFormat;
+        ci.sampleCount = 1;
+        ci.width = w * 2;
+        ci.height = h;
+        ci.faceCount = 1;
+        ci.arraySize = 1;
+        ci.mipCount = 1;
+        if (XrResult r = xrCreateSwapchain(session, &ci, &pair); XR_FAILED(r))
+        {
+            Log("vr: xrCreateSwapchain %ux%u (stereo) failed: %s", w * 2, h, ResultText(instance, r).c_str());
+            pair = XR_NULL_HANDLE;
+            return false;
+        }
+        uint32_t count = 0;
+        xrEnumerateSwapchainImages(pair, 0, &count, nullptr);
+        std::vector<XrSwapchainImageD3D12KHR> imgs(count, { XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR });
+        xrEnumerateSwapchainImages(pair, count, &count, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
+        for (const auto& i : imgs)
+            pairImages.push_back(i.texture);
+        pairW = w, pairH = h;
+        Log("vr: stereo, %ux%u per eye", w, h);
+        return true;
+    }
+
     void WaitIdle()
     {
         const uint64_t v = nextFence++;
@@ -354,14 +429,19 @@ struct Session
     }
 
     // Copies the latest captured frame into the quad's next image.
-    bool DrawQuad(FramePose& pose)
+    bool DrawQuad(FramePose& pose, bool& stereo)
     {
-        ComPtr<ID3D12Resource> screen;
+        ComPtr<ID3D12Resource> screen, eyes[2];
         {
             std::lock_guard lock(g_screenMutex);
             screen = g_screen;
             pose = g_screenPose;
+            stereo = g_screenStereo && g_eyes[0] && g_eyes[1] && pose.valid;
+            if (stereo)
+                eyes[0] = g_eyes[0], eyes[1] = g_eyes[1];
         }
+        if (stereo)
+            return DrawPair(eyes);
         if (!screen)
             return false;
         const D3D12_RESOURCE_DESC d = screen->GetDesc();
@@ -396,6 +476,49 @@ struct Session
         g_queue->Signal(fence.Get(), fenceValues[li]);
         XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
         xrReleaseSwapchainImage(quad, &ri);
+        return true;
+    }
+
+    // Copies the two eyes of the newest stereo frame into the pair's next image, side by side.
+    bool DrawPair(ComPtr<ID3D12Resource> (&eyes)[2])
+    {
+        const D3D12_RESOURCE_DESC d = eyes[0]->GetDesc();
+        if (!EnsurePair(uint32_t(d.Width), d.Height))
+            return false;
+        uint32_t index = 0;
+        XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+        if (XR_FAILED(xrAcquireSwapchainImage(pair, &ai, &index)))
+            return false;
+        XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+        wi.timeout = XR_INFINITE_DURATION;
+        xrWaitSwapchainImage(pair, &wi);
+        const uint32_t li = listIndex++ % kLists;
+        if (fence->GetCompletedValue() < fenceValues[li])
+        {
+            fence->SetEventOnCompletion(fenceValues[li], fenceEvent);
+            WaitForSingleObject(fenceEvent, 1000);
+        }
+        allocators[li]->Reset();
+        list->Reset(allocators[li].Get(), nullptr);
+        ID3D12Resource* image = pairImages[index];
+        Barrier(list.Get(), image, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+        for (int e = 0; e < 2; e++)
+        {
+            Barrier(list.Get(), eyes[e].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION dst{ image, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, src{ eyes[e].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+            dst.SubresourceIndex = src.SubresourceIndex = 0;
+            const D3D12_BOX box{ 0, 0, 0, std::min(uint32_t(eyes[e]->GetDesc().Width), pairW), std::min(eyes[e]->GetDesc().Height, pairH), 1 };
+            list->CopyTextureRegion(&dst, e ? pairW : 0, 0, 0, &src, &box);
+            Barrier(list.Get(), eyes[e].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        }
+        Barrier(list.Get(), image, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->Close();
+        ID3D12CommandList* lists[] = { list.Get() };
+        g_queue->ExecuteCommandLists(1, lists);
+        fenceValues[li] = nextFence++;
+        g_queue->Signal(fence.Get(), fenceValues[li]);
+        XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+        xrReleaseSwapchainImage(pair, &ri);
         return true;
     }
 
@@ -467,6 +590,14 @@ struct Session
                 {
                     std::lock_guard lock(g_poseMutex);
                     g_eyeFov = views[0].fov;
+                    if (n >= 2)
+                    {
+                        const float dx = views[1].pose.position.x - views[0].pose.position.x, dy = views[1].pose.position.y - views[0].pose.position.y,
+                                    dz = views[1].pose.position.z - views[0].pose.position.z;
+                        const float ipd = sqrtf(dx * dx + dy * dy + dz * dz);
+                        if (ipd > 0.04f && ipd < 0.09f)
+                            g_ipd.store(ipd, std::memory_order_relaxed);
+                    }
                 }
             }
             xrBeginFrame(session, nullptr);
@@ -476,8 +607,35 @@ struct Session
             const XrCompositionLayerBaseHeader* layers[1] = { reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer) };
             uint32_t layerCount = 0;
             FramePose framePose;
-            const bool drawn = fs.shouldRender && DrawQuad(framePose);
-            if (drawn && framePose.valid)
+            bool stereo = false;
+            const bool drawn = fs.shouldRender && DrawQuad(framePose, stereo);
+            if (drawn && stereo)
+            {
+                // A stereo frame: each eye from the head pose moved half the eye distance along the head's x axis (as
+                // it was drawn: gpu.cpp stereo::), across the field of view it was drawn with.
+                const float tanY = tanf(framePose.fovY * 0.5f), tanX = tanY * float(pairW) / float(std::max(pairH, 1u));
+                const auto& p = framePose.pose;
+                const float x = p.orientation[0], y = p.orientation[1], z = p.orientation[2], w = p.orientation[3];
+                // The head's x axis in the local space: the rotation's first column.
+                const float ax[3] = { 1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w) };
+                const float half = HalfIpd();
+                for (int e = 0; e < 2; e++)
+                {
+                    const float sgn = e ? half : -half;
+                    eyes[e].pose.orientation = { x, y, z, w };
+                    eyes[e].pose.position = { p.position[0] + ax[0] * sgn, p.position[1] + ax[1] * sgn, p.position[2] + ax[2] * sgn };
+                    eyes[e].fov = { -atanf(tanX), atanf(tanX), atanf(tanY), -atanf(tanY) };
+                    eyes[e].subImage.swapchain = pair;
+                    eyes[e].subImage.imageRect = { { int32_t(e ? pairW : 0), 0 }, { int32_t(pairW), int32_t(pairH) } };
+                }
+                projection.space = local;
+                projection.viewCount = 2;
+                projection.views = eyes;
+                layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&projection);
+                layerCount = 1;
+                shown++;
+            }
+            else if (drawn && framePose.valid)
             {
                 // A head-tracked frame: both eyes see it from the pose it was rendered with (mono), across the field
                 // of view it was rendered with; the runtime turns it for the head's movement since.
@@ -572,6 +730,56 @@ void Start(ID3D12Device* device, ID3D12CommandQueue* queue)
     std::thread(Thread).detach();
 }
 
+bool StereoFrame(float& clipPerMetre, float& halfIpd)
+{
+    if (!StereoMode())
+        return false;
+    // REGPU_VR_STEREO_TEST=1 (live): stereo without a headset, for screenshots (the desktop shows the eye drawn second;
+    // REGPU_VR_SHOW=left (gpu.cpp) swaps the order).
+    static LiveSwitch test("REGPU_VR_STEREO_TEST");
+    if (!(g_capturing.load(std::memory_order_relaxed) || test) || !g_lastPosed.load(std::memory_order_relaxed))
+        return false;
+    const float fovY = g_lastFovY.load(std::memory_order_relaxed);
+    if (fovY < 0.1f || fovY > 3.0f)
+        return false;
+    // P00 of a 16:9 symmetric projection with that vertical field of view (the game's main view).
+    clipPerMetre = 1.0f / (tanf(fovY * 0.5f) * (16.0f / 9.0f));
+    halfIpd = HalfIpd();
+    return true;
+}
+
+ID3D12Resource* StereoTarget(int eye, uint32_t w, uint32_t h)
+{
+    if (eye < 0 || eye > 1 || !g_capturing.load(std::memory_order_relaxed))
+        return nullptr;
+    std::lock_guard lock(g_screenMutex);
+    ComPtr<ID3D12Resource>& t = g_eyes[eye];
+    if (!t || t->GetDesc().Width != w || t->GetDesc().Height != h)
+    {
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        d.Width = w;
+        d.Height = h;
+        d.DepthOrArraySize = 1;
+        d.MipLevels = 1;
+        d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
+        ComPtr<ID3D12Resource> made;
+        if (FAILED(g_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&made))))
+            return nullptr;
+        if (t)
+            g_oldScreens.push_back(t);
+        while (g_oldScreens.size() > 8)
+            g_oldScreens.erase(g_oldScreens.begin());
+        t = made;
+    }
+    if (eye == 1)
+        g_eyesThisFrame = true;
+    return t.Get();
+}
+
 void CaptureFrame(ID3D12GraphicsCommandList* list, ID3D12Resource* backBuffer)
 {
     if (!g_capturing.load(std::memory_order_relaxed))
@@ -605,6 +813,7 @@ void CaptureFrame(ID3D12GraphicsCommandList* list, ID3D12Resource* backBuffer)
         }
         else
             g_screenPose.valid = false;
+        g_screenStereo = g_eyesThisFrame.exchange(false);
     }
     Barrier(list, backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Barrier(list, screen.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -640,6 +849,8 @@ bool GetHeadPose(HeadPose& out)
 
 void SubmitFramePose(const HeadPose* pose, float renderFovY)
 {
+    g_lastPosed.store(pose != nullptr, std::memory_order_relaxed);
+    g_lastFovY.store(renderFovY, std::memory_order_relaxed);
     if (!g_capturing.load(std::memory_order_relaxed))
         return;
     FramePose f;
