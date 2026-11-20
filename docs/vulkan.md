@@ -77,7 +77,8 @@ FM3 (the `regpu-vulkan` branch of its port) on an RX 7900 XTX against its D3D12 
 - **Validation:** none on the race grid and menus under synchronization validation; none with FXAA, SMAA, CMAA 2,
   SSAA, FSR 1/3 or XeSS; two messages from inside FSR 4's own shaders (not ReGPU's).
 - **Image:** the race grid matches (mean difference under 1/255; the rest is animated crowd and sub-pixel edges).
-- **Speed:** level. 4K 4x MSAA with CMAA 2: 230 fps and 4.18 ms of GPU a frame against 232 fps and 4.14 ms; without the
+- **Speed:** level (the 9800X3D's graphics too, since multisampled colour surfaces stay in GENERAL: 22 -> 56 fps in
+  the race at 720p 2x, D3D12 59). 4K 4x MSAA with CMAA 2: 230 fps and 4.18 ms of GPU a frame against 232 fps and 4.14 ms; without the
   filter 278 against 284 fps. Per pass (`REGPU_GPU_PASSES=1`), the main scene pass is ~5% slower and spread over many
   shaders (the driver's SPIR-V against its DXIL compile of the same HLSL); CMAA 2 is slightly faster. At 1080p both
   hold the 360 fps cap with the draw thread equally busy. FM3's benchmark race at 4K (40 s, the AI driving): 233.1
@@ -85,6 +86,18 @@ FM3 (the `regpu-vulkan` branch of its port) on an RX 7900 XTX against its D3D12 
 - **Measuring:** the light performance log's "GPU ms/frame" (timestamps around each frame) and `REGPU_GPU_PASSES=1`
   (per pass) / `REGPU_GPU_SHADERS=1` (per draw, by shaders) work as on D3D12. Compare the same settings on both sides:
   a profile with a different `aa=` makes one look slower.
+
+## The direct SPIR-V translator (experimental)
+
+`src/gpu/spirv` translates Xenos microcode straight to SPIR-V (its own builder, no glslang, no DXC). It covers pixel
+shaders: ALU, control flow, texture fetches as hlsl.cpp's TFetch (and the lean rules under `REGPU_LEAN_FETCH`), the
+renderer's no-kill, plain-fetch and specialised variants. `REGPU_SPIRV_DIRECT=1` (start-time) uses it for pixel shaders
+the game hasn't rewritten and no debug edit changed; the rest keep HLSL. `regpu_spirv_check` runs it over captured
+microcode with spirv-val.
+- FM3: every pixel shader and variant direct (~1 ms each against 100-900 ms through DXC); cold boot to the race grid
+  19 s against 42 s; the frame within 0.4/255 of the HLSL path; no validation messages. GPU: the RX 7900 XTX's 4K race
+  2-4% faster (238 fps against 228-233); the 9800X3D's graphics 2-6% slower (51-54 against 55 fps, within its noise).
+- Not yet: vertex shaders (the HLSL wrapper: index fetch, rectangles, points, the viewport transform, vertex fetch).
 
 ## Not done yet
 
