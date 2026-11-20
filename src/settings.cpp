@@ -67,6 +67,10 @@ void Config::ShownSize(uint32_t& w, uint32_t& h) const
 {
     w = width;
     h = height;
+    // Triple screen: the resolution is the three screens together and each is 16:9 (RenderSize); a forced aspect ratio
+    // (a single screen's 16:9) would shrink all three into a third (FM3 port session 39: 853x480 per screen at 7680x1440).
+    if (const char* t = getenv("REGPU_TRIPLE"); t && *t && strcmp(t, "0") != 0)
+        return;
     // The forced aspect, or the resolution's own; never narrower than 16:9 (narrower views
     // are not supported yet: such resolutions get 16:9 with bars).
     uint64_t aw = aspectW, ah = aspectH;

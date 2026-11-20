@@ -34,6 +34,7 @@ constexpr UINT kWidth = 1280, kHeight = 720;
 struct Presenter
 {
     HWND window = nullptr;
+    HWND surface = nullptr; // fullscreen: the child window the swap chain is on (else the window itself)
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<IDXGISwapChain3> swapChain;
@@ -199,6 +200,8 @@ void EnsureDevice()
 // area the window is placed at its top left, title bar on screen. Pixels are physical: the process is
 // made per-monitor DPI aware before ReGPU opens a window (a host's window has its own awareness).
 // Maximised or borderless (fullscreen) windows are left alone. Asynchronous: safe off the window's thread.
+RECT MonitorRow();
+bool SpanMonitors();
 void SizeWindow(HWND hwnd, uint32_t width, uint32_t height)
 {
     if (!hwnd || !width || !height || IsZoomed(hwnd))
@@ -211,6 +214,8 @@ void SizeWindow(HWND hwnd, uint32_t width, uint32_t height)
     const int w = r.right - r.left, h = r.bottom - r.top;
     MONITORINFO mi{ sizeof(mi) };
     GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    if (SpanMonitors())
+        mi.rcWork = MonitorRow(); // (triple screen: the whole row of monitors, not the nearest one)
     RECT now{};
     GetWindowRect(hwnd, &now);
     // Kept on the work area as far as it fits; its top left (the title bar) always is.
@@ -219,6 +224,50 @@ void SizeWindow(HWND hwnd, uint32_t width, uint32_t height)
     const bool own = GetWindowThreadProcessId(hwnd, nullptr) == GetCurrentThreadId();
     SetWindowPos(hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE | (own ? 0u : UINT(SWP_ASYNCWINDOWPOS)));
     Log("presenter: window client %ux%u", width, height);
+}
+
+// Fullscreen over several monitors (REGPU_TRIPLE, or REGPU_FULLSCREEN_SPAN=1; FM3 port session 39): the row of monitors
+// the primary one is in (those beside it that overlap its rows, side by side), as one rectangle. Separate monitors, not
+// an Eyefinity/Surround desktop, show the triple-wide picture this way. One monitor: just it.
+RECT MonitorRow()
+{
+    struct Ctx { RECT primary{}; std::vector<RECT> all; } ctx;
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM p) -> BOOL {
+        auto& c = *reinterpret_cast<Ctx*>(p);
+        MONITORINFO mi{ sizeof(mi) };
+        if (GetMonitorInfoW(m, &mi))
+        {
+            c.all.push_back(mi.rcMonitor);
+            if (mi.dwFlags & MONITORINFOF_PRIMARY)
+                c.primary = mi.rcMonitor;
+        }
+        return TRUE;
+    }, LPARAM(&ctx));
+    RECT row = ctx.primary;
+    // Grow left and right with monitors that touch the row's edge and share most of its height.
+    for (bool grew = true; grew;)
+    {
+        grew = false;
+        for (const RECT& r : ctx.all)
+        {
+            const LONG overlap = std::min(r.bottom, row.bottom) - std::max(r.top, row.top);
+            if (overlap < (row.bottom - row.top) / 2)
+                continue;
+            if (std::abs(r.right - row.left) <= 8 && r.left < row.left) { row.left = r.left; grew = true; }
+            if (std::abs(r.left - row.right) <= 8 && r.right > row.right) { row.right = r.right; grew = true; }
+        }
+    }
+    return row;
+}
+
+bool SpanMonitors()
+{
+    static const bool on = [] {
+        const char* t = getenv("REGPU_TRIPLE");
+        const char* s = getenv("REGPU_FULLSCREEN_SPAN");
+        return (t && *t && strcmp(t, "0") != 0) || (s && *s && strcmp(s, "0") != 0);
+    }();
+    return on;
 }
 
 void CreateWindowAndDevice()
@@ -252,9 +301,17 @@ void CreateWindowAndDevice()
     {
         // Borderless window over the whole display; its black background shows around the picture.
         // The picture (the swap chain) is a child window: the largest rectangle of the chosen
-        // aspect ratio, centred. Other windows cannot cover the black bars this way.
-        const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-        g_p.window = CreateWindowExW(0, L"regpu", GetSettings().windowTitle.c_str(), WS_POPUP | WS_VISIBLE, 0, 0, sw, sh, nullptr, nullptr, wc.hInstance, nullptr);
+        // aspect ratio, centred. Other windows cannot cover the black bars this way. Triple screen: over the row of
+        // monitors (MonitorRow).
+        RECT area{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+        if (SpanMonitors())
+        {
+            area = MonitorRow();
+            Log("presenter: fullscreen over the monitors at %ld,%ld, %ldx%ld", area.left, area.top, area.right - area.left, area.bottom - area.top);
+        }
+        const int sw = area.right - area.left, sh = area.bottom - area.top;
+        g_p.window = CreateWindowExW(0, L"regpu", GetSettings().windowTitle.c_str(), WS_POPUP | WS_VISIBLE, area.left, area.top, sw, sh, nullptr, nullptr,
+            wc.hInstance, nullptr);
         LONG w = sw, h = sh;
         if (int64_t(sw) * outH > int64_t(sh) * outW)
             w = LONG(int64_t(sh) * outW / outH);
@@ -267,7 +324,10 @@ void CreateWindowAndDevice()
     {
         g_p.window = CreateWindowW(L"regpu", GetSettings().windowTitle.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
             CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr, wc.hInstance, nullptr);
-        SetWindowPos(g_p.window, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER); // (sized from the work area's corner)
+        // (Sized from the work area's corner; triple screen: from the monitor row's left edge, so a three-screen-wide window
+        // starts on the left monitor.)
+        const LONG left = SpanMonitors() ? MonitorRow().left : 0;
+        SetWindowPos(g_p.window, nullptr, left, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
         SizeWindow(g_p.window, outW, outH);
         ShowWindow(g_p.window, SW_SHOW);
     }
@@ -292,6 +352,7 @@ void CreateWindowAndDevice()
     ComPtr<IDXGISwapChain1> sc1;
     Check(factory->CreateSwapChainForHwnd(g_p.queue.Get(), surface ? surface : g_p.window, &sd, nullptr, nullptr, &sc1), "CreateSwapChainForHwnd");
     Check(sc1.As(&g_p.swapChain), "IDXGISwapChain3");
+    g_p.surface = surface ? surface : g_p.window;
     factory->MakeWindowAssociation(g_p.window, DXGI_MWA_NO_ALT_ENTER);
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
@@ -601,9 +662,37 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, I
 uint32_t RegpuFrameCap();
 bool RegpuPerfLiteOn();
 
+// The window, the picture's own window and the swap chain, in physical pixels: logged at the first present and whenever
+// they change (session 39: a triple-screen picture shown at a third of its size on the centre screen).
+void LogWindowSizes()
+{
+    static RECT lastWin{}, lastSurf{};
+    static UINT lastW = 0, lastH = 0;
+    if (!g_p.window || !g_p.swapChain)
+        return;
+    RECT win{}, surf{};
+    GetWindowRect(g_p.window, &win);
+    GetWindowRect(g_p.surface ? g_p.surface : g_p.window, &surf);
+    DXGI_SWAP_CHAIN_DESC1 d{};
+    g_p.swapChain->GetDesc1(&d);
+    if (memcmp(&win, &lastWin, sizeof(win)) == 0 && memcmp(&surf, &lastSurf, sizeof(surf)) == 0 && d.Width == lastW && d.Height == lastH)
+        return;
+    lastWin = win, lastSurf = surf, lastW = d.Width, lastH = d.Height;
+    Log("presenter: window %ld,%ld %ldx%ld, picture %ld,%ld %ldx%ld, swap chain %ux%u, DPI %u", win.left, win.top, win.right - win.left, win.bottom - win.top,
+        surf.left, surf.top, surf.right - surf.left, surf.bottom - surf.top, d.Width, d.Height, GetDpiForWindow(g_p.window));
+}
+
 void PresenterPresent()
 {
     using Clock = std::chrono::steady_clock;
+    {
+        static Clock::time_point lastCheck{};
+        if (Clock::now() - lastCheck > std::chrono::seconds(5))
+        {
+            lastCheck = Clock::now();
+            LogWindowSizes();
+        }
+    }
     // REGPU_PRESENT_PACE=1 (live, session 33 of the FM3 port): presents held to an even spacing at the frame cap. The cap
     // gates the title's VdSwap, at the start of the pipeline; the frame then reaches here after the command processor,
     // the draw thread and the replay thread, whose time varies with the frame's load: the presents came unevenly (the
