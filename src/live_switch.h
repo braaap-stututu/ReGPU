@@ -17,7 +17,13 @@ public:
     explicit LiveSwitch(const char* name);
     LiveSwitch(const LiveSwitch&) = delete;
     LiveSwitch& operator=(const LiveSwitch&) = delete;
+#if defined(__clang__)
+    // (clang-cl left MSVC's atomic<bool>::load out of line: 431 calls in a PGR3 build, 2.2% of the draw thread. The
+    // builtin is the same relaxed load, inlined.)
+    operator bool() const { return __atomic_load_n(reinterpret_cast<const bool*>(&value_), __ATOMIC_RELAXED); }
+#else
     operator bool() const { return value_.load(std::memory_order_relaxed); }
+#endif
     const char* Name() const { return name_; }
 
     // The debug server's side: false if the name was never a switch (it's then kept for when one registers).
