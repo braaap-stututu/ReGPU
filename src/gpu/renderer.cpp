@@ -12199,6 +12199,7 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
 // composite's pixel shader (REGPU_VR_HUD_UNDER=<hash>, the port's). On a stereo frame the surface just before that draw
 // is the HUD alone: it goes to the headset's HUD panel (first eye's pass), and the composite is drawn opaque, so neither
 // eye has the HUD in its picture. REGPU_VR_HUD_IN_VIEW=1 (live): the HUD stays in both eyes' pictures, as before.
+// Head-tracked mono frames (REGPU_VR=cockpit, regpu::xr::MonoHudPanel) do the same (FM3 port session 39).
 ComPtr<ID3D12Resource> g_hudCopy;
 bool StereoHudDraw()
 {
@@ -12208,7 +12209,7 @@ bool StereoHudDraw()
     }();
     static LiveSwitch inView("REGPU_VR_HUD_IN_VIEW");
     // (Not the resolve that follows: a copy packet runs with the composite's shaders still loaded.)
-    return hudUnder && g_stereoClipX != 0.0f && C().psHash == hudUnder && WidePass() && !inView && C().color && !RendererIsResolveDraw();
+    return hudUnder && (g_stereoClipX != 0.0f || regpu::xr::MonoHudPanel()) && C().psHash == hudUnder && WidePass() && !inView && C().color && !RendererIsResolveDraw();
 }
 
 void StereoCaptureHud()

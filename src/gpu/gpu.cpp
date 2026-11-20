@@ -1960,6 +1960,9 @@ uint32_t FrameCap()
     uint32_t c = s.maxFps;
     if (s.vsync)
         c = std::min(c, refresh);
+    // VR headset pacing (render/xr.h PaceCap): the headset's display rate while a session runs.
+    if (const uint32_t pace = regpu::xr::PaceCap())
+        c = std::min(c, pace);
     c = std::max(c, 30u);
     static std::atomic<uint32_t> logged{ 0 };
     if (logged.exchange(c) != c)
