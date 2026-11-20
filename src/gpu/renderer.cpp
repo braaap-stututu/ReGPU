@@ -1935,6 +1935,122 @@ ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RES
     return r;
 }
 
+// Upload rings made off the frame (PGR3 port, session 5): a 256 MB ring took ~20-40 ms to create (the OS zeroes its
+// pages), made at a frame start for each of the three slots: PGR3's race start grew the ring (85/28/22/21 ms frames)
+// and the upload ring auto mode's first trial made the other place's ring at the grown size (62/110/128 ms frames).
+// Rings are now asked for ahead (RingRequest: a slot's last frame used over half its ring; the auto mode's other
+// place before a trial) and made on a thread of their own; a frame start takes a ready one (RingTake). A ring that
+// overflows still grows at once (as before). REGPU_RING_SYNC=1 (start-time): made at the frame start, as before.
+namespace ringmaker
+{
+struct Ready
+{
+    bool vram;
+    UINT64 size;
+    ComPtr<ID3D12Resource> res;
+    uint8_t* cpu;
+};
+std::mutex g_mutex;
+std::condition_variable g_cv;
+std::deque<std::pair<bool, UINT64>> g_queue; // (vram, size) to make
+std::vector<Ready> g_ready;
+bool g_started = false;
+
+bool Off()
+{
+    static const bool off = getenv("REGPU_RING_SYNC") != nullptr;
+    return off;
+}
+// (Not CreateBuffer/CreateGpuUploadRing: their counters belong to the frame's thread.)
+ComPtr<ID3D12Resource> Make(bool vram, UINT64 size, uint8_t*& cpu)
+{
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = vram ? D3D12_HEAP_TYPE_GPU_UPLOAD : D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = size;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> r;
+    cpu = nullptr;
+    if (FAILED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, vram ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr, IID_PPV_ARGS(&r))) ||
+        FAILED(r->Map(0, nullptr, reinterpret_cast<void**>(&cpu))))
+        return nullptr;
+    // Each page of a system-memory ring written once here: the OS zeroes a new buffer's pages at their first write,
+    // which otherwise fell on the draw thread's first frames with the ring. (Not a VRAM ring: that is PCIe traffic.)
+    if (!vram)
+        for (UINT64 at = 0; at < size; at += 4096)
+            cpu[at] = 0;
+    return r;
+}
+// At least `count` rings in that place of at least `size` made or on the way.
+void Request(bool vram, UINT64 size, int count)
+{
+    if (Off())
+        return;
+    std::lock_guard lock(g_mutex);
+    int have = 0;
+    for (const Ready& r : g_ready)
+        have += r.vram == vram && r.size >= size;
+    for (const auto& q : g_queue)
+        have += q.first == vram && q.second >= size;
+    if (have >= count)
+        return;
+    for (int i = have; i < count; i++)
+        g_queue.push_back({ vram, size });
+    if (!g_started)
+    {
+        g_started = true;
+        std::thread([] {
+            SetThreadDescription(GetCurrentThread(), L"gpu ring maker");
+            for (;;)
+            {
+                std::pair<bool, UINT64> job;
+                {
+                    std::unique_lock lock(g_mutex);
+                    g_cv.wait(lock, [] { return !g_queue.empty(); });
+                    job = g_queue.front();
+                }
+                uint8_t* cpu = nullptr;
+                ComPtr<ID3D12Resource> r = Make(job.first, job.second, cpu);
+                std::lock_guard lock(g_mutex);
+                g_queue.pop_front();
+                if (r)
+                    g_ready.push_back({ job.first, job.second, std::move(r), cpu });
+                else
+                    Log("renderer: upload ring of %llu MB in %s could not be made ahead", (unsigned long long)(job.second >> 20), job.first ? "VRAM" : "system memory");
+            }
+        }).detach();
+    }
+    g_cv.notify_one();
+}
+// A ready ring in that place larger than `above` (and at least `atLeast`), if one is.
+bool Take(bool vram, UINT64 above, UINT64 atLeast, ComPtr<ID3D12Resource>& res, uint8_t*& cpu, UINT64& size)
+{
+    if (Off())
+        return false;
+    std::lock_guard lock(g_mutex);
+    for (size_t i = 0; i < g_ready.size(); i++)
+        if (g_ready[i].vram == vram && g_ready[i].size > above && g_ready[i].size >= atLeast)
+        {
+            res = std::move(g_ready[i].res), cpu = g_ready[i].cpu, size = g_ready[i].size;
+            g_ready.erase(g_ready.begin() + i);
+            return true;
+        }
+    return false;
+}
+// Ready rings in that place no larger than `upTo` (overtaken by a ring grown at once): released.
+void Prune(bool vram, UINT64 upTo)
+{
+    std::lock_guard lock(g_mutex);
+    std::erase_if(g_ready, [&](const Ready& r) { return r.vram == vram && r.size <= upTo; });
+}
+} // namespace ringmaker
+
 // Whether the GPU sees guest memory through the placed buffer over it. A driver can open the heap
 // and still not alias it (vkd3d-proton on RADV: the calls succeed and the GPU reads zeros, so
 // in-place vertex fetches draw nothing): a value written by the CPU is copied out by the GPU and
@@ -3517,6 +3633,15 @@ void BeginFrameIfNeeded()
                 Log("renderer memory: uploads decoded to RGBA8 by guest format: %s", expanded.c_str());
         }
     }
+    // (Ahead of an overflow: a slot whose last frame used over 3/4 of its ring gets a ring twice as large made off the
+    // frame, for every slot and, with the other place's ring kept (auto mode), for that place too: ringmaker. At half,
+    // PGR3's race-load frame (132 MB of 256) asked for six 512 MB rings, and making them stalled the race start.)
+    if (const UINT64 used = f.ringUsed.load(); used > f.ringSize / 4 * 3 && f.ringSize * 2 <= kRingMax)
+    {
+        ringmaker::Request(f.ringInVram, f.ringSize * 2, int(kFrames));
+        if (f.ringAlt)
+            ringmaker::Request(!f.ringInVram, f.ringSize * 2, int(kFrames));
+    }
     if (const UINT64 used = f.ringUsed.load(); used > g_ringPeak)
     {
         g_ringPeak = used;
@@ -3551,7 +3676,16 @@ void BeginFrameIfNeeded()
         const auto now = std::chrono::steady_clock::now();
         const float ms = ringAuto.last.time_since_epoch().count() ? std::chrono::duration<float, std::milli>(now - ringAuto.last).count() : 0.0f;
         ringAuto.last = now;
-        if (ringAuto.window < 0 && now >= ringAuto.nextTrial)
+        // (A trial starts once every slot's other-place ring is as large as its ring: made off the frame meanwhile.)
+        bool altsReady = true;
+        if (ringAuto.window < 0 && now >= ringAuto.nextTrial && !ringmaker::Off())
+            for (UINT i = 0; i < kFrames; i++)
+                if (const FrameResources& o = g_r.frames[i]; !o.ringAlt || o.ringAltSize < o.ringSize)
+                {
+                    altsReady = false;
+                    ringmaker::Request(!o.ringInVram, o.ringSize, int(kFrames));
+                }
+        if (ringAuto.window < 0 && now >= ringAuto.nextTrial && altsReady)
         {
             ringAuto.window = 0;
             ringAuto.frames = 0;
@@ -3622,6 +3756,29 @@ void BeginFrameIfNeeded()
             f.ringAltSize = 0;
         }
     }
+    // Larger rings made ahead (ringmaker): this slot's ring and its other-place ring take them now.
+    {
+        ComPtr<ID3D12Resource> r;
+        uint8_t* cpu = nullptr;
+        UINT64 size = 0;
+        if (ringmaker::Take(f.ringInVram, f.ringSize, 0, r, cpu, size))
+        {
+            f.garbage.push_back(f.ring);
+            f.ring = std::move(r), f.ringCpu = cpu, f.ringSize = size;
+            if (frameIndex == 0)
+                Log("renderer: upload ring %llu MB (made ahead)", (unsigned long long)(size >> 20));
+        }
+        if (f.ringAlt && ringmaker::Take(!f.ringInVram, f.ringAltSize, 0, r, cpu, size))
+        {
+            f.garbage.push_back(f.ringAlt);
+            f.ringAlt = std::move(r), f.ringAltCpu = cpu, f.ringAltSize = size;
+        }
+        if (const UINT64 want = g_ringWant.load(); want > f.ringSize && ringmaker::Take(f.ringInVram, f.ringSize, want, r, cpu, size))
+        {
+            f.garbage.push_back(f.ring);
+            f.ring = std::move(r), f.ringCpu = cpu, f.ringSize = size;
+        }
+    }
     if (const UINT64 want = g_ringWant.load(); want > f.ringSize)
     {
         f.garbage.push_back(f.ring); // the old ring may still be referenced by views until this frame's end
@@ -3633,6 +3790,7 @@ void BeginFrameIfNeeded()
             f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
         f.ringSize = want;
         Log("renderer: upload ring grown to %llu MB", (unsigned long long)(want >> 20));
+        ringmaker::Prune(f.ringInVram, want);
     }
     f.ringUsed = 0;
     g_ringGeneration.fetch_add(1, std::memory_order_relaxed); // (threads' ring chunks from before are void: RingAlloc)
