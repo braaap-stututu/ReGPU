@@ -430,6 +430,39 @@ struct Emitter
     }
     uint64_t taint = 0;
     bool psTaint = false;
+
+    // N9 (FM3 port session 43; REGPU_HALF_REGS=1): registers that must stay 32-bit in a pixel shader. Roots: texture
+    // coordinates, predicate, kill and address operands, the depth export; then every register those were computed
+    // from (Precision32 closes over `deps`). A relative register access keeps the whole shader 32-bit.
+    uint64_t full32 = 0;
+    bool relativeRegs = false;
+    std::vector<std::pair<uint32_t, uint64_t>> deps; // dest register <- source registers
+    uint64_t SrcRegs(const Source& s)
+    {
+        if (s.isConstant)
+            return 0;
+        if (s.relative)
+        {
+            relativeRegs = true;
+            return 0;
+        }
+        return 1ull << (s.reg & 63);
+    }
+    uint64_t Precision32() const
+    {
+        uint64_t m = full32;
+        for (bool changed = true; changed;)
+        {
+            changed = false;
+            for (const auto& [dest, src] : deps)
+                if ((m >> dest) & 1 && (m | src) != m)
+                {
+                    m |= src;
+                    changed = true;
+                }
+        }
+        return m;
+    }
     bool curTaint = true; // the instruction being emitted reads a tainted operand
     bool SrcTaint(const Source& s) const
     {
@@ -706,6 +739,30 @@ struct Emitter
             body += ScalarCode(a) + " ";
         }
         curTaint = true;
+        if (pixel)
+        {
+            const uint64_t srcs = SrcRegs(a.src[0]) | SrcRegs(a.src[1]) | SrcRegs(a.src[2]);
+            const uint64_t scalarSrcs = SrcRegs(a.src[2]);
+            const bool vectorRoot = (a.vectorOp >= 20 && a.vectorOp <= 27) || a.vectorOp == 29;
+            const bool scalarRoot = a.scalarOp == 23 || a.scalarOp == 24 || (a.scalarOp >= 27 && a.scalarOp <= 39);
+            if (vectorRoot && !vectorUnused)
+                full32 |= srcs;
+            if (scalarRoot && !scalarKept)
+                full32 |= scalarSrcs;
+            if (a.exportData && a.vectorDest == 61) // the depth export
+                full32 |= srcs;
+            if (a.scalarOp >= 42 && a.scalarOp <= 47) // (a temp spread over the opcode bits: keep it simple)
+                relativeRegs = true;
+            if (!a.exportData)
+            {
+                if (a.vectorMask && !vectorUnused)
+                    deps.push_back({ a.vectorDest & 63, srcs });
+                if (a.scalarMask && !scalarKept)
+                    deps.push_back({ a.scalarDest & 63, scalarSrcs });
+                if (a.scalarDestRelative)
+                    relativeRegs = true;
+            }
+        }
         if (!a.exportData)
         {
             if (vectorTaint && a.vectorMask && !vectorUnused)
@@ -764,6 +821,8 @@ struct Emitter
 
     void EmitFetch(const Fetch& f)
     {
+        if (pixel && f.opcode != 0)
+            full32 |= 1ull << (f.src & 63); // texture coordinates
         std::string body;
         if (f.opcode == 0)
         {
@@ -1802,8 +1861,18 @@ TranslatedShader TranslateShader(const Shader& shader)
             h += "float4 main(VSOut input) : SV_Target0\n{\n";
         // Interpolators land in r0-r15; the generated parameter in the register pinfo.y names.
         std::string inputs;
+        // N9 (REGPU_HALF_REGS=1): registers no coordinate, predicate, address or depth depends on, declared 16-bit
+        // (DXC with REGPU_HALF_REGS compiles them as real halves: dxc.cpp; FXC only as a min-precision hint). Not when a
+        // register is accessed relatively, nor for the generated-parameter register (a pixel position).
+        static const bool halfEnv = getenv("REGPU_HALF_REGS") && atoi(getenv("REGPU_HALF_REGS")) != 0;
+        const bool halfRegs = halfEnv && !e.relativeRegs;
+        static const bool halfInputs = halfEnv && atoi(getenv("REGPU_HALF_REGS")) >= 2;
+        const uint64_t keep32 = halfRegs ? e.Precision32() : ~0ull;
         for (uint32_t n : regs)
-            decl += "    float4 r" + std::to_string(n) + (n < 16 ? " = input.o[" + std::to_string(n) + "];\n" : " = 0;\n");
+            // (r0-r15 can receive the pixel position at run time (pinfo.y), which 16 bits can't hold exactly above 2048:
+            // only with REGPU_HALF_REGS=2.)
+            decl += std::string(halfRegs && !((keep32 >> (n & 63)) & 1) && (n >= 16 || halfInputs) ? "    min16float4 r" : "    float4 r") + std::to_string(n) +
+                (n < 16 ? " = input.o[" + std::to_string(n) + "];\n" : " = 0;\n");
         for (uint32_t n : regs)
             if (n < 16)
                 inputs += "    if (pinfo.y == " + std::to_string(n) + "u) r" + std::to_string(n) + " = float4(((pinfo.z & 65536u) ? floor(input.pos.xy) : input.pos.xy) * pinfo2.yz, input.pcoord);\n";
