@@ -23,6 +23,7 @@ public:
 
     // Module header parts.
     void Capability(spv::Capability c);
+    void Extension(const char* name);
     void EntryPoint(spv::ExecutionModel model, uint32_t function, const char* name, const std::vector<uint32_t>& interface);
     void ExecutionMode(uint32_t function, spv::ExecutionMode mode, std::initializer_list<uint32_t> args = {});
     void Name(uint32_t id, const char* name);
@@ -40,6 +41,8 @@ public:
     uint32_t TypeStruct(const std::vector<uint32_t>& members); // never deduplicated (decorations differ)
     uint32_t TypePointer(spv::StorageClass sc, uint32_t type);
     uint32_t TypeFunction(uint32_t ret, const std::vector<uint32_t>& params = {});
+    // Any other type, deduplicated by its operands (OpTypeImage, OpTypeSampler, OpTypeSampledImage, OpTypeRuntimeArray).
+    uint32_t Type(spv::Op op, const std::vector<uint32_t>& operands);
 
     // Constants (deduplicated).
     uint32_t ConstFloat(float v);
@@ -77,7 +80,7 @@ public:
 private:
     uint32_t next_ = 1;
     uint32_t glsl_ = 0;
-    std::vector<uint32_t> caps_, entry_, modes_, debug_, annotations_, globals_, functions_;
+    std::vector<uint32_t> caps_, exts_, entry_, modes_, debug_, annotations_, globals_, functions_;
     std::vector<uint32_t> fnVars_, fnBody_;
     bool terminated_ = true;
     std::map<std::vector<uint32_t>, uint32_t> dedup_;

@@ -5,11 +5,12 @@
 // Emitter for the subset it supports and returns false with a short reason for the rest, so a renderer can fall
 // back to the HLSL path per shader. Not wired into the renderer.
 //
-// Supported: pixel shaders made of ALU instructions (every vector op but CUBE, every scalar op hlsl.cpp knows),
+// Supported: pixel shaders made of ALU instructions and texture fetches (1D/2D/3D/cube as TFetch, setTexLOD,
+// getGradients, getWeights) (every vector op but CUBE, every scalar op hlsl.cpp knows),
 // predicates, kills, float/bool/loop constants (relative addressing, packed constants), all control flow (exec,
 // conditional exec, jumps, loops, calls), colour and depth exports and the HLSL epilogue (alpha test, alpha to mask,
 // exponent bias, target clamps). Not yet: vertex shaders (the HLSL wrapper: index fetch, rectangles, points,
-// viewport), vertex and texture fetches, the REGPU_PLAIN_MUL_* / REGPU_HYPER_PLAIN_MUL / REGPU_HALF_REGS variants.
+// viewport), vertex fetches, the REGPU_PLAIN_MUL_* / REGPU_HYPER_PLAIN_MUL / REGPU_HALF_REGS variants.
 #include <cstdint>
 #include <string>
 #include <vector>

@@ -27,6 +27,10 @@ struct Translator
     uint32_t r = 0, ps = 0, p = 0, a0 = 0, aL = 0, oC[4] = {}, oD = 0;
     uint32_t cfpc = 0, loopCount = 0, loopSaved = 0, loopDepth = 0, callRet = 0, callDepth = 0, guard = 0;
     uint32_t regCount = 1;
+    uint32_t regLod = 0; // setTexLOD's value (hlsl.cpp's regLod)
+    // Texture fetch resources, made at the first fetch (InitTextures).
+    bool texInit = false;
+    uint32_t tV3 = 0, tIV2 = 0, tSampler = 0, tImg2 = 0, tImgC = 0, tImg3 = 0, gtex = 0, gcube = 0, gvol = 0, gsamp = 0;
     bool exportsDepth = false;
     uint8_t rank[256] = {};
 
@@ -141,8 +145,6 @@ struct Translator
 
     bool CheckAlu(const Alu& a)
     {
-        if (a.vectorOp == 18)
-            return why = "vector op CUBE", false;
         if (a.vectorOp > 29)
             return why = "vector op " + std::to_string(a.vectorOp), false;
         if (a.scalarOp == 41 || a.scalarOp > 50)
@@ -150,10 +152,27 @@ struct Translator
         return true;
     }
 
+    // CUBE (hlsl.cpp's CubeOp; the operands are v.zzxy and v.yxzz, the first carries v): (tc, sc, 2 * major axis, face).
+    uint32_t CubeOp(uint32_t A)
+    {
+        const uint32_t vx = Comp(A, 2), vy = Comp(A, 3), vz = Comp(A, 0);
+        const uint32_t mx = b.Ext(tF, GLSLstd450FAbs, { vx }), my = b.Ext(tF, GLSLstd450FAbs, { vy }), mz = b.Ext(tF, GLSLstd450FAbs, { vz });
+        auto ge = [&](uint32_t x, uint32_t y) { return Bin(spv::OpFOrdGreaterThanEqual, tB, x, y); };
+        auto neg = [&](uint32_t x) { return b.Op(spv::OpFNegate, tF, { x }); };
+        auto lt0 = [&](uint32_t x) { return Bin(spv::OpFOrdLessThan, tB, x, F(0)); };
+        const uint32_t zMajor = And(ge(mz, mx), ge(mz, my)), yMajor = ge(my, mx);
+        const uint32_t ma = SelF(zMajor, vz, SelF(yMajor, vy, vx));
+        const uint32_t face = SelF(zMajor, SelF(lt0(vz), F(5), F(4)), SelF(yMajor, SelF(lt0(vy), F(3), F(2)), SelF(lt0(vx), F(1), F(0))));
+        const uint32_t sc = SelF(zMajor, SelF(lt0(vz), neg(vx), vx), SelF(yMajor, vx, SelF(lt0(vx), vz, neg(vz))));
+        const uint32_t tc = SelF(zMajor, neg(vy), SelF(yMajor, SelF(lt0(vy), neg(vz), vz), neg(vy)));
+        return Vec4(tc, sc, Bin(spv::OpFMul, tF, F(2), b.Ext(tF, GLSLstd450FAbs, { ma })), face);
+    }
+
     uint32_t VectorOp(const Alu& a, uint32_t A, uint32_t B, uint32_t C)
     {
         switch (a.vectorOp)
         {
+        case 18: return CubeOp(A);
         case 0: return Bin(spv::OpFAdd, tV4, A, B);
         case 1: return Mul9(A, B, true);
         case 2: case 29: return b.Ext(tV4, GLSLstd450FMax, { A, B });
@@ -378,6 +397,297 @@ struct Translator
             EmitAluBody(a);
     }
 
+
+    // ---- Texture fetches (hlsl.cpp's TFetch / TFetchRaw, the same results) ----
+    uint32_t UBits(uint32_t v, uint32_t shift, uint32_t mask)
+    {
+        return Bin(spv::OpBitwiseAnd, tU, shift ? Bin(spv::OpShiftRightLogical, tU, v, U(shift)) : v, U(mask));
+    }
+    uint32_t UBit(uint32_t v, uint32_t shift) { return Bin(spv::OpINotEqual, tB, UBits(v, shift, 1), U(0)); }
+    uint32_t UEq(uint32_t v, uint32_t c) { return Bin(spv::OpIEqual, tB, v, U(c)); }
+    uint32_t SelU(uint32_t c, uint32_t x, uint32_t y) { return b.Op(spv::OpSelect, tU, { c, x, y }); }
+    uint32_t Fract(uint32_t x) { return b.Ext(tF, GLSLstd450Fract, { x }); }
+    uint32_t FAbs(uint32_t x) { return b.Ext(tF, GLSLstd450FAbs, { x }); }
+    uint32_t FMax(uint32_t x, uint32_t y) { return b.Ext(tF, GLSLstd450FMax, { x, y }); }
+    uint32_t FMin(uint32_t x, uint32_t y) { return b.Ext(tF, GLSLstd450FMin, { x, y }); }
+    uint32_t FAdd(uint32_t x, uint32_t y) { return Bin(spv::OpFAdd, tF, x, y); }
+    uint32_t FSub(uint32_t x, uint32_t y) { return Bin(spv::OpFSub, tF, x, y); }
+    uint32_t FMulS(uint32_t x, uint32_t y) { return Bin(spv::OpFMul, tF, x, y); }
+    uint32_t FDiv(uint32_t x, uint32_t y) { return Bin(spv::OpFDiv, tF, x, y); }
+    uint32_t FLt(uint32_t x, uint32_t y) { return Bin(spv::OpFOrdLessThan, tB, x, y); }
+    uint32_t FGt(uint32_t x, uint32_t y) { return Bin(spv::OpFOrdGreaterThan, tB, x, y); }
+    uint32_t FGe(uint32_t x, uint32_t y) { return Bin(spv::OpFOrdGreaterThanEqual, tB, x, y); }
+    uint32_t Vec2(uint32_t x, uint32_t y) { return b.Op(spv::OpCompositeConstruct, tV2, { x, y }); }
+    uint32_t Vec3(uint32_t x, uint32_t y, uint32_t z) { return b.Op(spv::OpCompositeConstruct, tV3, { x, y, z }); }
+
+    void InitTextures()
+    {
+        if (texInit)
+            return;
+        texInit = true;
+        b.Capability(spv::CapabilityImageQuery);
+        b.Capability(spv::CapabilityRuntimeDescriptorArrayEXT);
+        b.Extension("SPV_EXT_descriptor_indexing");
+        tV3 = b.TypeVector(tF, 3);
+        tIV2 = b.TypeVector(tI, 2);
+        tSampler = b.Type(spv::OpTypeSampler, {});
+        auto image = [&](spv::Dim d) {
+            return b.Type(spv::OpTypeImage, { tF, uint32_t(d), 0, 0, 0, 1, uint32_t(spv::ImageFormatUnknown) });
+        };
+        tImg2 = image(spv::Dim2D);
+        tImgC = image(spv::DimCube);
+        tImg3 = image(spv::Dim3D);
+        // Bindless arrays (gpu/vk/bindings.h): set 1 gtex, set 2 gcube, set 3 gvol, binding 0 each; the samplers s0-s7 as
+        // set 0 binding 200.
+        auto array = [&](uint32_t type, uint32_t set, const char* name) {
+            const uint32_t a = b.Type(spv::OpTypeRuntimeArray, { type });
+            const uint32_t v = b.GlobalVariable(b.TypePointer(spv::StorageClassUniformConstant, a), spv::StorageClassUniformConstant);
+            b.Decorate(v, spv::DecorationDescriptorSet, { set });
+            b.Decorate(v, spv::DecorationBinding, { 0 });
+            b.Name(v, name);
+            return v;
+        };
+        gtex = array(tImg2, 1, "gtex");
+        gcube = array(tImgC, 2, "gcube");
+        gvol = array(tImg3, 3, "gvol");
+        gsamp = b.GlobalVariable(b.TypePointer(spv::StorageClassUniformConstant, b.TypeArray(tSampler, 8)), spv::StorageClassUniformConstant);
+        b.Decorate(gsamp, spv::DecorationDescriptorSet, { 0 });
+        b.Decorate(gsamp, spv::DecorationBinding, { 200 });
+        b.Name(gsamp, "gSamplers");
+    }
+
+    // A sampled image from a bindless array's element and sampler s (0 linear wrap, 1 linear clamp, 2 point clamp,
+    // 3 point wrap, 4-7 anisotropic wrap).
+    uint32_t SampledImage(uint32_t array, uint32_t imageType, uint32_t index, uint32_t s, uint32_t* imageOut = nullptr)
+    {
+        const uint32_t img = Load(imageType, b.Op(spv::OpAccessChain, b.TypePointer(spv::StorageClassUniformConstant, imageType), { array, index }));
+        if (imageOut)
+            *imageOut = img;
+        const uint32_t smp = Load(tSampler, b.Op(spv::OpAccessChain, b.TypePointer(spv::StorageClassUniformConstant, tSampler), { gsamp, s }));
+        return b.Op(spv::OpSampledImage, b.Type(spv::OpTypeSampledImage, { imageType }), { img, smp });
+    }
+    // level: sampled at max(bias, 0) (the vertex path, a pixel fetch without computed LOD); else with the bias.
+    uint32_t Sample(uint32_t si, uint32_t coord, bool level, uint32_t bias)
+    {
+        if (level)
+            return b.Op(spv::OpImageSampleExplicitLod, tV4, { si, coord, uint32_t(spv::ImageOperandsLodMask), FMax(bias, F(0)) });
+        return b.Op(spv::OpImageSampleImplicitLod, tV4, { si, coord, uint32_t(spv::ImageOperandsBiasMask), bias });
+    }
+
+    // Xenia's PWLGammaToLinear.
+    uint32_t PwlGammaToLinear(uint32_t g)
+    {
+        g = Saturate(g, false);
+        const uint32_t hi = FGe(g, F(96.0f / 255.0f)), top = FGe(g, F(192.0f / 255.0f)), mid = FGe(g, F(64.0f / 255.0f));
+        const uint32_t scale = SelF(hi, SelF(top, F(8.0f / 1024.0f), F(4.0f / 1024.0f)), SelF(mid, F(2.0f / 1024.0f), F(1.0f / 1024.0f)));
+        const uint32_t offset = SelF(hi, SelF(top, F(-1024.0f), F(-256.0f)), SelF(mid, F(-64.0f), F(0.0f)));
+        uint32_t l = FAdd(FMulS(g, FMulS(F(255.0f * 1024.0f), scale)), offset);
+        l = FAdd(l, b.Ext(tF, GLSLstd450Trunc, { FMulS(l, scale) }));
+        return FDiv(l, F(1023.0f));
+    }
+
+    // hlsl.cpp's Fixed16Fetch, per component.
+    uint32_t Fixed16(uint32_t v, uint32_t info)
+    {
+        const uint32_t copy = UBits(info, 4, 3), mode = UBits(info, 14, 3), comps = Bin(spv::OpShiftLeftLogical, tU, U(1), UBits(info, 2, 3));
+        uint32_t c[4];
+        for (uint32_t i = 0; i < 4; i++)
+        {
+            const uint32_t x = Comp(v, i);
+            const uint32_t stored = SelF(UEq(copy, 1), b.Ext(tF, GLSLstd450RoundEven, { FMulS(Saturate(x, false), F(65535.0f)) }),
+                SelF(UEq(copy, 2), b.Ext(tF, GLSLstd450RoundEven, { FMulS(b.Ext(tF, GLSLstd450FClamp, { x, F(-1), F(1) }), F(32767.0f)) }), x));
+            const uint32_t asSigned = FSub(stored, SelF(FGe(stored, F(32768.0f)), F(65536.0f), F(0)));
+            const uint32_t asUnsigned = FAdd(stored, SelF(FLt(stored, F(0)), F(65536.0f), F(0)));
+            const uint32_t r = SelF(UEq(mode, 1), FDiv(asUnsigned, F(65535.0f)),
+                SelF(UEq(mode, 2), FMax(FDiv(asSigned, F(32767.0f)), F(-1)), SelF(UEq(mode, 3), asUnsigned, asSigned)));
+            const uint32_t use = i == 0 ? b.ConstBool(true) : Bin(spv::OpUGreaterThanEqual, tB, comps, U(i == 1 ? 2 : 4));
+            c[i] = SelF(use, r, x);
+        }
+        const uint32_t converted = Vec4(c[0], c[1], c[2], c[3]);
+        return b.Op(spv::OpSelect, tV4, { Splat4B(UBit(info, 6)), converted, v });
+    }
+
+    // TFetch(slot, coord, denorm, level, bias, texel) with the instruction's filter override (filt 0 point, 1 linear,
+    // -1 the constant's) and gLevelWrap = level.
+    uint32_t TexFetch(uint32_t slot, uint32_t coord, bool denorm, bool level, uint32_t bias, float ox, float oy, int filt)
+    {
+        InitTextures();
+        const uint32_t ti = Load(tUV4, b.Op(spv::OpAccessChain, pUniUV4, { cb, I(5), I(int32_t(slot)) }));
+        const uint32_t tb = Load(tV4, b.Op(spv::OpAccessChain, pUniV4, { cb, I(6), I(int32_t(slot)) }));
+        const uint32_t info = Comp(ti, 0, tU), w = Comp(ti, 3, tU);
+        const uint32_t index = b.Op(spv::OpBitcast, tU, { Comp(tb, 1) });
+        const uint32_t dim = UBits(w, 0, 0xFF);
+        const uint32_t result = b.Variable(pFnV4), border = b.Variable(pFnB);
+        Store(border, b.ConstBool(false));
+        const uint32_t cx = Comp(coord, 0), cy = Comp(coord, 1), cz = Comp(coord, 2);
+        b.If(UEq(dim, 2), [&] {
+            // 3D: the constant's own mode (no override), linear clamp at a level.
+            const uint32_t vmode = UBits(info, 0, 3);
+            Store(result, Sample(SampledImage(gvol, tImg3, index, level ? U(1) : vmode), Vec3(cx, cy, cz), level, bias));
+        }, [&] {
+            b.If(UEq(dim, 3), [&] {
+                // Cube: (s, t, face) from the CUBE instruction back to a direction (CubeDirection).
+                const uint32_t sc = FMulS(FSub(cx, F(1.5f)), F(2)), tc = FMulS(FSub(cy, F(1.5f)), F(2));
+                const uint32_t face = b.Op(spv::OpConvertFToU, tU, { b.Ext(tF, GLSLstd450RoundEven, { cz }) });
+                const uint32_t nsc = b.Op(spv::OpFNegate, tF, { sc }), ntc = b.Op(spv::OpFNegate, tF, { tc });
+                auto pick = [&](uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3, uint32_t v4, uint32_t v5) {
+                    return SelF(UEq(face, 0), v0, SelF(UEq(face, 1), v1, SelF(UEq(face, 2), v2, SelF(UEq(face, 3), v3, SelF(UEq(face, 4), v4, v5)))));
+                };
+                const uint32_t dx = pick(F(1), F(-1), sc, sc, sc, nsc), dy = pick(ntc, ntc, F(1), F(-1), ntc, ntc),
+                               dz = pick(nsc, sc, tc, ntc, F(1), F(-1));
+                Store(result, Sample(SampledImage(gcube, tImgC, index, U(1)), Vec3(dx, dy, dz), level, bias));
+            }, [&] {
+                // 2D.
+                const uint32_t sx = b.Op(spv::OpConvertUToF, tF, { b.Ext(tU, GLSLstd450UMax, { UBits(Comp(ti, 1, tU), 0, 0xFFFF), U(1) }) });
+                const uint32_t sy = b.Op(spv::OpConvertUToF, tF, { b.Ext(tU, GLSLstd450UMax, { UBits(Comp(ti, 2, tU), 0, 0xFFFF), U(1) }) });
+                uint32_t u = denorm ? FDiv(FAdd(cx, F(ox)), sx) : FAdd(cx, FDiv(F(ox), sx));
+                uint32_t v = denorm ? FDiv(FAdd(cy, F(oy)), sy) : FAdd(cy, FDiv(F(oy), sy));
+                auto mirror = [&](uint32_t x) { return FSub(F(1), FAbs(FSub(FMulS(Fract(FMulS(x, F(0.5f))), F(2)), F(1)))); };
+                u = SelF(UBit(info, 28), mirror(u), u);
+                v = SelF(UBit(info, 29), mirror(v), v);
+                u = SelF(UBit(info, 30), FAbs(u), u);
+                v = SelF(UBit(info, 31), FAbs(v), v);
+                const uint32_t outside = Or(Or(FLt(u, F(0)), FGt(u, F(1))), Or(FLt(v, F(0)), FGt(v, F(1))));
+                b.If(And(UBit(info, 16), outside), [&] {
+                    Store(border, b.ConstBool(true));
+                    Store(result, b.Op(spv::OpSelect, tV4, { Splat4B(UBit(info, 17)), One4(), Zero4() }));
+                }, [&] {
+                    const uint32_t hx = FDiv(F(0.5f), sx), hy = FDiv(F(0.5f), sy);
+                    uint32_t uu = SelF(UBit(info, 18), b.Ext(tF, GLSLstd450FClamp, { u, hx, FSub(F(1), hx) }), u);
+                    uint32_t vv = SelF(UBit(info, 19), b.Ext(tF, GLSLstd450FClamp, { v, hy, FSub(F(1), hy) }), v);
+                    const uint32_t sub = FGt(Comp(tb, 2), F(0));
+                    uu = SelF(sub, FMulS(uu, Comp(tb, 2)), uu);
+                    vv = SelF(sub, FMulS(vv, Comp(tb, 3)), vv);
+                    // FetchMode: the constant's mode, its filter replaced by the instruction's.
+                    uint32_t mode = UBits(info, 0, 3);
+                    if (filt == 0 || filt == 1)
+                    {
+                        const uint32_t wrap = Or(UEq(mode, 0), UEq(mode, 3));
+                        mode = filt == 0 ? SelU(wrap, U(3), U(2)) : SelU(wrap, U(0), U(1));
+                    }
+                    // The sampler: at a level the mode itself (gLevelWrap); else modes 1-3 theirs, mode 0 the anisotropy's
+                    // (tinfo.x bits 20-22: 1-4 = s4-s7) or linear wrap.
+                    uint32_t s = mode;
+                    if (!level)
+                    {
+                        const uint32_t aniso = UBits(info, 20, 7);
+                        const uint32_t anisoS = SelU(And(Bin(spv::OpUGreaterThanEqual, tB, aniso, U(1)), Bin(spv::OpULessThanEqual, tB, aniso, U(4))),
+                            Bin(spv::OpIAdd, tU, aniso, U(3)), U(0));
+                        s = SelU(UEq(mode, 0), anisoS, mode);
+                    }
+                    uint32_t img = 0;
+                    const uint32_t si = SampledImage(gtex, tImg2, index, s, &img);
+                    if (!level)
+                    {
+                        // A point fetch within 1/16 of a texel of a boundary goes onto it, 1/512 back (pinfo.z bit 17).
+                        const uint32_t snap = And(Or(UEq(mode, 2), UEq(mode, 3)), PinfoBit(131072));
+                        const uint32_t size = b.Op(spv::OpImageQuerySizeLod, tIV2, { img, I(0) });
+                        const uint32_t dw = b.Op(spv::OpConvertSToF, tF, { Comp(size, 0, tI) }), dh = b.Op(spv::OpConvertSToF, tF, { Comp(size, 1, tI) });
+                        auto snapAxis = [&](uint32_t x, uint32_t d) {
+                            const uint32_t at = FMulS(x, d), edge = b.Ext(tF, GLSLstd450RoundEven, { at });
+                            const uint32_t near = FLt(FAbs(FSub(at, edge)), F(1.0f / 16.0f));
+                            return FDiv(SelF(near, FSub(edge, F(1.0f / 512.0f)), at), d);
+                        };
+                        uu = SelF(snap, snapAxis(uu, dw), uu);
+                        vv = SelF(snap, snapAxis(vv, dh), vv);
+                    }
+                    Store(result, Sample(si, Vec2(uu, vv), level, bias));
+                });
+            });
+        });
+        // TFetch: the 16-bit fixed conversion (not of the border colour), gamma, exponent, the constant's swizzle.
+        uint32_t t = Load(tV4, result);
+        t = b.Op(spv::OpSelect, tV4, { Splat4B(Load(tB, border)), t, Fixed16(t, info) });
+        const uint32_t gamma = UBits(info, 24, 15);
+        uint32_t c[4];
+        for (uint32_t i = 0; i < 4; i++)
+            c[i] = SelF(UBit(gamma, i), PwlGammaToLinear(Comp(t, i)), Comp(t, i));
+        t = Vec4(c[0], c[1], c[2], c[3]);
+        const uint32_t expAdjust = Bin(spv::OpShiftRightArithmetic, tI, b.Op(spv::OpBitcast, tI, { Bin(spv::OpShiftLeftLogical, tU, info, U(18)) }), I(26));
+        t = b.Op(spv::OpVectorTimesScalar, tV4, { t, b.Ext(tF, GLSLstd450Exp2, { b.Op(spv::OpConvertSToF, tF, { expAdjust }) }) });
+        for (uint32_t i = 0; i < 4; i++)
+        {
+            const uint32_t sel = UBits(w, 8 + 3 * i, 7);
+            const uint32_t picked = b.Op(spv::OpVectorExtractDynamic, tF, { t, b.Ext(tU, GLSLstd450UMin, { sel, U(3) }) });
+            c[i] = SelF(Bin(spv::OpULessThan, tB, sel, U(4)), picked, SelF(UEq(sel, 5), F(1), F(0)));
+        }
+        const uint32_t swizzled = Vec4(c[0], c[1], c[2], c[3]);
+        return b.Op(spv::OpSelect, tV4, { Splat4B(UBit(w, 31)), swizzled, t });
+    }
+
+    // hlsl.cpp's DestSwizzleWrite: per component 0-3 a value component, 4 zero, 5 one, 6-7 kept.
+    void DestSwizzleWrite(uint32_t dest, uint32_t swizzle, uint32_t value)
+    {
+        const uint32_t ptr = RegPtr(dest), old = Load(tV4, ptr);
+        uint32_t c[4];
+        for (uint32_t i = 0; i < 4; i++)
+        {
+            const uint32_t sel = (swizzle >> (3 * i)) & 7;
+            c[i] = sel < 4 ? Comp(value, sel) : sel == 4 ? F(0) : sel == 5 ? F(1) : Comp(old, i);
+        }
+        Store(ptr, Vec4(c[0], c[1], c[2], c[3]));
+    }
+
+    void EmitFetchBody(const Fetch& f)
+    {
+        const uint32_t src = Load(tV4, RegPtr(f.src));
+        auto comp = [&](uint32_t i) { return Comp(src, (f.srcSwizzle >> (2 * i)) & 3); };
+        if (f.opcode == 1)
+        {
+            // A 1D fetch reads x at the row's centre (REGPU_NO_1D_TEXTURES: as 2D).
+            static const bool no1d = getenv("REGPU_NO_1D_TEXTURES") != nullptr;
+            InitTextures();
+            const uint32_t coord = f.dimension == 0 && !no1d ? Vec3(comp(0), F(0.5f), F(0)) : Vec3(comp(0), comp(1), comp(2));
+            static const bool noRegisterLod = getenv("REGPU_NO_REGISTER_LOD") != nullptr;
+            const bool level = !noRegisterLod && !f.useComputedLod;
+            const uint32_t tb = Load(tV4, b.Op(spv::OpAccessChain, pUniV4, { cb, I(6), I(int32_t(f.constIndex)) }));
+            uint32_t bias = FAdd(F(f.lodBias), Comp(tb, 0));
+            if (!noRegisterLod && f.useRegisterLod)
+                bias = FAdd(Load(tF, regLod), bias);
+            static const bool noOverride = getenv("REGPU_NO_FETCH_FILTER_OVERRIDE") != nullptr;
+            const int filt = !noOverride && (f.magFilter == 0 || f.magFilter == 1) ? int(f.magFilter) : -1;
+            DestSwizzleWrite(f.dest, f.destSwizzle, TexFetch(f.constIndex, coord, f.denormalized, level, bias, f.offsetX, f.offsetY, filt));
+        }
+        else if (f.opcode == 24)
+            Store(regLod, comp(0)); // setTexLOD
+        else if (f.opcode == 18)
+        {
+            // getGradients: (ddx(a), ddy(a), ddx(b), ddy(b)).
+            const uint32_t a = comp(0), c = comp(1);
+            DestSwizzleWrite(f.dest, f.destSwizzle, Vec4(b.Op(spv::OpDPdx, tF, { a }), b.Op(spv::OpDPdy, tF, { a }), b.Op(spv::OpDPdx, tF, { c }),
+                                                        b.Op(spv::OpDPdy, tF, { c })));
+        }
+        else if (f.opcode == 19 && !getenv("REGPU_NO_TEXTURE_WEIGHTS"))
+        {
+            // getWeights: the bilinear weights at these coordinates (0 for point filtering).
+            uint32_t x = comp(0), y = comp(1);
+            if (!f.denormalized)
+            {
+                const uint32_t ti = Load(tUV4, b.Op(spv::OpAccessChain, pUniUV4, { cb, I(5), I(int32_t(f.constIndex)) }));
+                x = FMulS(x, b.Op(spv::OpConvertUToF, tF, { b.Ext(tU, GLSLstd450UMax, { UBits(Comp(ti, 1, tU), 0, 0xFFFF), U(1) }) }));
+                y = FMulS(y, b.Op(spv::OpConvertUToF, tF, { b.Ext(tU, GLSLstd450UMax, { UBits(Comp(ti, 2, tU), 0, 0xFFFF), U(1) }) }));
+            }
+            x = FSub(FAdd(x, F(f.offsetX)), F(0.5f));
+            y = FSub(FAdd(y, F(f.offsetY)), F(0.5f));
+            DestSwizzleWrite(f.dest, f.destSwizzle, f.magFilter == 0 ? Zero4() : Vec4(Fract(x), Fract(y), F(0), F(0)));
+        }
+        else
+            DestSwizzleWrite(f.dest, f.destSwizzle, Zero4()); // other texture queries
+    }
+
+    void EmitFetch(const Fetch& f)
+    {
+        if (f.predicated)
+        {
+            uint32_t c = Load(tB, p);
+            if (!f.predCondition)
+                c = Not(c);
+            b.If(c, [&] { EmitFetchBody(f); });
+        }
+        else
+            EmitFetchBody(f);
+    }
+
     void EmitExec(const Cf& cf)
     {
         for (uint32_t k = 0; k < cf.count(); k++)
@@ -386,6 +696,8 @@ struct Translator
             const uint32_t* w = &shader.words[index * 3];
             if (!((cf.sequence() >> (2 * k)) & 1))
                 EmitAlu(DecodeAlu(w));
+            else
+                EmitFetch(DecodeFetch(w));
         }
     }
 
@@ -592,7 +904,15 @@ struct Translator
                 if ((cf.sequence() >> (2 * k)) & 1)
                 {
                     const Fetch f = DecodeFetch(w);
-                    return why = f.opcode == 0 ? "vertex fetch" : f.opcode == 1 ? "texture fetch" : "fetch op " + std::to_string(f.opcode), false;
+                    if (f.opcode == 0)
+                        return why = "vertex fetch", false;
+                    if (f.opcode == 1 && f.dimension > 3)
+                        return why = "texture fetch dimension " + std::to_string(f.dimension), false;
+                    if (f.opcode == 1 || f.opcode == 24 || f.opcode == 19)
+                        useReg(f.src), useReg(f.dest);
+                    else
+                        useReg(f.dest), useReg(f.src);
+                    continue;
                 }
                 const Alu a = DecodeAlu(w);
                 if (!CheckAlu(a))
@@ -646,15 +966,16 @@ struct Translator
         pUniU = b.TypePointer(spv::StorageClassUniform, tU);
         pInV4 = b.TypePointer(spv::StorageClassInput, tV4);
 
-        // PSConstants (hlsl.cpp's preamble; DX layout = std140 for these members). Only the members up to pinfo2.
-        const uint32_t aC = b.TypeArray(tV4, 256), aB = b.TypeArray(tUV4, 2), aL8 = b.TypeArray(tUV4, 8);
-        b.Decorate(aC, spv::DecorationArrayStride, { 16 });
-        b.Decorate(aB, spv::DecorationArrayStride, { 16 });
-        b.Decorate(aL8, spv::DecorationArrayStride, { 16 });
-        const uint32_t block = b.TypeStruct({ aC, aB, aL8, tUV4, tV4 });
+        // PSConstants (hlsl.cpp's preamble; DX layout = std140 for these members): pc, pb, pl, pinfo, pinfo2, tinfo[32],
+        // tbias[32].
+        const uint32_t aC = b.TypeArray(tV4, 256), aB = b.TypeArray(tUV4, 2), aL8 = b.TypeArray(tUV4, 8), aTi = b.TypeArray(tUV4, 32),
+                       aTb = b.TypeArray(tV4, 32);
+        for (uint32_t a : { aC, aB, aL8, aTi, aTb })
+            b.Decorate(a, spv::DecorationArrayStride, { 16 });
+        const uint32_t block = b.TypeStruct({ aC, aB, aL8, tUV4, tV4, aTi, aTb });
         b.Decorate(block, spv::DecorationBlock);
-        const uint32_t offsets[] = { 0, 4096, 4128, 4256, 4272 };
-        for (uint32_t m = 0; m < 5; m++)
+        const uint32_t offsets[] = { 0, 4096, 4128, 4256, 4272, 4288, 4800 };
+        for (uint32_t m = 0; m < 7; m++)
             b.MemberDecorate(block, m, spv::DecorationOffset, { offsets[m] });
         b.Name(block, "PSConstants");
         cb = b.GlobalVariable(b.TypePointer(spv::StorageClassUniform, block), spv::StorageClassUniform);
@@ -695,6 +1016,8 @@ struct Translator
         for (uint32_t& c : oC)
             c = b.Variable(pFnV4);
         oD = b.Variable(pFnV4);
+        regLod = b.Variable(pFnF);
+        Store(regLod, F(0));
 
         // Prologue: interpolators in r0-r15, the generated parameter in the register pinfo.y names.
         const uint32_t pos = Load(tV4, inPos);

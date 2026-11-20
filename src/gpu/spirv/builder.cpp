@@ -93,6 +93,15 @@ uint32_t Builder::Unique(spv::Op op, const std::vector<uint32_t>& rest, bool has
     return id;
 }
 
+uint32_t Builder::Type(spv::Op op, const std::vector<uint32_t>& operands) { return Unique(op, operands, false); }
+
+void Builder::Extension(const char* name)
+{
+    std::vector<uint32_t> ops;
+    String(ops, name);
+    Emit(exts_, spv::OpExtension, ops);
+}
+
 uint32_t Builder::TypeVoid() { return Unique(spv::OpTypeVoid, {}, false); }
 uint32_t Builder::TypeBool() { return Unique(spv::OpTypeBool, {}, false); }
 uint32_t Builder::TypeFloat() { return Unique(spv::OpTypeFloat, { 32 }, false); }
@@ -258,6 +267,7 @@ std::vector<uint32_t> Builder::Finish()
 {
     std::vector<uint32_t> w{ spv::MagicNumber, 0x00010300, 0, 0, 0 };
     w.insert(w.end(), caps_.begin(), caps_.end());
+    w.insert(w.end(), exts_.begin(), exts_.end());
     {
         std::vector<uint32_t> ops{ glsl_ };
         String(ops, "GLSL.std.450");

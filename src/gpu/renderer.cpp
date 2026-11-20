@@ -37,6 +37,7 @@
 #include <windows.h>
 
 #include "gpu/hlsl.h"
+#include "gpu/spirv/translate.h"
 #include "gpu/xess.h"
 #include "gpu/dlss.h"
 #include "gpu/fsr3.h"
@@ -843,6 +844,7 @@ struct CompiledShader
     mutable const CompiledShader* motion = nullptr; // its motion-vector variant, once looked up
     mutable const CompiledShader* noKill = nullptr; // pixel shaders: the variant without the alpha test (NoKillShader)
     uint32_t tag = 0; // the game's mark for this shader (Host::rewriteShader), passed to Host::onDraw
+    bool direct = false; // its SPIR-V came from the direct translator (REGPU_SPIRV_DIRECT), not HLSL and DXC
     bool IsReady() const { return state.load(std::memory_order_acquire) == Ready; }
 };
 
@@ -5840,6 +5842,8 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
     ScanBlockUse(cs.info);
     if (!cs.tag)
         PackConstants(cs.info, pixel);
+    // (The HLSL as translated, to tell whether a debug edit below changed it: REGPU_SPIRV_DIRECT.)
+    const std::string translatedHlsl = cs.info.hlsl;
     if (g_dumpHlsl)
     {
         std::filesystem::create_directories("out/hlsl");
@@ -5956,6 +5960,39 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
                 cs.info.hlsl.replace(at, 13, "return " + expr + ";");
             Log("debug: ps alias %016llx returns %s", (unsigned long long)hash, expr.c_str());
         }
+    }
+    // REGPU_SPIRV_DIRECT=1 (EXPERIMENTAL, start-time): pixel shaders straight from the microcode to SPIR-V
+    // (gpu/spirv/translate.h, ~1 ms here instead of HLSL and DXC's 100-900 ms), those the direct translator supports
+    // and the game hasn't rewritten or a debug edit changed; the rest, and every variant (motion, no-kill, fetch), keep
+    // the HLSL path. Its fetches follow the full TFetch (with the instruction's filter override) whatever
+    // REGPU_LEAN_FETCH says. Not cached on disk; logged once per shader that falls back.
+    static const bool direct = getenv("REGPU_SPIRV_DIRECT") && strcmp(getenv("REGPU_SPIRV_DIRECT"), "0") != 0;
+    if (direct && pixel && !cs.tag && cs.info.hlsl == translatedHlsl)
+    {
+        const auto start = std::chrono::steady_clock::now();
+        std::vector<uint32_t> words;
+        std::string why;
+        if (TranslateSpirv(parsed, cs.info, words, why))
+        {
+            auto code = std::make_shared<SpirvCode>();
+            code->words = std::move(words);
+            cs.code = std::move(code);
+            cs.direct = true;
+            cs.cacheKey = Fnv(cs.info.hlsl.data(), cs.info.hlsl.size(), 3); // (apart from the HLSL path's)
+            cs.state = CompiledShader::Ready;
+            static std::atomic<uint32_t> count{ 0 };
+            static std::atomic<uint64_t> micros{ 0 };
+            const uint64_t us = uint64_t(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count());
+            const uint32_t n = ++count;
+            micros += us;
+            if (n == 1 || n % 100 == 0)
+                Log("spirv direct: %u pixel shaders translated directly (%.2f ms average)", n, double(micros.load()) / 1000.0 / n);
+            g_stats.shadersBuilt++;
+            return cs;
+        }
+        static std::atomic<uint32_t> fallbacks{ 0 };
+        if (fallbacks++ < 40)
+            Log("spirv direct: ps %016llx falls back to HLSL: %s", (unsigned long long)hash, why.c_str());
     }
     cs.cacheKey = Fnv(cs.info.hlsl.data(), cs.info.hlsl.size(), pixel ? 1 : 2);
     if (auto b = g_bytecode.find(cs.cacheKey); b != g_bytecode.end())
