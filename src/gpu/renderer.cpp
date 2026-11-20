@@ -911,9 +911,6 @@ struct FrameResources
     UINT64 ringSize = 0; // this slot's ring (grows, see RingAlloc)
     // REGPU_GPU_UPLOAD_RING (live): the same ring in a GPU upload heap (VRAM the CPU writes through resizable BAR),
     // swapped with `ring` at the frame start; made only when the device reports GPU upload heaps.
-    ComPtr<ID3D12Resource> ringAlt;
-    uint8_t* ringAltCpu = nullptr;
-    UINT64 ringAltSize = 0;
     bool ringInVram = false;
     std::atomic<UINT64> ringUsed{ 0 }; // draw workers allocate concurrently
     // Guest ranges already uploaded this frame: (address << 32 | bytes) -> (offset, sample hash).
@@ -928,15 +925,22 @@ struct FrameResources
     size_t poolUsed = 0;
 
     // Vulkan (docs/vulkan-conversion-plan.md, step 6: these replace the D3D12 members above, which go once unused).
-    VkCommandPool vkPool = VK_NULL_HANDLE;          // this slot's command buffers (reset when the slot is reused)
-    std::vector<VkCommandBuffer> vkBuffers;         // allocated from vkPool; vkBuffersUsed of them used this frame
-    size_t vkBuffersUsed = 0;
+    // This slot's command buffers (allocator, pool, poolUsed), by pool: 0 the main stream (used by its replay thread, or
+    // by the draw thread while the replay is idle), 1.. one per thread that translates draw pieces (a command pool is
+    // used by one thread at a time). Reset when the slot comes round again.
+    struct VkPoolSet
+    {
+        VkCommandPool pool = VK_NULL_HANDLE;
+        std::vector<VkCommandBuffer> buffers;
+        size_t used = 0;
+    };
+    std::vector<VkPoolSet> vkPools;
     vk::Buffer vkRing;                              // the upload ring (ring / ringCpu / ringSize)
+    vk::Buffer vkRingAlt;                           // ringAlt: REGPU_GPU_UPLOAD_RING's ring in the other memory
     VkDescriptorSet vkSet0[kSamplerBanks] = {};     // set 0 over vkRing, guest memory and each sampler bank
     VkDeviceSize vkSet0GphysBytes = 0;
     VkBuffer vkSet0Gphys = VK_NULL_HANDLE;          // what those sets bind as gphys (t1): guest memory, the vertex arena or
                                                     // the ring (the copy path), as D3D12's per-frame t1 view
-    uint64_t vkTimeline = 0;                        // the queue timeline value of this slot's last submission (fence)
     std::vector<std::function<void()>> vkGarbage;   // garbage: destroyed when this slot's frame has completed
 };
 
@@ -1125,7 +1129,9 @@ struct Renderer
     vk::Buffer vkPhysical;                          // physicalHeap + physical: guest physical memory in place (empty: copies)
     vk::Buffer vkNullBuffer;                        // bound as gphys when guest memory isn't mapped
     vk::RecordedList vkRecorder;                    // recorder
-    VkCommandBuffer vkMain = VK_NULL_HANDLE;        // realList
+    // fence: a timeline semaphore of the renderer's own, signalled with nextFence's values as D3D12's fence was (the
+    // device's timeline, vk::Device::timeline, counts submissions for the graveyard).
+    VkSemaphore vkFence = VK_NULL_HANDLE;
     vk::Graveyard vkGraveyard;                      // FrameResources::garbage
 };
 
@@ -1217,7 +1223,7 @@ uint32_t g_zeroedEdramBase = ~0u; // EDRAM base a depth clear to zero has just e
 std::mutex g_surfaceMutex;           // EDRAM surfaces
 // Parallel segments: texture uploads and copies a worker makes go to this list, executed
 // before the segment's draws (another worker's earlier draws may use the same texture).
-RecordedList* g_prepList = nullptr;
+vk::RecordedList* g_prepList = nullptr;
 
 // What a thread recording draws keeps for itself: its command list, the bound surfaces and
 // shaders. The command processor thread uses the main context (the frame's list); draw
@@ -1249,19 +1255,19 @@ inline DrawContext& C() { return t_context ? *t_context : g_mainContext; }
 struct TextureScope
 {
     std::lock_guard<std::recursive_mutex> lock{ g_textureMutex };
-    RecordedList* saved = nullptr;
+    vk::RecordedList* saved = nullptr;
     TextureScope()
     {
         if (C().worker && g_prepList)
         {
-            saved = C().list;
-            C().list = g_prepList;
+            saved = C().vkList;
+            C().vkList = g_prepList;
         }
     }
     ~TextureScope()
     {
         if (saved)
-            C().list = saved;
+            C().vkList = saved;
     }
 };
 
@@ -2246,34 +2252,9 @@ D3D12_GPU_DESCRIPTOR_HANDLE Gpu(ID3D12DescriptorHeap* heap, UINT index, UINT str
 }
 
 bool g_gpuUploadHeap = false; // GPU upload heaps reported and allowed (see the ring set-up)
-bool g_uma = false, g_cacheCoherentUma = false; // the GPU shares system memory (Init, D3D12_FEATURE_ARCHITECTURE1)
+bool g_uma = false, g_cacheCoherentUma = false; // the GPU shares system memory (InitVulkan)
 
 ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state);
-
-// An upload ring in a GPU upload heap, mapped (write-combined: the CPU only writes it); null if the driver refuses.
-ComPtr<ID3D12Resource> CreateGpuUploadRing(UINT64 size, uint8_t*& cpu)
-{
-    D3D12_HEAP_PROPERTIES hp{};
-    hp.Type = D3D12_HEAP_TYPE_GPU_UPLOAD;
-    D3D12_RESOURCE_DESC rd{};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = size;
-    rd.Height = 1;
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1;
-    rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    ComPtr<ID3D12Resource> r;
-    const HRESULT hr = g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r));
-    if (FAILED(hr) || FAILED(r->Map(0, nullptr, reinterpret_cast<void**>(&cpu))))
-    {
-        Log("renderer: GPU upload heap ring of %llu MB failed (0x%08X): ring stays in system memory", (unsigned long long)(size >> 20), unsigned(hr));
-        cpu = nullptr;
-        return nullptr;
-    }
-    CountCreate("buffer");
-    return r;
-}
 
 ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state)
 {
@@ -2290,53 +2271,6 @@ ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RES
     ComPtr<ID3D12Resource> r;
     Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(&r)), "CreateCommittedResource(buffer)"); CountCreate("buffer");
     return r;
-}
-
-// Whether the GPU sees guest memory through the placed buffer over it. A driver can open the heap
-// and still not alias it (vkd3d-proton on RADV: the calls succeed and the GPU reads zeros, so
-// in-place vertex fetches draw nothing): a value written by the CPU is copied out by the GPU and
-// compared. The block is ours (Host::alloc), not memory the title may be using.
-bool PhysicalHeapAliasesGuest(ID3D12Device* d, ID3D12Resource* physical)
-{
-    const uint32_t address = RegpuGuestAlloc(Heap::Physical, 4096, 4096);
-    if (!address)
-        return true; // nothing to test with: trust the mapping, as before
-    uint32_t pattern[4];
-    for (uint32_t i = 0; i < 4; i++)
-        pattern[i] = 0x9E3779B9u * (i + 1) ^ uint32_t(GetTickCount64()) ^ address;
-    memcpy(GuestPtr<uint8_t>(address), pattern, sizeof(pattern));
-
-    ComPtr<ID3D12Resource> readback = CreateBuffer(256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    ComPtr<ID3D12CommandAllocator> allocator;
-    ComPtr<ID3D12GraphicsCommandList> list;
-    ComPtr<ID3D12Fence> fence;
-    if (FAILED(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
-        FAILED(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list))) ||
-        FAILED(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
-        return true;
-    list->CopyBufferRegion(readback.Get(), 0, physical, address & 0x1FFFFFFF, sizeof(pattern));
-    list->Close();
-    ID3D12CommandList* lists[] = { list.Get() };
-    g_r.queue->ExecuteCommandLists(1, lists);
-    const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    g_r.queue->Signal(fence.Get(), 1);
-    fence->SetEventOnCompletion(1, event);
-    WaitForSingleObject(event, 5000);
-    CloseHandle(event);
-    if (fence->GetCompletedValue() < 1)
-        return false; // the copy never finished: don't read through this heap
-    uint32_t seen[4] = {};
-    void* mapped = nullptr;
-    const D3D12_RANGE range{ 0, sizeof(seen) };
-    if (SUCCEEDED(readback->Map(0, &range, &mapped)))
-    {
-        memcpy(seen, mapped, sizeof(seen));
-        readback->Unmap(0, nullptr);
-    }
-    if (memcmp(seen, pattern, sizeof(pattern)) == 0)
-        return true;
-    Log("renderer: guest memory self-test at %08X wrote %08X %08X, the GPU read %08X %08X", address, pattern[0], pattern[1], seen[0], seen[1]);
-    return false;
 }
 
 // Depth resolves: a depth-stencil buffer can only be copied whole, so the
@@ -2617,13 +2551,16 @@ void* HeapViewAddress()
     return view;
 }
 
-void MapGuestMemory(ID3D12Device* d)
+// Guest physical memory for the GPU in place (VK_EXT_external_memory_host; D3D12 opened a heap over the same view): the
+// shaders read vertex and index data where the game wrote it. Without the extension, or when the import fails, vertex
+// data is copied (the copy path). Tried at init and again a few times in the first frames (BeginFrameIfNeeded).
+void MapGuestMemoryVk()
 {
     // A title can make a page of physical memory no-access (FH1 TU4 guards the page after its
-    // minimap geometry ring), and the heap calls refuse a view with such a page (E_INVALIDARG): on
-    // one PC the guard was there before the renderer started and every run took the copy path. The
-    // GPU doesn't see CPU protection, so those pages are made read-write (as the rest of the view) while the heap is opened and
-    // restored after. REGPU_NO_MAP_UNGUARD=1: as found.
+    // minimap geometry ring), and the import can refuse a range with such a page: on one PC the guard was there
+    // before the renderer started and every run took the copy path. The GPU doesn't see CPU protection, so those pages
+    // are made read-write (as the rest of the view) while the memory is imported and restored after.
+    // REGPU_NO_MAP_UNGUARD=1: as found.
     std::vector<std::pair<std::pair<void*, size_t>, DWORD>> guarded;
     if (!getenv("REGPU_NO_MAP_UNGUARD"))
     {
@@ -2653,68 +2590,18 @@ void MapGuestMemory(ID3D12Device* d)
             }
         }
     } restore{ guarded };
-    ComPtr<ID3D12Device13> d13;
-    HRESULT hr = getenv("REGPU_FORCE_DEVICE3") ? E_NOINTERFACE : d->QueryInterface(IID_PPV_ARGS(&d13)); // (REGPU_FORCE_DEVICE3: test the fallback)
-    // (A heap over the file mapping would lock every view: not with the vertex arena's own view.)
-    const bool ownView = HeapViewAddress() != GuestPtr(0xA0000000);
-    if (SUCCEEDED(hr))
-        hr = ownView ? E_INVALIDARG : d13->OpenExistingHeapFromFileMapping(RegpuPhysicalSection(), IID_PPV_ARGS(&g_r.physicalHeap));
-    if (FAILED(hr) && d13)
+    g_r.vkPhysical = vk::ImportHostMemory(*g_r.vkd, HeapViewAddress(), 0x20000000,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        "guest physical memory");
+    // (D3D12 tested the mapping with a GPU copy, PhysicalHeapAliasesGuest: vkd3d-proton on RADV could succeed without
+    // aliasing the memory. A Vulkan host-memory import is the memory itself.)
+    Log("renderer: guest memory %s", g_r.vkPhysical ? "mapped for the GPU (zero-copy vertex fetch)" : "not mappable; vertex data is copied");
+    // For a port's launcher ("Reduced performance" warning): what this PC actually got.
+    if (FILE* f = _wfopen((regpu::GetConfig().userDir / "zero_copy.txt").c_str(), L"w"))
     {
-        if (!ownView)
-            Log("renderer: OpenExistingHeapFromFileMapping failed %08X; trying the view address", unsigned(hr));
-        hr = d13->OpenExistingHeapFromAddress1(HeapViewAddress(), 0x20000000, IID_PPV_ARGS(&g_r.physicalHeap));
-}
-// Older runtimes (Windows 10, older drivers) have no ID3D12Device13, but ID3D12Device3 (Windows 10
-// 1709+) opens a heap over the whole allocation an address is in: the 512 MB view of guest
-// physical memory at 0xA0000000 is exactly that. The self-test below checks the GPU sees it.
-// (From the FM2 port: 211 fps against 150 on the copy path there.) Also when ID3D12Device13's calls
-// fail: under ReXGlue on one PC both returned E_INVALIDARG while this one works (FH1 on the copy
-// path: 7 ms a frame of vertex copies, 63 fps against stock's 96).
-if (FAILED(hr))
-{
-    if (d13)
-        Log("renderer: mapping guest memory: OpenExistingHeapFromAddress1 failed %08X; trying ID3D12Device3", unsigned(hr));
-    ComPtr<ID3D12Device3> d3;
-    if (SUCCEEDED(hr = d->QueryInterface(IID_PPV_ARGS(&d3))))
-        hr = d3->OpenExistingHeapFromAddress(HeapViewAddress(), IID_PPV_ARGS(&g_r.physicalHeap));
-    if (SUCCEEDED(hr))
-        Log("renderer: guest memory opened through ID3D12Device3, %llu MB", (unsigned long long)(g_r.physicalHeap->GetDesc().SizeInBytes >> 20));
-    else
-        Log("renderer: mapping guest memory: ID3D12Device3 failed %08X", unsigned(hr));
-}
-if (SUCCEEDED(hr))
-{
-    D3D12_RESOURCE_DESC bd{};
-    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width = g_r.physicalHeap->GetDesc().SizeInBytes;
-    bd.Height = 1;
-    bd.DepthOrArraySize = 1;
-    bd.MipLevels = 1;
-    bd.SampleDesc.Count = 1;
-    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
-    if (FAILED(hr = d->CreatePlacedResource(g_r.physicalHeap.Get(), 0, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_r.physical))))
-    {
-        Log("renderer: placing the guest memory buffer failed %08X", unsigned(hr));
-        g_r.physical.Reset();
+        fputs(g_r.vkPhysical ? "1" : "0", f);
+        fclose(f);
     }
-}
-// The calls can succeed on a driver that doesn't alias the memory (vkd3d-proton on RADV): test it.
-// REGPU_NO_HEAP_SELFTEST=1 trusts the mapping (A/B).
-if (g_r.physical && !getenv("REGPU_NO_HEAP_SELFTEST") && !PhysicalHeapAliasesGuest(d, g_r.physical.Get()))
-{
-    Log("renderer: the GPU does not see guest memory through the mapped heap; vertex data is copied instead");
-    g_r.physical.Reset();
-    g_r.physicalHeap.Reset();
-}
-Log("renderer: guest memory %s", g_r.physical ? "mapped for the GPU (zero-copy vertex fetch)" : "not mappable; vertex data is copied");
-// For a port's launcher ("Reduced performance" warning): what this PC actually got.
-if (FILE* f = _wfopen((regpu::GetConfig().userDir / "zero_copy.txt").c_str(), L"w"))
-{
-    fputs(g_r.physical ? "1" : "0", f);
-    fclose(f);
-}
 }
 
 // REGPU_ANISO_FROM_FETCH: anisotropic filtering as each fetch asks (see Init's samplers). Read when the
@@ -2822,23 +2709,31 @@ void UpdateSlotSets(FrameResources& f, VkBuffer gphys, VkDeviceSize gphysBytes, 
     f.vkSet0GphysBytes = gphysBytes;
 }
 
-// This slot's Vulkan upload ring made again (a larger size, or the other memory: REGPU_GPU_UPLOAD_RING), with its set 0s;
-// the old ones go with this slot's frame. f.ringCpu points into it: every CPU write to the ring lands there.
-void RecreateVkRing(FrameResources& f, UINT64 size, bool vram)
+// An upload ring: host-visible, in system memory or (vram: REGPU_GPU_UPLOAD_RING) device-local memory the CPU writes
+// through resizable BAR. Empty when there is no memory for it and !required.
+vk::Buffer MakeRing(UINT64 size, bool vram, bool required)
 {
-    vk::Device& d = *g_r.vkd;
-    vk::Buffer old = f.vkRing;
-    f.vkGarbage.push_back([old]() mutable { vk::Destroy(*g_r.vkd, old); });
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    f.vkRing = vk::CreateBuffer(d, size, usage, vram ? vk::Memory::UploadVram : vk::Memory::Upload, "upload ring");
-    if (!f.vkRing)
+    vk::Buffer ring = vk::CreateBuffer(*g_r.vkd, size, usage, vram ? vk::Memory::UploadVram : vk::Memory::Upload, "upload ring");
+    if (!ring && required)
         Fatal("renderer: no memory for the %llu MB upload ring", (unsigned long long)(size >> 20));
-    // (gphys stays what it was, except the ring itself on the copy path: the frame start sets it again.)
-    const bool ringAsGphys = f.vkSet0Gphys == old.buffer || !f.vkSet0Gphys;
+    return ring;
+}
+
+// f.vkRing has changed (a new size, or the other memory): its set 0s and ringCpu / ringSize follow. old: the ring it
+// replaced (its set 0s go with this slot's frame; gphys stays what it was, except the ring itself on the copy path).
+// Every CPU write to the ring lands in f.vkRing.
+void UseRing(FrameResources& f, VkBuffer old)
+{
+    const bool ringAsGphys = f.vkSet0Gphys == old || !f.vkSet0Gphys;
     UpdateSlotSets(f, ringAsGphys ? f.vkRing.buffer : f.vkSet0Gphys, ringAsGphys ? f.vkRing.size : f.vkSet0GphysBytes, true);
     f.ringCpu = f.vkRing.mapped;
+    f.ringSize = f.vkRing.size;
 }
+
+struct FrameResources;
+VkCommandBuffer AcquireVkList(FrameResources& f, uint32_t pool); // (below)
 
 // The Vulkan half of Init (step 6 of the conversion): what Init makes on D3D12, made on Vulkan. Both exist until every
 // user of the D3D12 objects is converted.
@@ -2846,58 +2741,6 @@ void InitVulkan()
 {
     vk::Device& d = RenderVkDevice();
     g_r.vkd = &d;
-    if (!vk::CreateDrawBindings(d, g_r.vkBindings, sizeof(gpu::VSConstants), sizeof(gpu::PSConstants), sizeof(gpu::VSConstants)))
-        Fatal("renderer: the graphics card can't hold ReGPU's bindless texture tables on Vulkan (see above)");
-    for (UINT bank = 0; bank < kSamplerBanks; bank++)
-    {
-        int aniso[vk::kSamplerCount];
-        SamplerAnisotropy(-1, aniso);
-        vk::CreateSamplers(d, aniso, g_r.vkSamplers[bank]);
-    }
-
-    // Guest physical memory in place (D3D12's heap over the same view, MapGuestMemory): the shaders read vertex and index
-    // data where the game wrote it. Without VK_EXT_external_memory_host, the copy path (as when D3D12 can't open it).
-    g_r.vkPhysical = vk::ImportHostMemory(d, HeapViewAddress(), 0x20000000,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        "guest physical memory");
-    Log("renderer: Vulkan: guest physical memory %s", g_r.vkPhysical ? "read in place (host memory import)" : "copied (no host memory import)");
-    g_r.vkNullBuffer = vk::CreateBuffer(d, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vk::Memory::Device, "null buffer");
-
-    const VkBufferUsageFlags ringUsage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    for (UINT i = 0; i < kFrames; i++)
-    {
-        FrameResources& f = g_r.frames[i];
-        VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-        pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-        pci.queueFamilyIndex = d.queueFamily;
-        vk::Check(vkCreateCommandPool(d.device, &pci, nullptr, &f.vkPool), "vkCreateCommandPool");
-        f.vkRing = vk::CreateBuffer(d, kRingSize, ringUsage, vk::Memory::Upload, "upload ring");
-        if (!f.vkRing)
-            Fatal("renderer: no memory for the %llu MB upload ring", (unsigned long long)(kRingSize >> 20));
-        // gphys: guest memory in place, else the ring (the copy path, as D3D12 bound its ring as t1 then).
-        UpdateSlotSets(f, g_r.vkPhysical ? g_r.vkPhysical.buffer : f.vkRing.buffer, g_r.vkPhysical ? g_r.vkPhysical.size : f.vkRing.size, true);
-        f.ringCpu = f.vkRing.mapped; // every CPU write to the ring goes to the Vulkan one
-    }
-    // The main command buffer, from slot 0 (realList), recorded through vkRecorder.
-    VkCommandBufferAllocateInfo ai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    ai.commandPool = g_r.frames[0].vkPool;
-    ai.commandBufferCount = 1;
-    vk::Check(vkAllocateCommandBuffers(d.device, &ai, &g_r.vkMain), "vkAllocateCommandBuffers");
-    g_r.frames[0].vkBuffers.push_back(g_r.vkMain);
-    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vk::Check(vkBeginCommandBuffer(g_r.vkMain, &bi), "vkBeginCommandBuffer");
-    g_r.frames[0].vkBuffersUsed = 1;
-    g_r.vkRecorder.Init(g_r.vkMain);
-    g_mainContext.vkList = &g_r.vkRecorder;
-    Log("renderer: Vulkan objects ready (%u frame slots, %llu MB upload ring each)", kFrames, (unsigned long long)(kRingSize >> 20));
-}
-
-void Init()
-{
-    g_r.device = RenderDevice();
-    g_r.queue = RenderQueue();
     // N2 (FM3 port session 43, Intel iGPU leads): a GPU sharing system memory (UMA: every integrated GPU). The idea was
     // that the vertex arena's "VRAM" copy is the same RAM again, a pure extra copy; measured on the Ryzen 9800X3D's
     // Radeon iGPU (720p frozen grid) turning it off cost 65 -> 51 fps: the driver puts the arena in its dedicated
@@ -2905,11 +2748,15 @@ void Init()
     // (start-time) turns it off on a UMA GPU, for tests on Intel (no carve-out). Read before the arena's switches are
     // first looked at (the heap view below, the first frame).
     {
-        D3D12_FEATURE_DATA_ARCHITECTURE1 arch{};
-        if (SUCCEEDED(g_r.device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, &arch, sizeof(arch))))
+        // (D3D12's ARCHITECTURE1 UMA and CacheCoherentUMA: on Vulkan the device's memory, a device-local type the CPU
+        // reads cached and coherent.)
+        g_uma = d.uma;
+        for (uint32_t i = 0; i < d.memory.memoryTypeCount; i++)
         {
-            g_uma = arch.UMA;
-            g_cacheCoherentUma = arch.CacheCoherentUMA;
+            const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            if (g_uma && (d.memory.memoryTypes[i].propertyFlags & want) == want)
+                g_cacheCoherentUma = true;
         }
         Log("renderer: memory architecture %s%s", g_uma ? "UMA (shared system memory)" : "discrete (own video memory)",
             g_cacheCoherentUma ? ", cache-coherent" : "");
@@ -2920,6 +2767,69 @@ void Init()
             Log("renderer: vertex arena off on a UMA GPU (REGPU_UMA_NO_ARENA)");
         }
     }
+    if (!vk::CreateDrawBindings(d, g_r.vkBindings, sizeof(gpu::VSConstants), sizeof(gpu::PSConstants), sizeof(gpu::VSConstants)))
+        Fatal("renderer: the graphics card can't hold ReGPU's bindless texture tables on Vulkan (see above)");
+    for (UINT bank = 0; bank < kSamplerBanks; bank++)
+    {
+        int aniso[vk::kSamplerCount];
+        SamplerAnisotropy(-1, aniso);
+        vk::CreateSamplers(d, aniso, g_r.vkSamplers[bank]);
+    }
+
+    MapGuestMemoryVk();
+    g_r.vkNullBuffer = vk::CreateBuffer(d, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vk::Memory::Device, "null buffer");
+
+    kRingSize = (getenv("REGPU_RING_MB") ? std::clamp<UINT64>(UINT64(atoi(getenv("REGPU_RING_MB"))), 16, 2048)
+        // (128 MB with the zero-copy mapping, not 64: new vertex buffers are copied for their first 16 frames,
+        // and the frame a world loads in filled 64 MB and dropped draws until the ring had grown.)
+        : regpu::GetConfig().uploadRingMB ? std::clamp<UINT64>(regpu::GetConfig().uploadRingMB, 16, 2048) : g_r.vkPhysical && !getenv("REGPU_NO_DIRECT_FETCH") ? 128 : 384) << 20;
+    Log("renderer: upload ring %llu MB per frame", (unsigned long long)(kRingSize >> 20));
+    // GPU upload heaps (D3D12's name; on Vulkan device-local memory the CPU can write, which a discrete GPU has with
+    // resizable BAR / Smart Access Memory on): the upload ring (per-draw constants, vertex and texture uploads) can live
+    // in VRAM instead of system memory. A second ring per frame slot is made there for the live A/B
+    // REGPU_GPU_UPLOAD_RING (REGPU_NO_GPU_UPLOAD_RING=1: not made).
+    g_gpuUploadHeap = d.largeBar && !getenv("REGPU_NO_GPU_UPLOAD_RING");
+    Log("renderer: GPU upload heaps %s (resizable BAR %s)", d.largeBar ? "supported" : "not supported", d.largeBar ? "on" : "off or unsupported");
+    for (UINT i = 0; i < kFrames; i++)
+    {
+        FrameResources& f = g_r.frames[i];
+        // Pool 0, and one for each thread that may translate draw pieces (the workers and the command processor).
+        f.vkPools.resize(2 + RendererDrawWorkers());
+        for (FrameResources::VkPoolSet& ps : f.vkPools)
+        {
+            VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+            pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+            pci.queueFamilyIndex = d.queueFamily;
+            vk::Check(vkCreateCommandPool(d.device, &pci, nullptr, &ps.pool), "vkCreateCommandPool");
+        }
+        f.vkRing = MakeRing(kRingSize, false, true);
+        // gphys: guest memory in place, else the ring (the copy path, as D3D12 bound its ring as t1 then).
+        UpdateSlotSets(f, g_r.vkPhysical ? g_r.vkPhysical.buffer : f.vkRing.buffer, g_r.vkPhysical ? g_r.vkPhysical.size : f.vkRing.size, true);
+        f.ringCpu = f.vkRing.mapped;
+        f.ringSize = f.vkRing.size;
+        // (The other place's ring is made when REGPU_GPU_UPLOAD_RING first asks for it, and the one it replaces is
+        // released: FM3 port session 43, both kept 3 x 128 MB of RAM for a live switch. REGPU_KEEP_BOTH_RINGS=1: as before.)
+        if (g_gpuUploadHeap && getenv("REGPU_KEEP_BOTH_RINGS"))
+            if (!(f.vkRingAlt = MakeRing(kRingSize, true, false)))
+                g_gpuUploadHeap = false;
+    }
+    {
+        VkSemaphoreTypeCreateInfo type{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo sci{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type };
+        vk::Check(vkCreateSemaphore(d.device, &sci, nullptr, &g_r.vkFence), "vkCreateSemaphore(fence)");
+        vk::SetName(d, VK_OBJECT_TYPE_SEMAPHORE, uint64_t(g_r.vkFence), "renderer fence");
+    }
+    // The main stream starts in a buffer of slot 0 (realList; each frame start takes a new one).
+    g_r.vkRecorder.Init(AcquireVkList(g_r.frames[0], 0));
+    g_mainContext.vkList = &g_r.vkRecorder;
+    Log("renderer: Vulkan objects ready (%u frame slots, %llu MB upload ring each)", kFrames, (unsigned long long)(kRingSize >> 20));
+}
+
+void Init()
+{
+    g_r.device = RenderDevice();
+    g_r.queue = RenderQueue();
     // REGPU_D3D12_STACKS=1 (with REGPU_D3D12_DEBUG): each debug-layer error is logged when it
     // happens, with the stack of the call that made it (the first 3 of each kind).
     if (getenv("REGPU_D3D12_STACKS"))
@@ -3087,7 +2997,6 @@ void Init()
     d->CreateShaderResourceView(nullptr, &nullSrv, Cpu(g_r.srvHeap.Get(), kBindlessBase + 2, g_r.srvStride));
 
     InitPipelineLibrary(d);
-    MapGuestMemory(d);
 
     // Views for the EDRAM surfaces (created on first use).
     hd.NumDescriptors = kMaxSurfaces;
@@ -3101,38 +3010,10 @@ void Init()
     InitDepthBlit();
     g_r.readback = CreateBuffer(UINT64((DumpWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    kRingSize = (getenv("REGPU_RING_MB") ? std::clamp<UINT64>(UINT64(atoi(getenv("REGPU_RING_MB"))), 16, 2048)
-        // (128 MB with the zero-copy mapping, not 64: new vertex buffers are copied for their first 16 frames,
-        // and the frame a world loads in filled 64 MB and dropped draws until the ring had grown.)
-        : regpu::GetConfig().uploadRingMB ? std::clamp<UINT64>(regpu::GetConfig().uploadRingMB, 16, 2048) : g_r.physical && !getenv("REGPU_NO_DIRECT_FETCH") ? 128 : 384) << 20;
-    Log("renderer: upload ring %llu MB per frame", (unsigned long long)(kRingSize >> 20));
-    // GPU upload heaps (D3D12 OPTIONS16; true only with resizable BAR / Smart Access Memory on): the upload ring
-    // (per-draw constants, vertex and texture uploads) can live in VRAM instead of system memory. A second ring per
-    // frame slot is made there for the live A/B REGPU_GPU_UPLOAD_RING (REGPU_NO_GPU_UPLOAD_RING=1: not made).
-    {
-        D3D12_FEATURE_DATA_D3D12_OPTIONS16 o16{};
-        const bool queried = SUCCEEDED(d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &o16, sizeof(o16)));
-        g_gpuUploadHeap = queried && o16.GPUUploadHeapSupported;
-        Log("renderer: GPU upload heaps %s (resizable BAR %s)", !queried ? "unknown (OPTIONS16 not reported)" : g_gpuUploadHeap ? "supported" : "not supported",
-            g_gpuUploadHeap ? "on" : "off or unsupported");
-        if (getenv("REGPU_NO_GPU_UPLOAD_RING"))
-            g_gpuUploadHeap = false;
-    }
     for (UINT i = 0; i < kFrames; i++)
     {
         FrameResources& f = g_r.frames[i];
         Check(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.allocator)), "CreateCommandAllocator");
-        f.ring = CreateBuffer(kRingSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-        f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
-        f.ringSize = kRingSize;
-        // (The other place's ring is made when REGPU_GPU_UPLOAD_RING first asks for it, and the one it replaces is
-        // released: FM3 port session 43, both kept 3 x 128 MB of RAM for a live switch. REGPU_KEEP_BOTH_RINGS=1: as before.)
-        if (g_gpuUploadHeap && getenv("REGPU_KEEP_BOTH_RINGS"))
-        {
-            if (!(f.ringAlt = CreateGpuUploadRing(kRingSize, f.ringAltCpu)))
-                g_gpuUploadHeap = false;
-            f.ringAltSize = f.ringAlt ? kRingSize : 0;
-        }
         f.descriptorBase = i * kDescriptorsPerFrame;
     }
     Check(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_r.frames[0].allocator.Get(), nullptr, IID_PPV_ARGS(&g_r.realList)),
@@ -3151,6 +3032,52 @@ void Init()
 double g_gpuWaitSeconds = 0; // CP thread blocked on the host GPU (frame resources)
 
 FrameResources& Frame() { return g_r.frames[g_r.frameIndex]; }
+
+// A begun command buffer from a pool of a frame slot (FrameResources::vkPools: the caller is the one thread using that
+// pool now). D3D12's AcquireList and the allocator Reset.
+VkCommandBuffer AcquireVkList(FrameResources& f, uint32_t pool)
+{
+    FrameResources::VkPoolSet& ps = f.vkPools[pool];
+    if (ps.used == ps.buffers.size())
+    {
+        VkCommandBufferAllocateInfo ai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        ai.commandPool = ps.pool;
+        ai.commandBufferCount = 1;
+        VkCommandBuffer cb = VK_NULL_HANDLE;
+        vk::Check(vkAllocateCommandBuffers(g_r.vkd->device, &ai, &cb), "vkAllocateCommandBuffers");
+        ps.buffers.push_back(cb);
+    }
+    VkCommandBuffer cb = ps.buffers[ps.used++];
+    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vk::Check(vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer");
+    return cb;
+}
+// The same for the replay thread (vk::RecordedList::HandOffNew / SwitchNew): ctx is the slot.
+VkCommandBuffer AcquireVkListFor(void* slot) { return AcquireVkList(*static_cast<FrameResources*>(slot), 0); }
+// The pool of the calling thread for draw pieces (1..: the workers and the command processor, each its own).
+uint32_t PiecePool()
+{
+    static std::atomic<uint32_t> next{ 1 };
+    thread_local const uint32_t mine = next.fetch_add(1);
+    if (mine >= g_r.frames[0].vkPools.size())
+        Fatal("renderer: more draw piece threads than command pools (%u)", mine);
+    return mine;
+}
+
+// The renderer's fence (D3D12's ID3D12Fence: Signal and GetCompletedValue), a timeline semaphore.
+uint64_t FenceCompleted()
+{
+    uint64_t value = 0;
+    vkGetSemaphoreCounterValue(g_r.vkd->device, g_r.vkFence, &value);
+    return value;
+}
+// Signals `value` on the queue after everything submitted so far.
+void SignalFence(uint64_t value)
+{
+    const vk::SemaphoreUse s{ g_r.vkFence, value, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT };
+    vk::Submit(*g_r.vkd, nullptr, 0, nullptr, 0, &s, 1);
+}
 void ReleaseWithFrame(vk::Image& image); // (below)
 bool g_asyncFrameEnded = false; // the last frame's end was queued on the replay thread (REGPU_ASYNC_PRESENT)
 ID3D12GraphicsCommandList* AcquireList();
@@ -3160,14 +3087,12 @@ ID3D12GraphicsCommandList* AcquireList();
 // as do the frame readback, the upscaler's images and the swap chain. Resolved images take their new
 // size at their next resolve. The guest redraws every surface it uses each frame.
 // Every frame in flight may still use the old surfaces and pipelines: waits for them.
+void WaitFenceValue(UINT64 value, DWORD timeoutMs); // (below)
 void WaitGpuIdle()
 {
-    g_r.recorder.Real(); // (a frame end queued on the replay thread presents there: REGPU_ASYNC_PRESENT)
-    if (const UINT64 last = g_r.nextFence - 1; g_r.fence->GetCompletedValue() < last)
-    {
-        g_r.fence->SetEventOnCompletion(last, g_r.fenceEvent);
-        WaitForSingleObject(g_r.fenceEvent, INFINITE);
-    }
+    g_r.vkRecorder.Real(); // (a frame end queued on the replay thread presents there: REGPU_ASYNC_PRESENT)
+    if (const UINT64 last = g_r.nextFence - 1; FenceCompleted() < last)
+        WaitFenceValue(last, INFINITE);
 }
 
 // The EDRAM surfaces are dropped and made again on their next use (a new size or sample count).
@@ -3751,10 +3676,8 @@ void EvictBindless()
 // threads steal each other's wake-up, and the loser sat out its whole timeout (FM4 port: 2 s stalls in a race).
 void WaitFenceValue(UINT64 value, DWORD timeoutMs)
 {
-    thread_local HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (g_r.fence->GetCompletedValue() >= value)
+    if (FenceCompleted() >= value)
         return;
-    g_r.fence->SetEventOnCompletion(value, event);
     // (Every fence wait on the draw thread, for the long-frame log; the frame-start one is also its "gpu wait".)
     struct CountFence
     {
@@ -3765,9 +3688,16 @@ void WaitFenceValue(UINT64 value, DWORD timeoutMs)
                 g_fenceWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         }
     } countFence;
-    if (WaitForSingleObject(event, timeoutMs) == WAIT_TIMEOUT && timeoutMs != INFINITE)
+    VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &g_r.vkFence;
+    wi.pValues = &value;
+    const VkResult result = vkWaitSemaphores(g_r.vkd->device, &wi, timeoutMs == INFINITE ? UINT64_MAX : uint64_t(timeoutMs) * 1000000);
+    if (result < 0)
+        vk::Check(result, "vkWaitSemaphores(fence)");
+    if (result == VK_TIMEOUT && timeoutMs != INFINITE)
         Log("perf: a fence wait timed out after %lu ms (value %llu, completed %llu)", timeoutMs, (unsigned long long)value,
-            (unsigned long long)g_r.fence->GetCompletedValue());
+            (unsigned long long)FenceCompleted());
 }
 
 void BeginFrameIfNeeded()
@@ -3775,7 +3705,7 @@ void BeginFrameIfNeeded()
     if (g_r.listOpen)
         return;
     FrameResources& f = Frame();
-    if (g_r.fence->GetCompletedValue() < f.fence)
+    if (FenceCompleted() < f.fence)
     {
         const auto w0 = std::chrono::steady_clock::now();
         WaitFenceValue(f.fence, INFINITE);
@@ -3976,20 +3906,24 @@ void BeginFrameIfNeeded()
         }
         f.timed = false;
     }
+    // This slot's command buffers have completed (its fence, above): its pools start over. Only this thread and the
+    // replay thread use pool 0, and the replay is in another slot's buffers until the switch below.
     f.poolUsed = 0;
+    for (FrameResources::VkPoolSet& ps : f.vkPools)
+    {
+        if (ps.used)
+            vk::Check(vkResetCommandPool(g_r.vkd->device, ps.pool, 0), "vkResetCommandPool");
+        ps.used = 0;
+    }
     if (g_asyncFrameEnded)
     {
-        // Last frame ended on the replay thread (REGPU_ASYNC_PRESENT): its list is closed there; this frame records
-        // into a pool list of its own slot, without waiting for that (Rebind would).
+        // Last frame ended on the replay thread (REGPU_ASYNC_PRESENT): its buffer is ended there; this frame records
+        // into a buffer of its own slot, without waiting for that (Rebind would).
         g_asyncFrameEnded = false;
-        g_r.recorder.Switch(AcquireList());
+        g_r.vkRecorder.Switch(AcquireVkList(f, 0));
     }
     else
-    {
-        g_r.recorder.Rebind(g_r.realList.Get()); // (a pool list may have continued last frame)
-        f.allocator->Reset();
-        C().list->Reset(f.allocator.Get(), nullptr);
-    }
+        g_r.vkRecorder.Rebind(AcquireVkList(f, 0)); // (the last frame's buffer was ended and submitted at its end)
     // This frame's scene phase and scale (see UpscaleScene).
     {
         const Settings& st = GetSettings();
@@ -4262,7 +4196,7 @@ void BeginFrameIfNeeded()
                     oldBytes += cached(t), nOld++;
             uint64_t rings = 0;
             for (UINT i = 0; i < kFrames; i++)
-                rings += g_r.frames[i].ringSize * (g_r.frames[i].ringAlt ? 2 : 1);
+                rings += g_r.frames[i].vkRing.size + g_r.frames[i].vkRingAlt.size;
             const double mb = 1024.0 * 1024.0;
             Log("renderer memory: textures %.0f MB (%llu; %.0f MB in %llu not used for 30 s), cubes %.0f MB (%llu), 3D %.0f MB (%llu), mip chains %.0f MB (%llu), "
                 "resolved images %.0f MB (%llu), EDRAM surfaces %.0f MB (%llu), texture heaps %zu x 128 MB, upload rings %.0f MB",
@@ -4323,7 +4257,7 @@ void BeginFrameIfNeeded()
         return a;
     }();
     static LiveSwitch vramRing("REGPU_GPU_UPLOAD_RING");
-    if (ringAuto.on && g_gpuUploadHeap && f.ringAlt)
+    if (ringAuto.on && g_gpuUploadHeap && f.vkRingAlt)
     {
         const auto now = std::chrono::steady_clock::now();
         const float ms = ringAuto.last.time_since_epoch().count() ? std::chrono::duration<float, std::milli>(now - ringAuto.last).count() : 0.0f;
@@ -4375,62 +4309,40 @@ void BeginFrameIfNeeded()
     // place's ring is made here when first wanted; without REGPU_KEEP_BOTH_RINGS the replaced one goes (garbage of this
     // slot: its frame has finished).
     static const bool keepBoth = getenv("REGPU_KEEP_BOTH_RINGS") != nullptr;
-    if (g_gpuUploadHeap && !f.ringAlt && wantVram != f.ringInVram)
+    if (g_gpuUploadHeap && !f.vkRingAlt && wantVram != f.ringInVram)
+        f.vkRingAlt = MakeRing(f.ringSize, wantVram, false);
+    if (f.vkRingAlt && wantVram != f.ringInVram)
     {
-        if (wantVram)
-            f.ringAlt = CreateGpuUploadRing(f.ringSize, f.ringAltCpu);
-        else if ((f.ringAlt = CreateBuffer(f.ringSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)))
-            f.ringAlt->Map(0, nullptr, reinterpret_cast<void**>(&f.ringAltCpu));
-        f.ringAltSize = f.ringAlt ? f.ringSize : 0;
-    }
-    if (f.ringAlt && wantVram != f.ringInVram)
-    {
-        std::swap(f.ring, f.ringAlt);
-        std::swap(f.ringCpu, f.ringAltCpu);
-        std::swap(f.ringSize, f.ringAltSize);
+        const VkBuffer old = f.vkRing.buffer;
+        std::swap(f.vkRing, f.vkRingAlt);
         f.ringInVram = !f.ringInVram;
-        // (Vulkan: one ring per slot, made again in the other memory. The auto mode's trials switch every few frames:
-        // keep both there once measured.)
-        RecreateVkRing(f, f.ringSize, f.ringInVram);
+        UseRing(f, old);
         if (frameIndex == 0 && !ringAuto.on)
             Log("renderer: upload ring in %s", f.ringInVram ? "VRAM (GPU upload heap)" : "system memory");
         if (!keepBoth && !ringAuto.on)
         {
-            f.garbage.push_back(f.ringAlt);
-            f.ringAlt.Reset();
-            f.ringAltCpu = nullptr;
-            f.ringAltSize = 0;
+            vk::Buffer gone = f.vkRingAlt;
+            f.vkGarbage.push_back([gone]() mutable { vk::Destroy(*g_r.vkd, gone); });
+            f.vkRingAlt = {};
         }
     }
     if (const UINT64 want = g_ringWant.load(); want > f.ringSize)
     {
-        f.garbage.push_back(f.ring); // the old ring may still be referenced by views until this frame's end
-        uint8_t* cpu = nullptr;
-        f.ring = f.ringInVram ? CreateGpuUploadRing(want, cpu) : CreateBuffer(want, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-        if (f.ringInVram && f.ring)
-            f.ringCpu = cpu;
-        else
-            f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
-        f.ringSize = want;
-        RecreateVkRing(f, want, f.ringInVram);
+        vk::Buffer old = f.vkRing; // (the old ring and its sets may still be in use until this slot's frame comes round)
+        f.vkGarbage.push_back([old]() mutable { vk::Destroy(*g_r.vkd, old); });
+        f.vkRing = MakeRing(want, f.ringInVram, true);
+        UseRing(f, old.buffer);
         Log("renderer: upload ring grown to %llu MB", (unsigned long long)(want >> 20));
     }
     f.ringUsed = 0;
     g_ringGeneration.fetch_add(1, std::memory_order_relaxed); // (threads' ring chunks from before are void: RingAlloc)
     f.uploads.clear();
     // Guest memory not mapped at init: try again a few times (see MapGuestMemory).
-    if (!g_r.physical && (g_r.frame == 30 || g_r.frame == 120 || g_r.frame == 600 || g_r.frame == 2400) && !getenv("REGPU_NO_MAP_RETRY"))
-        MapGuestMemory(g_r.device);
-    // Per-frame table: t0 this frame's ring, t1 guest physical memory.
+    if (!g_r.vkPhysical && (g_r.frame == 30 || g_r.frame == 120 || g_r.frame == 600 || g_r.frame == 2400) && !getenv("REGPU_NO_MAP_RETRY"))
+        MapGuestMemoryVk();
+    // Set 0's t0 is this slot's ring; t1 (gphys) is the vertex arena this frame, guest memory in place, or the ring (the
+    // copy path).
     {
-        D3D12_SHADER_RESOURCE_VIEW_DESC raw{};
-        raw.Format = DXGI_FORMAT_R32_TYPELESS;
-        raw.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-        raw.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        raw.Buffer.NumElements = UINT(f.ringSize / 4);
-        raw.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-        g_r.device->CreateShaderResourceView(f.ring.Get(), &raw, Cpu(g_r.srvHeap.Get(), f.descriptorBase, g_r.srvStride));
-        // Vulkan: t1 (gphys) is the vertex arena this frame, guest memory in place, or the ring (the copy path).
         if (const vk::Buffer* arena = VertexCacheBeginFrame())
             UpdateSlotSets(f, arena->buffer, arena->size, false);
         else if (g_r.vkPhysical)
@@ -4441,13 +4353,9 @@ void BeginFrameIfNeeded()
     f.descriptorsUsed = 2;
     EvictBindless();
     ReclaimTextureBlocks();
-    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() };
-    C().list->SetDescriptorHeaps(g_r.samplerHeap ? 2 : 1, heaps);
-    C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
-    g_drawState.Invalidate();
+    g_drawState.Invalidate(); // (sets 1-3, the bindless tables, are bound again by the first draw of a buffer)
     EvictSurfaces();
     SelectSurfaces(true);
-    C().list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_r.listOpen = true;
 }
 
@@ -4704,7 +4612,7 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
     static const uint32_t fullHashBytes = getenv("REGPU_UPLOAD_FULL_HASH_KB") ? uint32_t(atoi(getenv("REGPU_UPLOAD_FULL_HASH_KB"))) * 1024u : 16384u;
     // (Only on the copy path: with the zero-copy heap the large ranges, the ones that run past
     // allocations, are read in place by the GPU, and the check would cost every upload.)
-    if (!g_r.physical && !GuestReadable(src, bytes))
+    if (!g_r.vkPhysical && !GuestReadable(src, bytes))
         return zeros();
     // Large ranges reach this copy path, with guest memory mapped for the GPU, only when they were seen
     // changing (DynamicBuffer): hash them all, not 16 samples. Sampled, a range rewritten between two
@@ -4744,7 +4652,7 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
             }
             it->second.changed = true;
         }
-    if (bytes > fullHashBytes && g_r.physical && !uploadSampled)
+    if (bytes > fullHashBytes && g_r.vkPhysical && !uploadSampled)
         sample = FullHash(src, bytes);
     else if (bytes <= fullHashBytes)
         sample = uploadSampled ? ContentHash(src, bytes) : FullHash(src, bytes); // (ContentHash's default stride is 256 bytes)
@@ -5069,7 +4977,7 @@ uint64_t VertexCacheLocked(uint32_t address, uint32_t bytes, bool& arenaHit)
         e.hashed = true;
         if (!arena.watchFailed)
             Log("vertex arena: guest memory can't be write-watched (%08X)%s", address,
-                g_r.physical ? ": off from the next frame, read in place" : ": buffers are hashed");
+                g_r.vkPhysical ? ": off from the next frame, read in place" : ": buffers are hashed");
         arena.watchFailed = true;
     }
     if (e.hashed && !hash)
@@ -13489,13 +13397,10 @@ ID3D12GraphicsCommandList* AcquireList()
     return f.pool[f.poolUsed++].second.Get();
 }
 
-// The state every draw list starts with.
-void ListPrologue(RecordedList& list)
+// The state every draw list starts with (the bindless sets, 1-3, are bound by its first draw: DrawState).
+void ListPrologue(vk::RecordedList& list)
 {
-    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() };
-    list.SetDescriptorHeaps(g_r.samplerHeap ? 2 : 1, heaps);
-    list.SetGraphicsRootSignature(g_r.rootSignature.Get());
-    list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list.SetPrimitiveTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
 }
 
 // Command lists closed but not yet submitted, in order. Parallel segments end the main list and add
@@ -13526,6 +13431,36 @@ void QueueLists(UINT n, ID3D12CommandList* const* lists)
     g_pendingLists.insert(g_pendingLists.end(), lists, lists + n);
 }
 
+// The same for Vulkan command buffers (ended): one vkQueueSubmit2 for all queued.
+std::vector<VkCommandBuffer> g_vkPendingLists;
+void SubmitVkLists(uint32_t n, const VkCommandBuffer* lists)
+{
+    std::lock_guard lock(g_pendingMutex);
+    g_vkPendingLists.insert(g_vkPendingLists.end(), lists, lists + n);
+    if (!g_vkPendingLists.empty())
+        vk::Submit(*g_r.vkd, g_vkPendingLists.data(), uint32_t(g_vkPendingLists.size()));
+    g_vkPendingLists.clear();
+}
+void QueueVkLists(uint32_t n, const VkCommandBuffer* lists)
+{
+    static const bool now = getenv("REGPU_NO_DEFER_LISTS") != nullptr;
+    if (now)
+        return SubmitVkLists(n, lists);
+    std::lock_guard lock(g_pendingMutex);
+    g_vkPendingLists.insert(g_vkPendingLists.end(), lists, lists + n);
+}
+// Ends a command buffer and queues it (a hand-off's function, on the replay thread).
+void QueueClosed(VkCommandBuffer closed, void*)
+{
+    vk::Check(vkEndCommandBuffer(closed), "vkEndCommandBuffer");
+    QueueVkLists(1, &closed);
+}
+void QueueClosedAndSubmit(VkCommandBuffer closed, void* ctx)
+{
+    QueueClosed(closed, ctx);
+    SubmitVkLists(0, nullptr);
+}
+
 // Ends the main list so far (queued for submission) and continues the frame in a fresh one.
 void EndOcclusionQuery();
 void EndOcclusionPart();
@@ -13538,12 +13473,10 @@ void SplitMainList()
     const bool queryOpen = g_occlusionOpen;
     if (queryOpen)
         EndOcclusionPart();
-    ID3D12GraphicsCommandList* done = g_r.recorder.Real();
-    done->Close();
-    ID3D12CommandList* lists[] = { done };
-    QueueLists(1, lists);
-    g_r.recorder.Rebind(AcquireList());
-    ListPrologue(g_r.recorder);
+    // (The replay ends the buffer, queues it and begins the next from this slot's pool 0; Real waits for that.)
+    g_r.vkRecorder.HandOffNew(AcquireVkListFor, &Frame(), QueueClosed, nullptr);
+    g_r.vkRecorder.Real();
+    ListPrologue(g_r.vkRecorder);
     g_drawState.Invalidate();
     SelectSurfaces(true);
     if (queryOpen)
@@ -13563,20 +13496,9 @@ void SplitMainList()
 }
 
 // SplitMainList without waiting for the replay thread: the closed part is queued (and with submit, the
-// queue submitted) by the replay thread when it gets there (RecordedList::HandOff). Lists queued by the
-// command processor itself go through the stream too (QueueInStream), so the order holds; whatever
-// queues directly drains first (Real(), WaitForQueueIdle).
-void QueueClosed(ID3D12GraphicsCommandList* closed, void*)
-{
-    closed->Close();
-    ID3D12CommandList* lists[] = { closed };
-    QueueLists(1, lists);
-}
-void QueueClosedAndSubmit(ID3D12GraphicsCommandList* closed, void* ctx)
-{
-    QueueClosed(closed, ctx);
-    SubmitLists(0, nullptr);
-}
+// queue submitted) by the replay thread when it gets there (vk::RecordedList::HandOffNew, which also begins the next
+// buffer there: the pool is the replay's). Lists queued by the command processor itself go through the stream too
+// (QueueInStream), so the order holds; whatever queues directly drains first (Real(), WaitForQueueIdle).
 void SplitMainListAsync(bool submit)
 {
     static LiveSwitch sync("REGPU_SYNC_SPLITS"); // (A/B: wait for the replay as before)
@@ -13584,14 +13506,14 @@ void SplitMainListAsync(bool submit)
     {
         SplitMainList();
         if (submit)
-            SubmitLists(0, nullptr);
+            SubmitVkLists(0, nullptr);
         return;
     }
     const bool queryOpen = g_occlusionOpen;
     if (queryOpen)
         EndOcclusionPart();
-    g_r.recorder.HandOff(AcquireList(), submit ? QueueClosedAndSubmit : QueueClosed, nullptr);
-    ListPrologue(g_r.recorder);
+    g_r.vkRecorder.HandOffNew(AcquireVkListFor, &Frame(), submit ? QueueClosedAndSubmit : QueueClosed, nullptr);
+    ListPrologue(g_r.vkRecorder);
     g_drawState.Invalidate();
     SelectSurfaces(true);
     if (queryOpen)
@@ -13610,15 +13532,15 @@ void SplitMainListAsync(bool submit)
     }
 }
 // Lists queued at this point of the main stream (the draw workers' pieces).
-void QueueInStream(std::vector<ID3D12CommandList*> lists)
+void QueueInStream(std::vector<VkCommandBuffer> lists)
 {
     static LiveSwitch sync("REGPU_SYNC_SPLITS");
     if (sync)
-        return QueueLists(UINT(lists.size()), lists.data());
-    auto* held = new std::vector<ID3D12CommandList*>(std::move(lists));
-    g_r.recorder.HandOff(nullptr, [](ID3D12GraphicsCommandList*, void* ctx) {
-        auto* v = static_cast<std::vector<ID3D12CommandList*>*>(ctx);
-        QueueLists(UINT(v->size()), v->data());
+        return QueueVkLists(uint32_t(lists.size()), lists.data());
+    auto* held = new std::vector<VkCommandBuffer>(std::move(lists));
+    g_r.vkRecorder.HandOff(VK_NULL_HANDLE, [](VkCommandBuffer, void* ctx) {
+        auto* v = static_cast<std::vector<VkCommandBuffer>*>(ctx);
+        QueueVkLists(uint32_t(v->size()), v->data());
         delete v;
     }, held);
 }
@@ -13626,14 +13548,12 @@ void QueueInStream(std::vector<ID3D12CommandList*> lists)
 // Waits until everything submitted to the queue so far has finished.
 void WaitForQueueIdle()
 {
-    g_r.recorder.Real(); // (hand-offs still in the replay stream queue their lists first)
-    SubmitLists(0, nullptr); // (queued lists first: the signal follows them)
+    g_r.vkRecorder.Real(); // (hand-offs still in the replay stream queue their lists first)
+    SubmitVkLists(0, nullptr); // (queued lists first: the signal follows them)
     const UINT64 value = g_r.nextFence++;
-    g_r.queue->Signal(g_r.fence.Get(), value);
-    if (g_r.fence->GetCompletedValue() < value)
-    {
+    SignalFence(value);
+    if (FenceCompleted() < value)
         WaitFenceValue(value, 2000);
-    }
 }
 
 // Ends the open query's current D3D part (the guest query stays open).
@@ -14013,9 +13933,9 @@ uint64_t FenceSubmitImpl()
     lastDraws = draws;
     BeginFrameIfNeeded();
     SplitMainList();
-    SubmitLists(0, nullptr); // (the signal must follow this fence's draws)
+    SubmitVkLists(0, nullptr); // (the signal must follow this fence's draws)
     lastValue = g_r.nextFence++;
-    g_r.queue->Signal(g_r.fence.Get(), lastValue);
+    SignalFence(lastValue);
     if (FenceWritebacks())
     {
         // The write-backs recorded before this fence: the fence writer lands them before the fence.
@@ -14088,7 +14008,7 @@ struct Workers
     const std::function<void(uint32_t)>* job = nullptr;
     uint32_t count = 0;
     std::atomic<uint32_t> next{ 0 }, finished{ 0 };
-    std::vector<ID3D12GraphicsCommandList*> lists;
+    std::vector<VkCommandBuffer> lists;
     std::vector<uint64_t> pieceNs; // REGPU_TRACE_PIECES
     std::vector<uint32_t> pieceThread;
 } g_workers;
@@ -14098,11 +14018,11 @@ std::atomic<uint64_t> g_pieceNs{ 0 }, g_segmentNs{ 0 }, g_pieceCount{ 0 }, g_seg
 void TranslatePiece(DrawContext& ctx, uint32_t i)
 {
     const auto t0 = std::chrono::steady_clock::now();
-    ID3D12GraphicsCommandList* real = AcquireList();
-    RecordedList recorder;
+    VkCommandBuffer real = AcquireVkList(Frame(), PiecePool());
+    vk::RecordedList recorder;
     recorder.Init(real, true);
     ctx = DrawContext{};
-    ctx.list = &recorder;
+    ctx.vkList = &recorder;
     ctx.worker = true;
     DrawContext* saved = t_context;
     t_context = &ctx;
@@ -14112,7 +14032,7 @@ void TranslatePiece(DrawContext& ctx, uint32_t i)
     g_r.drawsThisFrame += ctx.draws;
     t_context = saved;
     const auto t1 = std::chrono::steady_clock::now();
-    real->Close();
+    vk::Check(vkEndCommandBuffer(real), "vkEndCommandBuffer(piece)");
     g_workers.lists[i] = real;
     g_workers.pieceNs[i] = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     g_workers.pieceThread[i] = GetCurrentThreadId();
@@ -14435,12 +14355,15 @@ void RendererFinishFencedWritebacks(uint64_t completed)
     }
 }
 
-void RendererFenceWait(uint64_t value, void* event)
+void RendererFenceWait(uint64_t value, void*)
 {
-    if (g_r.fence->GetCompletedValue() >= value)
+    if (FenceCompleted() >= value)
         return;
-    g_r.fence->SetEventOnCompletion(value, HANDLE(event));
-    WaitForSingleObject(HANDLE(event), 2000);
+    VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &g_r.vkFence;
+    wi.pValues = &value;
+    vkWaitSemaphores(g_r.vkd->device, &wi, 2000ull * 1000000); // (2 s at most, as before: the fence writer looks again)
 }
 
 void RendererOcclusionBegin()
@@ -14727,9 +14650,10 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
     // render target views they bind (created in order in it) must exist by then (the D3D12 debug layer:
     // "descriptor handle has not been initialized"; AMD GPUs hung in races, 0.1.2-0.1.4).
     SplitMainList();
-    // Texture uploads of the pieces, executed before them.
-    ID3D12GraphicsCommandList* prepReal = AcquireList();
-    RecordedList prep;
+    // Texture uploads of the pieces, executed before them (pool 0: the main stream's replay is idle until QueueInStream,
+    // and the workers record into this one under the texture lock).
+    VkCommandBuffer prepReal = AcquireVkList(Frame(), 0);
+    vk::RecordedList prep;
     prep.Init(prepReal, true);
     g_prepList = &prep;
     {
@@ -14747,7 +14671,7 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
         g_workers.count = n;
         g_workers.next = 0;
         g_workers.finished = 0;
-        g_workers.lists.assign(n, nullptr);
+        g_workers.lists.assign(n, VK_NULL_HANDLE);
         g_workers.pieceNs.assign(n, 0);
         g_workers.pieceThread.assign(n, 0);
         g_workers.generation++;
@@ -14777,10 +14701,10 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
         }
     }
     g_prepList = nullptr;
-    prepReal->Close();
-    std::vector<ID3D12CommandList*> lists;
+    vk::Check(vkEndCommandBuffer(prepReal), "vkEndCommandBuffer(prep)");
+    std::vector<VkCommandBuffer> lists;
     lists.push_back(prepReal);
-    for (ID3D12GraphicsCommandList* l : g_workers.lists)
+    for (VkCommandBuffer l : g_workers.lists)
         lists.push_back(l);
     QueueInStream(std::move(lists));
     // This thread translated a piece in that piece's list with its own draw state: what it set there isn't
@@ -15779,7 +15703,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // With the vertex arena bound as t1 (VertexArena), indices can't be read in place: triangle lists and strips become
     // real indexed draws (the index arena, which never reads t1), auto-generated indices stay on the GPU, the rest is
     // expanded on the CPU.
-    bool directIndex = (g_r.physical || g_vertexCacheThisFrame) && !noDirectIndex && !indexOverrun && !indexRewritten &&
+    bool directIndex = (g_r.vkPhysical || g_vertexCacheThisFrame) && !noDirectIndex && !indexOverrun && !indexRewritten &&
         (indexSource == 0 || indexSource == 2) && (prim == 4 || prim == 13 || (prim == 6 && (!restartOn || stripCut)));
     LiveSwitch &noIndexed = g_sw_REGPU_NO_INDEXED;
     IndexView indexView{};
@@ -16262,7 +16186,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         LiveSwitch &noDirect = g_sw_REGPU_NO_DIRECT_FETCH;
         static const uint32_t directBytes = getenv("REGPU_DIRECT_FETCH_KB") ? uint32_t(atoi(getenv("REGPU_DIRECT_FETCH_KB"))) * 1024u
                                           : RendererEarlyFences() ? kEarlyFenceDirectFetchBytes : kDirectFetchBytes;
-        if (g_r.physical && !g_vertexCacheThisFrame && !noDirect && bytes >= directBytes && !DynamicBuffer(address, bytes))
+        if (g_r.vkPhysical && !g_vertexCacheThisFrame && !noDirect && bytes >= directBytes && !DynamicBuffer(address, bytes))
         {
             NoteInPlace(address & 0x1FFFFFFF, bytes, false, C().vsHash);
             vc->vf[k][0] = address & 0x1FFFFFFF;
@@ -18314,7 +18238,7 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         const double wallMs = std::chrono::duration<double, std::milli>(now - time0).count();
         const double ticksPerMs = wallMs > 100.0 ? double(tsc - tsc0) / wallMs : 0.0;
         const double cpuMs = ticksPerMs > 0 && cyclesBefore ? double(cycles - cyclesBefore) / ticksPerMs : 0.0;
-        const double fenceNow = g_fenceWaitMs, replayNow = g_r.recorder.m_drainWaitMs;
+        const double fenceNow = g_fenceWaitMs, replayNow = g_r.vkRecorder.m_drainWaitMs;
         static uint64_t drawsBefore = 0, frames = 0;
         const double ms = std::chrono::duration<double, std::milli>(now - last).count();
         last = now;

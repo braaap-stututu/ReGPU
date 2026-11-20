@@ -113,7 +113,16 @@ public:
     using HandOffFn = void (*)(VkCommandBuffer closed, void* ctx);
     void HandOff(VkCommandBuffer next, HandOffFn fn, void* ctx)
     {
-        struct A { VkCommandBuffer next; HandOffFn fn; void* ctx; } a{ next, fn, ctx };
+        struct A { VkCommandBuffer next; HandOffFn fn; void* ctx; AcquireFn acquire; void* actx; } a{ next, fn, ctx, nullptr, nullptr };
+        Put(kHandOff, &a, sizeof(a));
+        Submit();
+    }
+    // The next buffer, allocated and begun by the replay (a command pool is used by one thread at a time: the one
+    // replaying into its buffers allocates the next one, so the draw thread never touches a pool in use).
+    using AcquireFn = VkCommandBuffer (*)(void* ctx);
+    void HandOffNew(AcquireFn acquire, void* actx, HandOffFn fn, void* ctx)
+    {
+        struct A { VkCommandBuffer next; HandOffFn fn; void* ctx; AcquireFn acquire; void* actx; } a{ VK_NULL_HANDLE, fn, ctx, acquire, actx };
         Put(kHandOff, &a, sizeof(a));
         Submit();
     }
@@ -127,7 +136,17 @@ public:
         Submit();
     }
     // Records into another (begun) buffer from here on, without waiting.
-    void Switch(VkCommandBuffer next) { Put(kSwitch, &next, sizeof(next)); }
+    void Switch(VkCommandBuffer next)
+    {
+        struct A { VkCommandBuffer next; AcquireFn acquire; void* actx; } a{ next, nullptr, nullptr };
+        Put(kSwitch, &a, sizeof(a));
+    }
+    // Switch to a buffer the replay acquires (HandOffNew).
+    void SwitchNew(AcquireFn acquire, void* actx)
+    {
+        struct A { VkCommandBuffer next; AcquireFn acquire; void* actx; } a{ VK_NULL_HANDLE, acquire, actx };
+        Put(kSwitch, &a, sizeof(a));
+    }
 
     // The real buffer, with everything recorded so far replayed into it and rendering ended (predication stays).
     VkCommandBuffer Real()
@@ -738,20 +757,25 @@ private:
                 break;
             }
             case kSwitch:
-                EndAll(cb);
-                m_targetsSet = false;
-                cb = m_real = At<VkCommandBuffer>(a);
-                break;
-            case kHandOff:
             {
-                struct A { VkCommandBuffer next; HandOffFn fn; void* ctx; };
+                struct A { VkCommandBuffer next; AcquireFn acquire; void* actx; };
                 const A& c = At<A>(a);
                 EndAll(cb);
-                if (c.next)
+                m_targetsSet = false;
+                cb = m_real = c.acquire ? c.acquire(c.actx) : c.next;
+                break;
+            }
+            case kHandOff:
+            {
+                struct A { VkCommandBuffer next; HandOffFn fn; void* ctx; AcquireFn acquire; void* actx; };
+                const A& c = At<A>(a);
+                EndAll(cb);
+                const bool fresh = c.next || c.acquire;
+                if (fresh)
                     m_targetsSet = false; // a new buffer starts with no rendering state
                 c.fn(cb, c.ctx);
-                if (c.next)
-                    cb = m_real = c.next;
+                if (fresh)
+                    cb = m_real = c.acquire ? c.acquire(c.actx) : c.next;
                 break;
             }
             case kEndRendering: EndRendering(cb); break;
