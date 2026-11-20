@@ -499,6 +499,41 @@ std::string Handle(const std::string& line)
         }
         return Ok("\"hits\":[" + out + "]");
     }
+    // findhex HEXBYTES: guest addresses holding those bytes (as written: big-endian words like 8200206C), at 4-byte
+    // aligned places, the first 64. E.g. a vtable pointer finds the objects of that class (FM3 port, session 37).
+    if (cmd == "findhex")
+    {
+        std::string hex;
+        in >> hex;
+        std::string needle;
+        for (size_t i = 0; i + 1 < hex.size(); i += 2)
+            needle += char(std::stoi(hex.substr(i, 2), nullptr, 16));
+        if (needle.empty())
+            return Error("findhex HEXBYTES");
+        std::string out;
+        int found = 0;
+        for (uint64_t a = 0x10000; a < 0x100000000ull && found < 64;)
+        {
+            MEMORY_BASIC_INFORMATION mi{};
+            if (!VirtualQuery(g_base + a, &mi, sizeof(mi)))
+                break;
+            const uint64_t start = uint64_t(static_cast<uint8_t*>(mi.BaseAddress) - g_base), end = start + mi.RegionSize;
+            if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            {
+                const std::string_view region(reinterpret_cast<const char*>(g_base + start), size_t(end - start));
+                for (size_t at = region.find(needle); at != std::string_view::npos && found < 64; at = region.find(needle, at + 1))
+                    if (((start + at) & 3) == 0)
+                    {
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "%s\"%08llX\"", out.empty() ? "" : ",", (unsigned long long)(start + at));
+                        out += buf;
+                        found++;
+                    }
+            }
+            a = end;
+        }
+        return Ok("\"hits\":[" + out + "]");
+    }
     // env NAME [value]: set (or clear) an environment variable, for the switches that take a value (read once
     // at their first use, so mostly before that happens).
     if (cmd == "env")
