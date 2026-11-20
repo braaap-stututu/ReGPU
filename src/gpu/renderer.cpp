@@ -676,6 +676,9 @@ struct CachedTexture
     uint32_t width = 0, height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM; // cubes: matches their faces
     bool native = false; // block-compressed on the GPU: the shader applies the fetch swizzle
+    // The texture budget's size of `resource` (GetResourceAllocationInfo, asked once per resource: TextureBudgetBytes).
+    const ID3D12Resource* budgetFor = nullptr;
+    uint64_t budgetBytes = 0;
 };
 
 // A resolve destination backed by a host texture: fetches of this guest
@@ -3504,12 +3507,22 @@ void BeginFrameIfNeeded()
             };
             std::vector<Old> old;
             uint64_t total = 0;
-            for (const auto& [key, t] : g_r.textures)
+            // Each texture's size is asked of the driver once and kept (PGR3 port, session 5): asking for every texture each
+            // time (thousands of GetResourceAllocationInfo calls on the draw thread, under the texture mutex) made every
+            // 64th frame ~3 ms longer (PGR3 1440p race at a 360 cap: ~4 long frames a second, p99 6-8 ms; with the
+            // budget off 0.2 and 4.4 ms). REGPU_TEXTURE_BUDGET_ASK_ALL=1 (live): asked every time, as before.
+            static LiveSwitch askAll("REGPU_TEXTURE_BUDGET_ASK_ALL");
+            for (auto& [key, t] : g_r.textures)
             {
                 if (!t.resource)
                     continue;
-                const D3D12_RESOURCE_DESC d = t.resource->GetDesc();
-                const uint64_t b = g_r.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+                if (t.budgetFor != t.resource.Get() || askAll)
+                {
+                    const D3D12_RESOURCE_DESC d = t.resource->GetDesc();
+                    t.budgetBytes = g_r.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+                    t.budgetFor = t.resource.Get();
+                }
+                const uint64_t b = t.budgetBytes;
                 total += b;
                 if (t.checkedFrame == ~0ull || t.checkedFrame + 600 < g_r.frame)
                     old.push_back({ t.checkedFrame == ~0ull ? 0 : t.checkedFrame, key, b });
@@ -3647,11 +3660,19 @@ void BeginFrameIfNeeded()
                 const D3D12_RESOURCE_DESC d = r->GetDesc();
                 return g_r.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
             };
-            auto sum = [&](const auto& map, uint64_t& n) {
+            // Cached textures' sizes are asked once per resource and kept (as the texture budget's, PGR3 session 5: the walk
+            // asking the driver for every texture made this report's frame ~3.5 ms longer every 30 s).
+            static LiveSwitch askAll("REGPU_TEXTURE_BUDGET_ASK_ALL");
+            auto cached = [&](CachedTexture& t) -> uint64_t {
+                if (t.budgetFor != t.resource.Get() || askAll)
+                    t.budgetBytes = bytes(t.resource.Get()), t.budgetFor = t.resource.Get();
+                return t.budgetBytes;
+            };
+            auto sum = [&](auto& map, uint64_t& n) {
                 uint64_t b = 0;
-                for (const auto& [k, t] : map)
+                for (auto& [k, t] : map)
                     if (t.resource)
-                        b += bytes(t.resource.Get()), n++;
+                        b += cached(t), n++;
                 return b;
             };
             uint64_t nTex = 0, nCube = 0, nVol = 0, nMip = 0, nRes = 0, nSurf = 0, nOld = 0;
@@ -3677,9 +3698,9 @@ void BeginFrameIfNeeded()
                 for (const auto& [k, sf] : *m)
                     if (sf.resource)
                         surf += bytes(sf.resource.Get()), nSurf++;
-            for (const auto& [k, t] : g_r.textures)
+            for (auto& [k, t] : g_r.textures)
                 if (t.resource && t.checkedFrame + 1800 < g_r.frame)
-                    oldBytes += bytes(t.resource.Get()), nOld++;
+                    oldBytes += cached(t), nOld++;
             uint64_t rings = 0;
             for (UINT i = 0; i < kFrames; i++)
                 rings += g_r.frames[i].ringSize * (g_r.frames[i].ringAlt ? 2 : 1);
