@@ -4,6 +4,9 @@
 // through those switches; the rest are REGPU_HYPER_* switches read where the renderer and translator use them.
 #include "regpu/hyper.h"
 
+#include "gpu/vk/device.h"
+#include "render/presenter.h"
+
 #include "log.h"
 
 #include <algorithm>
@@ -11,8 +14,6 @@
 #include <cstring>
 #include <string>
 #include <windows.h>
-#include <dxgi1_6.h>
-#include <wrl/client.h>
 
 namespace regpu::hypermode
 {
@@ -46,35 +47,13 @@ struct GpuClass
     bool integrated = false; // 512 MB or less of dedicated memory: shares system memory
 };
 
-// The GPU the renderer will use: REGPU_ADAPTER's match (a name part) when set, else the first hardware adapter.
+// The GPU the renderer uses (REGPU_ADAPTER picks it: vk::CreateDevice).
 GpuClass DetectGpu()
 {
     GpuClass g;
-    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
-        return g;
-    const char* want = getenv("REGPU_ADAPTER");
-    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-    bool found = false;
-    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++)
-    {
-        DXGI_ADAPTER_DESC1 d{};
-        adapter->GetDesc1(&d);
-        if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
-            continue;
-        if (want && *want)
-        {
-            char name[128]{};
-            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
-            if (!strstr(name, want))
-                continue;
-        }
-        g.vendor = d.VendorId;
-        g.integrated = d.DedicatedVideoMemory <= 512ull * 1024 * 1024;
-        found = true;
-        break;
-    }
-    (void)found;
+    const vk::Device& d = RenderVkDevice();
+    g.vendor = d.props.vendorID;
+    g.integrated = d.uma;
     return g;
 }
 

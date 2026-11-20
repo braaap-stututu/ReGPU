@@ -160,7 +160,7 @@ if(REGPU_POSTAA_FILTERS)
     target_include_directories(regpu PRIVATE "${REGPU_AA_DIR}/smaa") # AreaTex.h, SearchTex.h
 endif()
 target_compile_options(regpu PRIVATE -msse4.1 -fno-strict-aliasing -gline-tables-only)
-target_link_libraries(regpu PUBLIC d3d12 dxgi ws2_32 winmm synchronization onecore)
+target_link_libraries(regpu PUBLIC ws2_32 winmm synchronization onecore)
 if(REGPU_FSR3)
     target_compile_definitions(regpu PRIVATE REGPU_FSR3=1)
     target_include_directories(regpu PRIVATE "${REGPU_FFX}/api/include" "${REGPU_FFX}/upscalers/include")

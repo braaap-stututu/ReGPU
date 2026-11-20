@@ -14,10 +14,7 @@
 #include <string>
 #include <vector>
 
-#include <d3d12.h>
-#include <dxgi1_6.h>
 #include <windows.h>
-#include <wrl/client.h>
 
 #include "live_switch.h"
 #include "log.h"
@@ -28,7 +25,6 @@
 #include "regpu/regpu.h"
 #include "settings.h"
 
-using Microsoft::WRL::ComPtr;
 
 namespace
 {
@@ -114,153 +110,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             regpu::GetHost().onChar(wchar_t(wp));
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-void Check(HRESULT hr, const char* what)
-{
-    if (FAILED(hr))
-        Fatal("presenter: %s failed (%08lX)", what, hr);
-}
-
-std::mutex g_deviceMutex;
-ComPtr<ID3D12Device> g_device;
-ComPtr<ID3D12CommandQueue> g_queue;
-
-// The GPU to draw on: the high-performance one. On a laptop with two (NVIDIA Optimus, AMD switchable
-// graphics) Direct3D's default adapter is the integrated GPU unless the executable exports
-// NvOptimusEnablement / AmdPowerXpressRequestHighPerformance, which a plugin DLL cannot do for its host.
-// REGPU_ADAPTER=<n> picks the n-th adapter in that order instead (0 is the first). Null when none
-// makes a feature level 12.0 device: D3D12CreateDevice then takes the default.
-ComPtr<IDXGIAdapter1> PickAdapter()
-{
-    ComPtr<IDXGIFactory6> factory;
-    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))))
-        return nullptr;
-    const char* wanted = getenv("REGPU_ADAPTER");
-    const int pick = wanted && *wanted ? atoi(wanted) : -1;
-    ComPtr<IDXGIAdapter1> chosen;
-    for (UINT i = 0;; i++)
-    {
-        ComPtr<IDXGIAdapter1> adapter;
-        if (FAILED(factory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter))))
-            break;
-        DXGI_ADAPTER_DESC1 desc{};
-        adapter->GetDesc1(&desc);
-        char name[128] = {};
-        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
-        const bool software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE;
-        const bool usable = !software && SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr));
-        Log("presenter: adapter %u: %s (vendor %04X, %llu MB dedicated)%s", i, name, desc.VendorId,
-            (unsigned long long)(desc.DedicatedVideoMemory >> 20), software ? ", software" : usable ? "" : ", no feature level 12.0");
-        if (usable && !chosen && (pick < 0 || int(i) == pick))
-            chosen = adapter;
-    }
-    return chosen;
-}
-
-void EnsureDevice()
-{
-    std::lock_guard lock(g_deviceMutex);
-    if (g_device)
-        return;
-    const Settings& settings = GetSettings();
-    (void)settings;
-    if (getenv("REGPU_D3D12_DEBUG"))
-    {
-        ComPtr<ID3D12Debug> debug;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
-        {
-            debug->EnableDebugLayer();
-            Log("presenter: D3D12 debug layer on");
-            // REGPU_D3D12_GBV=1 (with the debug layer): GPU-based validation and synchronized command
-            // queue validation, which report resource state and barrier hazards as the GPU meets them
-            // (slow). From the FM4 port.
-            ComPtr<ID3D12Debug1> debug1;
-            if (getenv("REGPU_D3D12_GBV") && SUCCEEDED(debug.As(&debug1)))
-            {
-                debug1->SetEnableGPUBasedValidation(TRUE);
-                debug1->SetEnableSynchronizedCommandQueueValidation(TRUE);
-                Log("presenter: D3D12 GPU-based validation on (REGPU_D3D12_GBV)");
-            }
-        }
-        else
-            Log("presenter: D3D12 debug layer not available (Graphics Tools not installed?)");
-    }
-    // REGPU_DRED=1: device-removed breadcrumbs and page-fault reporting, so a removed device logs the
-    // command list and operation the GPU stopped at (renderer.cpp, LogDebugMessages). From the FM4 port.
-    if (getenv("REGPU_DRED"))
-    {
-        ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred))))
-        {
-            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-            Log("presenter: device-removed breadcrumbs and page-fault reporting on (REGPU_DRED)");
-        }
-    }
-    // REGPU_ADAPTER (FM3 port, session 33; the FM3 launcher's "Graphics card"): the GPU to render on, as a part of its
-    // name ("7900", "Radeon(TM) Graphics"; case-insensitive, the first match), an adapter index ("1"), or "high" /
-    // "low" (Windows' high-performance / power-saving GPU). Empty or no match: the high-performance adapter (PickAdapter).
-    ComPtr<IDXGIAdapter1> chosen;
-    if (const char* want = getenv("REGPU_ADAPTER"); want && *want)
-    {
-        ComPtr<IDXGIFactory6> factory;
-        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
-        {
-            std::string w = want;
-            std::transform(w.begin(), w.end(), w.begin(), [](unsigned char c) { return char(tolower(c)); });
-            if (w == "high" || w == "low")
-                factory->EnumAdapterByGpuPreference(0, w == "high" ? DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE : DXGI_GPU_PREFERENCE_MINIMUM_POWER,
-                    IID_PPV_ARGS(&chosen));
-            else if (w.find_first_not_of("0123456789") == std::string::npos)
-                factory->EnumAdapters1(UINT(atoi(want)), &chosen);
-            else
-            {
-                ComPtr<IDXGIAdapter1> a;
-                for (UINT i = 0; !chosen && factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++)
-                {
-                    DXGI_ADAPTER_DESC1 d{};
-                    a->GetDesc1(&d);
-                    char name[128] = {};
-                    WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
-                    std::string n = name;
-                    std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return char(tolower(c)); });
-                    if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && n.find(w) != std::string::npos)
-                        chosen = a;
-                }
-            }
-        }
-        if (!chosen)
-            Log("presenter: REGPU_ADAPTER=%s matches no graphics card: using the default one", want);
-    }
-    if (chosen && FAILED(D3D12CreateDevice(chosen.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device))))
-    {
-        Log("presenter: REGPU_ADAPTER=%s: that graphics card can't run D3D12 feature level 12_0: using the default one", getenv("REGPU_ADAPTER"));
-        chosen.Reset();
-    }
-    if (!g_device)
-    {
-        // No REGPU_ADAPTER: the high-performance GPU on laptops with two (PickAdapter), else Windows' default.
-        ComPtr<IDXGIAdapter1> adapter = PickAdapter();
-        Check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device)), "D3D12CreateDevice");
-    }
-    {
-        // Which card it is (by the device's LUID), for the log and bug reports.
-        ComPtr<IDXGIFactory4> factory;
-        ComPtr<IDXGIAdapter1> a;
-        DXGI_ADAPTER_DESC1 d{};
-        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapterByLuid(g_device->GetAdapterLuid(), IID_PPV_ARGS(&a))) &&
-            SUCCEEDED(a->GetDesc1(&d)))
-        {
-            char name[128] = {};
-            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
-            Log("presenter: rendering on %s (%04X:%04X, %llu MB of its own memory)%s", name, d.VendorId, d.DeviceId,
-                (unsigned long long)(d.DedicatedVideoMemory >> 20), chosen ? " (REGPU_ADAPTER)" : "");
-        }
-    }
-    D3D12_COMMAND_QUEUE_DESC qd{};
-    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    Check(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_queue)), "CreateCommandQueue");
 }
 
 // A windowed game's client area at exactly `width` x `height` pixels (the output resolution), as a
@@ -949,18 +798,6 @@ vk::Device& RenderVkDevice()
             vk::CreateDevice(device, regpu::GetConfig().userDir);
     });
     return device;
-}
-
-ID3D12Device* RenderDevice()
-{
-    EnsureDevice();
-    return g_device.Get();
-}
-
-ID3D12CommandQueue* RenderQueue()
-{
-    EnsureDevice();
-    return g_queue.Get();
 }
 
 void PresenterUseRenderer()

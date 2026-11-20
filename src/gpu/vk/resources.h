@@ -1,7 +1,7 @@
 #pragma once
 // Vulkan resources for the renderer (docs/vulkan-conversion-plan.md, step 4): buffers and images in VMA memory, the
 // per-image state that replaces D3D12's resource states, deferred destruction on the queue timeline, and the format
-// mapping from the DXGI formats renderer.cpp names today.
+// formats' properties.
 //
 // Image state. D3D12 resources carried a state the renderer tracked by hand (Surface::state, StateBefore/After in
 // each barrier) and promoted or decayed implicitly at command list boundaries. Vulkan does neither: every Image keeps
@@ -148,9 +148,6 @@ private:
     std::vector<std::pair<uint64_t, std::function<void()>>> m_dead;
 };
 
-// DXGI format -> Vulkan format, for the formats renderer.cpp uses (VK_FORMAT_UNDEFINED for others). Typeless depth
-// formats map to their depth format.
-VkFormat ToVkFormat(uint32_t dxgiFormat); // a DXGI_FORMAT value (removed with D3D12)
 bool IsDepthFormat(VkFormat format);
 bool HasStencil(VkFormat format);
 // Bytes per texel, or per 4x4 block for block-compressed formats.

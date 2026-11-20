@@ -5,8 +5,6 @@
 #include <cstdio>
 #include <cstring>
 
-#include <dxgiformat.h>
-
 #include "gpu/vk/resources.h"
 
 int main()
@@ -15,16 +13,16 @@ int main()
     vk::CreateDevice(d, {});
     bool ok = true;
 
-    // Every DXGI format renderer.cpp names maps, and an image of it can be made (sampled, copied to and from).
-    const DXGI_FORMAT formats[] = { DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT,
-        DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R16G16_FLOAT,
-        DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC3_UNORM,
-        DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_D32_FLOAT_S8X24_UINT };
+    // Every format renderer.cpp uses: an image of it can be made (sampled, copied to and from).
+    const VkFormat formats[] = { VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+        VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_R32_UINT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R8_UINT, VK_FORMAT_R16_UINT,
+        VK_FORMAT_R16_UNORM, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC4_UNORM_BLOCK,
+        VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_D32_SFLOAT_S8_UINT };
     std::vector<vk::Image> images;
-    for (DXGI_FORMAT f : formats)
+    for (VkFormat f : formats)
     {
         vk::ImageDesc desc;
-        desc.format = vk::ToVkFormat(f);
+        desc.format = f;
         desc.width = desc.height = 64;
         desc.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         if (vk::IsDepthFormat(desc.format))
@@ -33,7 +31,7 @@ int main()
         vk::Image im = desc.format ? vk::CreateImage(d, desc) : vk::Image{};
         if (!im || !im.view)
         {
-            printf("vkresources: DXGI format %d -> %d: no image\n", int(f), int(desc.format));
+            printf("vkresources: format %d: no image\n", int(f));
             ok = false;
         }
         images.push_back(im);

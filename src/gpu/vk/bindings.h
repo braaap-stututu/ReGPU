@@ -61,9 +61,10 @@ struct DrawBindings
 // sizes. False (and a log line) when the device can't hold 65536 update-after-bind images per stage.
 bool CreateDrawBindings(Device& d, DrawBindings& b, uint32_t vsBytes, uint32_t psBytes, uint32_t motionBytes);
 
-// A set 0 over one frame slot's upload ring, guest physical memory and a bank of eight samplers.
+// A set 0 over one frame slot's upload ring, guest physical memory and a bank of eight samplers. motionRing: b2 (the
+// motion draws' last-frame vertex constants) over that buffer instead of `ring` (the previous frame slot's ring).
 VkDescriptorSet CreateSet0(Device& d, DrawBindings& b, VkBuffer ring, VkDeviceSize ringBytes, VkBuffer guest, VkDeviceSize guestBytes,
-    const VkSampler (&samplers)[kSamplerCount]);
+    const VkSampler (&samplers)[kSamplerCount], VkBuffer motionRing = VK_NULL_HANDLE, VkDeviceSize motionRingBytes = 0);
 // Frees a set 0 (its ring grew: a new one replaces it once the frames using it are done).
 void FreeSet0(Device& d, DrawBindings& b, VkDescriptorSet set);
 

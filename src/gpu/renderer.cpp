@@ -34,17 +34,12 @@
 #include <unordered_set>
 #include <unordered_map>
 
-#include <d3d12.h>
-#include <dxgi1_4.h>
-#include <d3dcompiler.h>
 #include <windows.h>
-#include <wrl/client.h>
 
 #include "gpu/hlsl.h"
 #include "gpu/xess.h"
 #include "gpu/dlss.h"
 #include "gpu/fsr3.h"
-#include "gpu/recorded_list.h"
 // The Vulkan renderer's pieces (docs/vulkan-conversion-plan.md, step 6: renderer.cpp moves to them function by
 // function; the D3D12 includes above go once nothing uses them).
 #include "gpu/constants.h"
@@ -65,7 +60,6 @@
 #include "AreaTex.h"
 #include "SearchTex.h"
 #endif
-#include <DirectXPackedVector.h>
 #include "live_switch.h"
 #include "settings.h"
 #include "gpu/regs.h"
@@ -78,39 +72,24 @@
 #include "regpu/driver.h"
 #include "png.h"
 #include "render/presenter.h"
-#if defined(REGPU_VULKAN)
-// Config::renderer = Vulkan (or REGPU_RENDERER=vulkan): the same seam, implemented in gpu/vk/renderer_vk.cpp (the FM2
-// port's Vulkan backend). The command processor calls these entry points either way.
-bool VulkanRendererEnabled();
-void RendererVkSavePipelineCache();
-void RendererVkOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords);
-void RendererVkSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t usedDwords, uint64_t hash);
-void RendererVkOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize);
-void RendererVkOnSwap(uint64_t frame, uint32_t frontBuffer);
-#define REGPU_VK_IF_ENABLED(call) \
-    if (VulkanRendererEnabled()) \
-    { \
-        call; \
-        return; \
-    }
-#else
-#define REGPU_VK_IF_ENABLED(call)
-inline bool VulkanRendererEnabled()
+
+// Rectangles and viewports in D3D's conventions (left, top, right, bottom; the origin top left), as the EDRAM, resolve and
+// draw code has always used them (they were D3D12_RECT and D3D12_VIEWPORT).
+struct Rect
 {
-    return false;
-}
-#endif
+    LONG left = 0, top = 0, right = 0, bottom = 0;
+};
+struct Viewport
+{
+    float TopLeftX = 0, TopLeftY = 0, Width = 0, Height = 0, MinDepth = 0, MaxDepth = 1;
+};
 #include "gpu/renderer.h"
 #include "gpu/shader_scan.h"
 #include "gpu/resolve_pack.h"
 
 // REGPU_DXC (dxc.cpp, global): DXIL from DXC instead of FXC's DXBC, cached apart (.dxil).
 bool DxcEnabled();
-bool DxcFor(bool pixel); // (both stages or neither: D3D12 refuses mixed DXBC/DXIL pipelines)
-HRESULT DxcCompileShader(const std::string& hlsl, bool pixel, ID3DBlob** code, std::string* errors);
-std::string DxcCacheTag(); // "-<hash of REGPU_DXC_ARGS>" or ""
 
-using Microsoft::WRL::ComPtr;
 
 
 std::atomic<bool> g_gameWidescreen{ false }; // regpu::SetGameWidescreen
@@ -291,7 +270,8 @@ struct Upscale
     struct DrawConstants
     {
         uint32_t frame = 0;                    // the temporal frame that last drew it
-        D3D12_GPU_VIRTUAL_ADDRESS address[2]{}; // its vertex constants in that frame's ring, by frame parity
+        uint32_t offset[2]{};                   // its vertex constants in that frame's ring, by frame parity
+        uint8_t slot[2]{ 0xFF, 0xFF };           // and that frame's slot
         float first[16]{};                      // its c0-c3 that frame (camera cut detection; set for sampled draws)
         uint32_t firstFrame = 0;
     };
@@ -730,7 +710,7 @@ void NoteDepthTestLayout(uint32_t depthBase)
 }
 LONG HostX(LONG v) { return LONG(std::lround(double(v) * ScaleX())); }
 LONG HostY(LONG v) { return LONG(std::lround(double(v) * ScaleY())); }
-D3D12_RECT ToHost(const D3D12_RECT& r)
+Rect ToHost(const Rect& r)
 {
     const PassScaleSnapshot& p = PassScales(); // (one ask, not four)
     auto x = [&](LONG v) { return LONG(std::lround(double(v) * p.scaleX)); };
@@ -772,8 +752,7 @@ constexpr UINT kDescriptorsPerFrame = 8192; // per frame: ring + guest memory vi
 constexpr UINT kBindless = 1u << 16;      // permanent texture descriptors (0 null 2D, 1 null cube)
 constexpr UINT kBindlessBase = kDescriptorsPerFrame * 3;
 // The EDRAM colour target: half floats hold the title's HDR (7e3) range.
-constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
-constexpr VkFormat kVkColorFormat = VK_FORMAT_R16G16B16A16_SFLOAT; // the EDRAM colour surfaces' format
+constexpr VkFormat kVkColorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 constexpr UINT kMaxSurfaces = 64; // EDRAM bases with host surfaces
 // Samples per pixel of the scene surfaces (anti-aliasing, Settings::msaa). The blits that
 // read them use multisampled shaders when this is above 1.
@@ -953,27 +932,18 @@ constexpr UINT kSamplerBanks = 4;
 
 struct FrameResources
 {
-    ComPtr<ID3D12CommandAllocator> allocator;
-    ComPtr<ID3D12Resource> ring;
-    uint8_t* ringCpu = nullptr;
+    uint8_t* ringCpu = nullptr; // vkRing's mapping
     UINT64 ringSize = 0; // this slot's ring (grows, see RingAlloc)
-    // REGPU_GPU_UPLOAD_RING (live): the same ring in a GPU upload heap (VRAM the CPU writes through resizable BAR),
-    // swapped with `ring` at the frame start; made only when the device reports GPU upload heaps.
+    // REGPU_GPU_UPLOAD_RING (live): the ring in VRAM the CPU writes through resizable BAR, swapped with vkRingAlt at the
+    // frame start; made only where the device offers such memory.
     bool ringInVram = false;
     std::atomic<UINT64> ringUsed{ 0 }; // draw workers allocate concurrently
     // Guest ranges already uploaded this frame: (address << 32 | bytes) -> (offset, sample hash).
     std::unordered_map<uint64_t, std::pair<UINT64, uint64_t>> uploads;
-    UINT descriptorBase = 0;
-    UINT descriptorsUsed = 0;
-    UINT64 fence = 0;
-    std::vector<ComPtr<ID3D12Resource>> garbage; // released once this frame's work completes
+    UINT64 fence = 0;   // the renderer fence's value at this slot's frame end
     bool timed = false; // REGPU_PERF: GPU timestamps were written for this frame
-    // Extra command lists of this frame (parallel draw pieces, main list continuations).
-    std::vector<std::pair<ComPtr<ID3D12CommandAllocator>, ComPtr<ID3D12GraphicsCommandList>>> pool;
-    size_t poolUsed = 0;
 
-    // Vulkan (docs/vulkan-conversion-plan.md, step 6: these replace the D3D12 members above, which go once unused).
-    // This slot's command buffers (allocator, pool, poolUsed), by pool: 0 the main stream (used by its replay thread, or
+    // This slot's command buffers, by pool: 0 the main stream (used by its replay thread, or
     // by the draw thread while the replay is idle), 1.. one per thread that translates draw pieces (a command pool is
     // used by one thread at a time). Reset when the slot comes round again.
     struct VkPoolSet
@@ -983,12 +953,14 @@ struct FrameResources
         size_t used = 0;
     };
     std::vector<VkPoolSet> vkPools;
-    vk::Buffer vkRing;                              // the upload ring (ring / ringCpu / ringSize)
-    vk::Buffer vkRingAlt;                           // ringAlt: REGPU_GPU_UPLOAD_RING's ring in the other memory
+    vk::Buffer vkRing;                              // the upload ring (ringCpu, ringSize)
+    vk::Buffer vkRingAlt;                           // REGPU_GPU_UPLOAD_RING's ring in the other memory
     VkDescriptorSet vkSet0[kSamplerBanks] = {};     // set 0 over vkRing, guest memory and each sampler bank
+    VkDescriptorSet vkSet0Motion[kSamplerBanks] = {}; // the same with b2 over the previous slot's ring (motion draws:
+    VkBuffer vkSet0PrevRing = VK_NULL_HANDLE;           // last frame's vertex constants, where that frame left them)
     VkDeviceSize vkSet0GphysBytes = 0;
     VkBuffer vkSet0Gphys = VK_NULL_HANDLE;          // what those sets bind as gphys (t1): guest memory, the vertex arena or
-                                                    // the ring (the copy path), as D3D12's per-frame t1 view
+                                                    // the ring (the copy path)
     std::vector<std::function<void()>> vkGarbage;   // garbage: destroyed when this slot's frame has completed
     std::vector<ImageRef> retiredImages;            // garbage: released when this slot's frame has completed
     vk::TransientSets vkSets;                       // ReGPU's own passes' descriptor sets this frame (vk::PassArgs)
@@ -1090,8 +1062,7 @@ struct BoundTexture
 // the larger ones: that is done on worker threads and draws wait until it is ready.
 struct PipelineEntry
 {
-    ComPtr<ID3D12PipelineState> pso;
-    VkPipeline vk = VK_NULL_HANDLE; // Vulkan: replaces pso
+    VkPipeline vk = VK_NULL_HANDLE;
     std::atomic<int> state{ 0 }; // 0 building, 1 ready, 2 failed
     // The build, run once by whoever claims it first: a pool thread, or a draw that must wait for it
     // (WaitForPipeline), so that draw doesn't wait behind every build queued before it.
@@ -1106,27 +1077,11 @@ struct PipelineEntry
 
 struct Renderer
 {
-    ID3D12Device* device = nullptr;
-    ID3D12CommandQueue* queue = nullptr;
-    ComPtr<ID3D12GraphicsCommandList> realList;
-    RecordedList recorder; // the main thread's command list (see recorded_list.h)
-    ComPtr<ID3D12Heap> physicalHeap;     // the guest's physical memory section, mapped for the GPU
-    ComPtr<ID3D12Resource> physical;     // 512 MB raw buffer over it (null if unsupported)
-    ComPtr<ID3D12Fence> fence;
-    HANDLE fenceEvent = nullptr;
-    UINT64 nextFence = 1;
+    UINT64 nextFence = 1; // the renderer fence's next value (vkFence)
     FrameResources frames[kFrames];
     UINT frameIndex = 0;
     bool listOpen = false;
 
-    ComPtr<ID3D12RootSignature> rootSignature;
-    ComPtr<ID3D12DescriptorHeap> srvHeap;     // shader visible
-    ComPtr<ID3D12DescriptorHeap> samplerHeap; // REGPU_LEAN_FETCH: s0-s7 again as a table (space1, root parameter 4)
-    ComPtr<ID3D12DescriptorHeap> stagingHeap; // CPU: null texture SRV
-    UINT srvStride = 0;
-    ComPtr<ID3D12DescriptorHeap> rtvHeap, dsvHeap;
-    ComPtr<ID3D12RootSignature> blitRootSignature;
-    ComPtr<ID3D12RootSignature> motionRootSignature; // root signature + b2 (motion-vector pipelines)
     vk::Pass depthBlit;                // depth buffer -> R32_SFLOAT
     vk::Pass depthPackBlit;            // depth and stencil -> the guest's D24S8 words as RGBA8
     vk::Pass colorBlit8, colorBlit16;  // colour -> 8888 / RGBA16F, scaled
@@ -1138,12 +1093,8 @@ struct Renderer
     // places at different EDRAM offsets do not overwrite each other.
     struct Surface
     {
-        ComPtr<ID3D12Resource> resource;
-        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        D3D12_CPU_DESCRIPTOR_HANDLE view{};
         uint64_t lastFrame = 0; // the frame that last selected it (EvictSurfaces)
-        UINT slot = 0;          // its view in the RTV/DSV heap
-        vk::Image vk;           // Vulkan: replaces resource, state and view (vk.target is the attachment view)
+        vk::Image vk;           // the image (vk.target its attachment view; its own state)
     };
     std::unordered_map<uint32_t, Surface> colorSurfaces, depthSurfaces;
     BufferRef readback; // the dumped frame (DumpWidth x OutputHeight RGBA8, 256-byte rows)
@@ -1230,41 +1181,18 @@ uint64_t ImageBytes(const vk::Image* image)
 }
 std::atomic<uint32_t> g_lastFrameDraws{ 0 }; // the debug server's status
 
-// REGPU_LEAN_FETCH's sampler table (Init): the eight samplers in banks. A change of texture filtering
-// (regpu::SetAnisotropy) is written into the next bank and the draws switch to it, so frames still in
-// flight keep reading the one they were recorded with.
-D3D12_SAMPLER_DESC g_samplerBase[8]{};
-UINT g_samplerStride = 0;
+// The eight samplers in banks (InitVulkan): a change of texture filtering (regpu::SetAnisotropy) is written into the
+// next bank and the draws switch to it, so frames still in flight keep reading the one they were recorded with.
 std::atomic<UINT> g_samplerBank{ 0 };
 std::atomic<int> g_anisoRequest{ -1 }, g_anisoApplied{ -1 };
 std::mutex g_samplerMutex;
 
-void WriteSamplerBank(UINT bank, int aniso)
-{
-    for (UINT i = 0; i < 8; i++)
-    {
-        D3D12_SAMPLER_DESC s = g_samplerBase[i];
-        // The wrapping linear samplers (s0 and the anisotropic s4-s7): surface textures. The clamped
-        // and point ones (shadow maps, render targets, lookups) stay as they are.
-        const bool surface = i == 0 || i >= 4;
-        if (surface && aniso == 0)
-        {
-            s.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-            s.MaxAnisotropy = 0;
-        }
-        else if (surface && aniso > 0)
-        {
-            s.Filter = aniso > 1 ? D3D12_FILTER_ANISOTROPIC : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-            s.MaxAnisotropy = UINT(std::clamp(aniso, 1, 16));
-        }
-        D3D12_CPU_DESCRIPTOR_HANDLE h = g_r.samplerHeap->GetCPUDescriptorHandleForHeapStart();
-        h.ptr += size_t(bank * 8 + i) * g_samplerStride;
-        g_r.device->CreateSampler(&s, h);
-    }
-}
-
-// The sampler table for the next draw, after a filtering change if one is pending (draw thread).
-D3D12_GPU_DESCRIPTOR_HANDLE SamplerTable()
+void SamplerAnisotropy(int aniso, int (&out)[vk::kSamplerCount]); // (below)
+// The sampler bank for the next draw, after a filtering change if one is pending (regpu::SetAnisotropy, draw threads):
+// the next bank gets samplers with the new filtering and every slot's set 0s for that bank are made again, so frames
+// in flight keep reading the bank they were recorded with.
+void UpdateSlotSetsBank(UINT bank); // (below)
+UINT SamplerBank()
 {
     if (g_anisoRequest.load(std::memory_order_relaxed) != g_anisoApplied.load(std::memory_order_acquire))
     {
@@ -1272,15 +1200,23 @@ D3D12_GPU_DESCRIPTOR_HANDLE SamplerTable()
         if (const int want = g_anisoRequest.load(); want != g_anisoApplied.load())
         {
             const UINT bank = (g_samplerBank.load() + 1) % kSamplerBanks;
-            WriteSamplerBank(bank, want);
+            VkSampler old[vk::kSamplerCount];
+            memcpy(old, g_r.vkSamplers[bank], sizeof(old));
+            int aniso[vk::kSamplerCount];
+            SamplerAnisotropy(want, aniso);
+            vk::CreateSamplers(*g_r.vkd, aniso, g_r.vkSamplers[bank]);
+            UpdateSlotSetsBank(bank);
+            vk::Device* d = g_r.vkd;
+            g_r.vkGraveyard.Bury(d->submitted.load() + 1, [d, samplers = std::vector<VkSampler>(old, old + vk::kSamplerCount)] {
+                for (VkSampler sampler : samplers)
+                    vkDestroySampler(d->device, sampler, nullptr);
+            });
             g_samplerBank.store(bank);
             g_anisoApplied.store(want, std::memory_order_release);
             Log("renderer: texture filtering %d (sampler bank %u)", want, bank);
         }
     }
-    D3D12_GPU_DESCRIPTOR_HANDLE h = g_r.samplerHeap->GetGPUDescriptorHandleForHeapStart();
-    h.ptr += uint64_t(g_samplerBank.load()) * 8 * g_samplerStride;
-    return h;
+    return g_samplerBank.load(std::memory_order_relaxed);
 }
 
 std::atomic<uint64_t> g_outputRequest{ 0 }; // regpu::SetOutputSize: width << 32 | height, 0 none (ApplyOutputSize)
@@ -1322,17 +1258,11 @@ vk::RecordedList* g_prepList = nullptr;
 // workers each have their own (see the parallel draw segments in gpu.cpp).
 struct DrawContext
 {
-    RecordedList* list = nullptr;
-    vk::RecordedList* vkList = nullptr; // Vulkan: replaces list
-    // Vulkan: the bound surfaces (replace color, depth, rtv, dsv and colorState: an image carries its own state). Draw
-    // workers leave them as targets and don't transition them.
+    vk::RecordedList* vkList = nullptr; // this thread's recorder (the main stream's, or a draw piece's)
+    // The bound surfaces (an image carries its own state). Draw workers leave them as targets and don't transition them.
     vk::Image* vkColor = nullptr;
     vk::Image* vkDepth = nullptr;
     uint32_t colorBase = ~0u, depthBase = ~0u;
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv{}, dsv{};
-    // The bound surfaces.
-    ComPtr<ID3D12Resource> color, depth;
-    D3D12_RESOURCE_STATES colorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
     // Active shaders: the last microcode loaded per stage.
     std::vector<uint32_t> vsCode, psCode;
     uint64_t vsHash = 0, psHash = 0;
@@ -1363,74 +1293,13 @@ struct TextureScope
     }
 };
 
-// With REGPU_DRED: where the GPU was when the device went away. Each command list still in flight
-// logs its breadcrumb count and the last operation it completed, with the operations around it; a
-// page fault logs its address and the allocations at or recently freed from it. From the FM4 port.
-void LogDeviceRemovedData()
-{
-    ComPtr<ID3D12DeviceRemovedExtendedData> dred;
-    if (!g_r.device || FAILED(g_r.device->QueryInterface(IID_PPV_ARGS(&dred))))
-        return;
-    static const char* kOps[] = { "SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced", "ExecuteIndirect",
-        "Dispatch", "CopyBufferRegion", "CopyTextureRegion", "CopyResource", "CopyTiles", "ResolveSubresource", "ClearRenderTargetView",
-        "ClearUnorderedAccessView", "ClearDepthStencilView", "ResourceBarrier", "ExecuteBundle", "Present", "ResolveQueryData",
-        "BeginSubmission", "EndSubmission" };
-    const auto op = [&](D3D12_AUTO_BREADCRUMB_OP o) { return UINT(o) < std::size(kOps) ? kOps[o] : "other"; };
-    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT crumbs{};
-    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&crumbs)))
-    {
-        int listed = 0;
-        for (const D3D12_AUTO_BREADCRUMB_NODE* n = crumbs.pHeadAutoBreadcrumbNode; n && listed < 16; n = n->pNext)
-        {
-            const UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
-            if (done >= n->BreadcrumbCount)
-                continue; // finished
-            listed++;
-            Log("renderer: dred: list %p (%s) on queue %p: %u of %u operations done", static_cast<const void*>(n->pCommandList),
-                n->pCommandListDebugNameA ? n->pCommandListDebugNameA : "unnamed", static_cast<const void*>(n->pCommandQueue), done, n->BreadcrumbCount);
-            const UINT from = done > 4 ? done - 4 : 0, to = std::min(n->BreadcrumbCount, done + 4);
-            for (UINT i = from; i < to; i++)
-                Log("renderer: dred:   %s%u %s", i == done ? "> " : "  ", i, op(n->pCommandHistory[i]));
-        }
-        if (!listed)
-            Log("renderer: dred: no command list was in flight");
-    }
-    D3D12_DRED_PAGE_FAULT_OUTPUT fault{};
-    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault)) && fault.PageFaultVA)
-    {
-        Log("renderer: dred: page fault at GPU VA %016llX", (unsigned long long)fault.PageFaultVA);
-        for (const D3D12_DRED_ALLOCATION_NODE* a = fault.pHeadExistingAllocationNode; a; a = a->pNext)
-            Log("renderer: dred:   existing allocation %s (type %d)", a->ObjectNameA ? a->ObjectNameA : "unnamed", int(a->AllocationType));
-        for (const D3D12_DRED_ALLOCATION_NODE* a = fault.pHeadRecentFreedAllocationNode; a; a = a->pNext)
-            Log("renderer: dred:   recently freed %s (type %d)", a->ObjectNameA ? a->ObjectNameA : "unnamed", int(a->AllocationType));
-    }
-    else
-        Log("renderer: dred: no page fault recorded");
-}
-
+// When a Vulkan call failed (Check): what the validation layer reported (REGPU_VK_VALIDATION puts its messages in the
+// log as they come; this says how many). D3D12's device-removed breadcrumbs (REGPU_DRED) have no Vulkan counterpart
+// here yet (VK_EXT_device_fault would be it).
 void LogDebugMessages()
 {
-    if (g_r.device)
-        Log("renderer: device removed reason %08lX", g_r.device->GetDeviceRemovedReason());
-    if (getenv("REGPU_DRED"))
-        LogDeviceRemovedData();
-    ComPtr<ID3D12InfoQueue> queue;
-    if (!g_r.device || FAILED(g_r.device->QueryInterface(IID_PPV_ARGS(&queue))))
-        return;
-    // The first messages name the cause; the rest are often its echo (calls on a list that failed to close).
-    const UINT64 n = queue->GetNumStoredMessages();
-    for (UINT64 i = 0; i < n; i++)
-    {
-        if (i == 15 && n > 20)
-            i = n - 5;
-        SIZE_T size = 0;
-        queue->GetMessage(i, nullptr, &size);
-        std::vector<char> buffer(size);
-        auto* message = reinterpret_cast<D3D12_MESSAGE*>(buffer.data());
-        queue->GetMessage(i, message, &size);
-        Log("d3d12: %s", message->pDescription);
-    }
-    queue->ClearStoredMessages();
+    if (g_r.vkd && g_r.vkd->validation)
+        Log("renderer: %llu validation messages so far (above)", (unsigned long long)vk::g_validationMessages.load());
 }
 double g_pipelineMs = 0; // REGPU_PERF: time spent creating pipeline states this second
 uint32_t g_pipelinesCreated = 0;
@@ -1913,17 +1782,16 @@ struct IndexView
 
 struct DrawState
 {
-    D3D12_VIEWPORT viewport{ -1, -1, -1, -1, -1, -1 };
-    D3D12_RECT scissor{ -1, -1, -1, -1 };
+    Viewport viewport{ -1, -1, -1, -1, -1, -1 };
+    Rect scissor{ -1, -1, -1, -1 };
     uint32_t stencilRef = ~0u;
     float blendFactor[4] = { -1, -1, -1, -1 };
     VkPipeline pso = VK_NULL_HANDLE;
-    D3D12_GPU_DESCRIPTOR_HANDLE table2{}, table3{}, samplers{};
     bool texturesBound = false;               // Vulkan: sets 1-3 bound in this command buffer
     VkDescriptorSet set0 = VK_NULL_HANDLE;    // Vulkan: the set 0 last bound (with its offsets)
     uint32_t set0Offsets[3] = { ~0u, ~0u, ~0u };
 
-    D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
     bool motionTargets = false; // the motion target is bound as the second render target
     bool motionRoot = false;    // the motion root signature is set
     IndexView indexBuffer{};
@@ -1933,26 +1801,15 @@ thread_local DrawState g_drawState;
 
 // A D3D viewport as Vulkan's, flipped to D3D's y-up NDC with a negative height (core since Vulkan 1.1): the translated
 // vertex shaders' positions and the pipelines' front faces stay as on D3D12.
-VkViewport ToVkViewport(const D3D12_VIEWPORT& v)
+VkViewport ToVkViewport(const Viewport& v)
 {
     return { v.TopLeftX, v.TopLeftY + v.Height, v.Width, -v.Height, v.MinDepth, v.MaxDepth };
 }
 // A D3D rectangle as a Vulkan one (offsets clamped at 0: Vulkan refuses negative scissor offsets).
-VkRect2D ToVkRect(const D3D12_RECT& r)
+VkRect2D ToVkRect(const Rect& r)
 {
     const LONG left = std::max<LONG>(r.left, 0), top = std::max<LONG>(r.top, 0);
     return { { int32_t(left), int32_t(top) }, { uint32_t(std::max<LONG>(r.right - left, 0)), uint32_t(std::max<LONG>(r.bottom - top, 0)) } };
-}
-VkPrimitiveTopology ToVkTopology(D3D_PRIMITIVE_TOPOLOGY t)
-{
-    switch (t)
-    {
-    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
-    case D3D_PRIMITIVE_TOPOLOGY_LINELIST: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-    case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
-    case D3D_PRIMITIVE_TOPOLOGY_POINTLIST: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
-    default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    }
 }
 
 // Texture cache key: address (4 KB aligned), format (6 bits), width and height (13 bits each).
@@ -2268,41 +2125,8 @@ uint64_t Hash(uint64_t key, const uint8_t* source, size_t bytes, size_t stride)
 }
 }
 
-D3D12_CPU_DESCRIPTOR_HANDLE Cpu(ID3D12DescriptorHeap* heap, UINT index, UINT stride)
-{
-    D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += SIZE_T(index) * stride;
-    return h;
-}
-
-D3D12_GPU_DESCRIPTOR_HANDLE Gpu(ID3D12DescriptorHeap* heap, UINT index, UINT stride)
-{
-    D3D12_GPU_DESCRIPTOR_HANDLE h = heap->GetGPUDescriptorHandleForHeapStart();
-    h.ptr += UINT64(index) * stride;
-    return h;
-}
-
 bool g_gpuUploadHeap = false; // GPU upload heaps reported and allowed (see the ring set-up)
 bool g_uma = false, g_cacheCoherentUma = false; // the GPU shares system memory (InitVulkan)
-
-ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state);
-
-ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state)
-{
-    D3D12_HEAP_PROPERTIES hp{};
-    hp.Type = heap;
-    D3D12_RESOURCE_DESC rd{};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = size;
-    rd.Height = 1;
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1;
-    rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    ComPtr<ID3D12Resource> r;
-    Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(&r)), "CreateCommittedResource(buffer)"); CountCreate("buffer");
-    return r;
-}
 
 // Depth resolves: a depth-stencil buffer can only be copied whole, so the
 // resolve rectangle is drawn into an R32_FLOAT texture by a tiny pass that
@@ -2516,7 +2340,6 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
     }
 }
 
-void InitPipelineLibrary(ID3D12Device* device);
 
 // Guest physical memory for the GPU, in place: vertex fetches read it without copies. Called at
 // init and, when that fails, again at a few frames after (FrameBegin): under ReXGlue the heap calls
@@ -2607,67 +2430,6 @@ bool AnisoFromFetch()
     return fromFetch;
 }
 
-// N4 (FM3 port session 43, Intel's D3D12 guidance): REGPU_ROOTSIG_11=1 (start-time) serializes the main root
-// signatures as version 1.1, so the root CBVs (b0/b1: per-draw constants in the upload ring, written before the draw
-// is recorded and never changed while the list runs) are DATA_STATIC_WHILE_SET_AT_EXECUTE, which lets a driver
-// prefetch or fold them. Every descriptor table keeps 1.0's meaning (descriptors and data volatile: the guest-memory
-// view changes under the GPU, bindless slots are rewritten). Same results; measure on the GPU in question.
-HRESULT SerializeRootSignatureFor(const D3D12_ROOT_SIGNATURE_DESC& rs, ComPtr<ID3DBlob>& blob, ComPtr<ID3DBlob>& error)
-{
-    static const bool v11 = getenv("REGPU_ROOTSIG_11") && atoi(getenv("REGPU_ROOTSIG_11")) != 0;
-    if (!v11)
-        return D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
-    std::vector<D3D12_ROOT_PARAMETER1> params(rs.NumParameters);
-    std::vector<std::vector<D3D12_DESCRIPTOR_RANGE1>> ranges(rs.NumParameters);
-    for (UINT i = 0; i < rs.NumParameters; i++)
-    {
-        const D3D12_ROOT_PARAMETER& a = rs.pParameters[i];
-        D3D12_ROOT_PARAMETER1& b = params[i];
-        b.ParameterType = a.ParameterType;
-        b.ShaderVisibility = a.ShaderVisibility;
-        if (a.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
-        {
-            for (UINT r = 0; r < a.DescriptorTable.NumDescriptorRanges; r++)
-            {
-                const D3D12_DESCRIPTOR_RANGE& x = a.DescriptorTable.pDescriptorRanges[r];
-                D3D12_DESCRIPTOR_RANGE1 y{};
-                y.RangeType = x.RangeType;
-                y.NumDescriptors = x.NumDescriptors;
-                y.BaseShaderRegister = x.BaseShaderRegister;
-                y.RegisterSpace = x.RegisterSpace;
-                y.OffsetInDescriptorsFromTableStart = x.OffsetInDescriptorsFromTableStart;
-                y.Flags = x.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER ? D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
-                                                                              : D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
-                ranges[i].push_back(y);
-            }
-            b.DescriptorTable.NumDescriptorRanges = UINT(ranges[i].size());
-            b.DescriptorTable.pDescriptorRanges = ranges[i].data();
-        }
-        else if (a.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
-            b.Constants = a.Constants;
-        else
-        {
-            b.Descriptor.ShaderRegister = a.Descriptor.ShaderRegister;
-            b.Descriptor.RegisterSpace = a.Descriptor.RegisterSpace;
-            b.Descriptor.Flags = a.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV ? D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE
-                                                                                    : D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
-        }
-    }
-    D3D12_VERSIONED_ROOT_SIGNATURE_DESC v{};
-    v.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-    v.Desc_1_1.NumParameters = rs.NumParameters;
-    v.Desc_1_1.pParameters = params.data();
-    v.Desc_1_1.NumStaticSamplers = rs.NumStaticSamplers;
-    v.Desc_1_1.pStaticSamplers = rs.pStaticSamplers;
-    v.Desc_1_1.Flags = rs.Flags;
-    static bool logged = false;
-    if (!logged)
-    {
-        logged = true;
-        Log("renderer: root signatures as version 1.1 (root constant buffers static while set: REGPU_ROOTSIG_11)");
-    }
-    return D3D12SerializeVersionedRootSignature(&v, &blob, &error);
-}
 
 // The sampler anisotropy per slot (s0-s7) for a filtering setting: -1 as configured at start (s0 16x unless REGPU_NO_ANISO
 // or REGPU_ANISO_FROM_FETCH; s4-s7 2x/4x/8x/16x), 0 off, 1-16 for the surface samplers (s0, s4-s7): the D3D12 static
@@ -2687,21 +2449,53 @@ void SamplerAnisotropy(int aniso, int (&out)[vk::kSamplerCount])
 // frame (D3D12 wrote the per-frame table's two views each frame).
 void UpdateSlotSets(FrameResources& f, VkBuffer gphys, VkDeviceSize gphysBytes, bool ringChanged)
 {
-    if (!ringChanged && gphys == f.vkSet0Gphys && f.vkSet0[0])
+    // (The previous slot's ring for b2; before it exists, this one's.)
+    const FrameResources& prev = g_r.frames[(UINT(&f - g_r.frames) + kFrames - 1) % kFrames];
+    const vk::Buffer& prevRing = prev.vkRing ? prev.vkRing : f.vkRing;
+    if (!ringChanged && gphys == f.vkSet0Gphys && f.vkSet0[0] && prevRing.buffer == f.vkSet0PrevRing)
         return;
     if (f.vkSet0[0])
     {
-        VkDescriptorSet oldSets[kSamplerBanks];
-        memcpy(oldSets, f.vkSet0, sizeof(oldSets));
+        VkDescriptorSet oldSets[2 * kSamplerBanks];
+        memcpy(oldSets, f.vkSet0, sizeof(f.vkSet0));
+        memcpy(oldSets + kSamplerBanks, f.vkSet0Motion, sizeof(f.vkSet0Motion));
         f.vkGarbage.push_back([oldSets] {
             for (VkDescriptorSet set : oldSets)
                 vk::FreeSet0(*g_r.vkd, g_r.vkBindings, set);
         });
     }
     for (UINT bank = 0; bank < kSamplerBanks; bank++)
+    {
         f.vkSet0[bank] = vk::CreateSet0(*g_r.vkd, g_r.vkBindings, f.vkRing.buffer, f.vkRing.size, gphys, gphysBytes, g_r.vkSamplers[bank]);
+        f.vkSet0Motion[bank] = vk::CreateSet0(*g_r.vkd, g_r.vkBindings, f.vkRing.buffer, f.vkRing.size, gphys, gphysBytes, g_r.vkSamplers[bank],
+            prevRing.buffer, prevRing.size);
+    }
+    f.vkSet0PrevRing = prevRing.buffer;
     f.vkSet0Gphys = gphys;
     f.vkSet0GphysBytes = gphysBytes;
+}
+
+// Every slot's set 0s of one sampler bank made again (its samplers changed: SamplerBank); the old ones go when every
+// frame submitted so far has completed.
+void UpdateSlotSetsBank(UINT bank)
+{
+    std::vector<VkDescriptorSet> old;
+    for (FrameResources& f : g_r.frames)
+    {
+        if (!f.vkSet0[bank])
+            continue;
+        const FrameResources& prev = g_r.frames[(UINT(&f - g_r.frames) + kFrames - 1) % kFrames];
+        const vk::Buffer& prevRing = prev.vkRing ? prev.vkRing : f.vkRing;
+        old.push_back(f.vkSet0[bank]);
+        old.push_back(f.vkSet0Motion[bank]);
+        f.vkSet0[bank] = vk::CreateSet0(*g_r.vkd, g_r.vkBindings, f.vkRing.buffer, f.vkRing.size, f.vkSet0Gphys, f.vkSet0GphysBytes, g_r.vkSamplers[bank]);
+        f.vkSet0Motion[bank] = vk::CreateSet0(*g_r.vkd, g_r.vkBindings, f.vkRing.buffer, f.vkRing.size, f.vkSet0Gphys, f.vkSet0GphysBytes,
+            g_r.vkSamplers[bank], prevRing.buffer, prevRing.size);
+    }
+    g_r.vkGraveyard.Bury(g_r.vkd->submitted.load() + 1, [old] {
+        for (VkDescriptorSet set : old)
+            vk::FreeSet0(*g_r.vkd, g_r.vkBindings, set);
+    });
 }
 
 // An upload ring: host-visible, in system memory or (vram: REGPU_GPU_UPLOAD_RING) device-local memory the CPU writes
@@ -2832,204 +2626,15 @@ void InitVulkan()
     Log("renderer: Vulkan objects ready (%u frame slots, %llu MB upload ring each)", kFrames, (unsigned long long)(kRingSize >> 20));
 }
 
+void LoadPipelineManifest(); // (below)
 void Init()
 {
-    g_r.device = RenderDevice();
-    g_r.queue = RenderQueue();
-    // REGPU_D3D12_STACKS=1 (with REGPU_D3D12_DEBUG): each debug-layer error is logged when it
-    // happens, with the stack of the call that made it (the first 3 of each kind).
-    if (getenv("REGPU_D3D12_STACKS"))
-    {
-        ComPtr<ID3D12InfoQueue1> queue;
-        DWORD cookie = 0;
-        if (SUCCEEDED(g_r.device->QueryInterface(IID_PPV_ARGS(&queue))))
-            queue->RegisterMessageCallback(
-                [](D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id, LPCSTR description, void*) {
-                    if (severity > D3D12_MESSAGE_SEVERITY_ERROR)
-                        return;
-                    static std::mutex m;
-                    static std::unordered_map<int, int> seen;
-                    std::lock_guard lock(m);
-                    if (seen[int(id)]++ >= 3)
-                        return;
-                    const auto stack = regpu::GetHost().currentStack;
-                    Log("d3d12 error %d: %s\n  at %s", int(id), description, stack ? stack(16).c_str() : "?");
-                },
-                D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie);
-        else
-            Log("renderer: no ID3D12InfoQueue1 (REGPU_D3D12_STACKS needs the debug layer)");
-    }
-    auto* d = g_r.device;
-
-    // Root signature: b0, b1 root CBVs; one table t0-t32; four static samplers.
-    D3D12_DESCRIPTOR_RANGE range{};
-    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = 2; // t0 upload ring, t1 guest memory
-    D3D12_DESCRIPTOR_RANGE bindless[3]{};
-    for (UINT i = 0; i < 3; i++)
-    {
-        // 2D textures in space1, cubes in space2, 3D in space3, over the same descriptors.
-        bindless[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        bindless[i].NumDescriptors = kBindless;
-        bindless[i].RegisterSpace = 1 + i;
-        bindless[i].OffsetInDescriptorsFromTableStart = 0;
-    }
-    D3D12_ROOT_PARAMETER params[6]{};
-    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[0].Descriptor.ShaderRegister = 0;
-    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[1].Descriptor.ShaderRegister = 1;
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[2].DescriptorTable.NumDescriptorRanges = 1;
-    params[2].DescriptorTable.pDescriptorRanges = &range;
-    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[3].DescriptorTable.NumDescriptorRanges = 3;
-    params[3].DescriptorTable.pDescriptorRanges = bindless;
-    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    // s0-s3 linear wrap, linear clamp, point clamp, point wrap; s4-s7 linear wrap at 2x, 4x, 8x, 16x
-    // anisotropy (REGPU_ANISO_FROM_FETCH, below).
-    D3D12_STATIC_SAMPLER_DESC samplers[8]{};
-    const D3D12_FILTER filters[4] = { D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_FILTER_MIN_MAG_MIP_POINT,
-        D3D12_FILTER_MIN_MAG_MIP_POINT };
-    const D3D12_TEXTURE_ADDRESS_MODE modes[4] = { D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_WRAP };
-    for (UINT i = 0; i < 8; i++)
-    {
-        samplers[i].Filter = filters[i < 4 ? i : 0];
-        // Wrapping linear filtering (surface textures: road, ground) is anisotropic: plain
-        // trilinear picks blurred levels at grazing angles (blotchy asphalt). Not the clamped
-        // sampler: it also reads shadow maps and other render targets, where averaging depth
-        // over a long footprint breaks the shadows (black patches, glitchy object shadows).
-        // REGPU_ANISO_FROM_FETCH: s0 stays trilinear and a fetch gets the anisotropy it asks for (dword 3
-        // bits 25-27), as the console and Xenia give it; forced 16x made FH1's distant ground about 20%
-        // sharper than stock's (fine-detail measure, FX).
-        static LiveSwitch noAniso("REGPU_NO_ANISO"); // A/B
-        if (i >= 4)
-        {
-            samplers[i].Filter = D3D12_FILTER_ANISOTROPIC;
-            samplers[i].MaxAnisotropy = 2u << (i - 4);
-        }
-        else if (filters[i] == D3D12_FILTER_MIN_MAG_MIP_LINEAR && modes[i] == D3D12_TEXTURE_ADDRESS_MODE_WRAP && !noAniso && !AnisoFromFetch())
-        {
-            samplers[i].Filter = D3D12_FILTER_ANISOTROPIC;
-            samplers[i].MaxAnisotropy = 16;
-        }
-        samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW = i >= 4 ? D3D12_TEXTURE_ADDRESS_MODE_WRAP : modes[i];
-        samplers[i].MaxLOD = D3D12_FLOAT32_MAX;
-        samplers[i].ShaderRegister = i;
-        samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    }
-    // REGPU_LEAN_FETCH (hlsl.cpp): the same eight samplers as a table in space1, which a shader can
-    // index (static samplers can't back a dynamically indexed array).
-    D3D12_DESCRIPTOR_RANGE samplerRange{};
-    samplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
-    samplerRange.NumDescriptors = 8;
-    samplerRange.RegisterSpace = 1;
-    D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 4;
-    rs.pParameters = params;
-    rs.NumStaticSamplers = 8;
-    rs.pStaticSamplers = samplers;
-    if (LeanFetch())
-    {
-        params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[4].DescriptorTable.NumDescriptorRanges = 1;
-        params[4].DescriptorTable.pDescriptorRanges = &samplerRange;
-        params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        rs.NumParameters = 5;
-        D3D12_DESCRIPTOR_HEAP_DESC sh{};
-        sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-        sh.NumDescriptors = 8 * kSamplerBanks;
-        sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        Check(d->CreateDescriptorHeap(&sh, IID_PPV_ARGS(&g_r.samplerHeap)), "CreateDescriptorHeap(sampler)");
-        g_samplerStride = d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-        for (UINT i = 0; i < 8; i++)
-        {
-            D3D12_SAMPLER_DESC& s = g_samplerBase[i];
-            s.Filter = samplers[i].Filter;
-            s.AddressU = samplers[i].AddressU;
-            s.AddressV = samplers[i].AddressV;
-            s.AddressW = samplers[i].AddressW;
-            s.MaxAnisotropy = samplers[i].MaxAnisotropy;
-            s.ComparisonFunc = samplers[i].ComparisonFunc;
-            s.MaxLOD = samplers[i].MaxLOD;
-        }
-        WriteSamplerBank(0, -1);
-    }
-    ComPtr<ID3DBlob> blob, error;
-    if (FAILED(SerializeRootSignatureFor(rs, blob, error)))
-        Fatal("renderer: root signature: %s", error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
-    Check(d->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_r.rootSignature)), "CreateRootSignature");
-    if (const char* dumpRs = getenv("REGPU_DUMP_ROOTSIG")) // the root signature as a file, for offline shader analysis (Radeon GPU Analyzer --rs-bin; the FM3 port's tools/rga_shaders.ps1)
-        if (FILE* f = fopen(dumpRs, "wb")) { fwrite(blob->GetBufferPointer(), 1, blob->GetBufferSize(), f); fclose(f); }
-    // Motion-vector pipelines: the same plus b2, last frame's vertex constants of the draw.
-    params[rs.NumParameters].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[rs.NumParameters].Descriptor.ShaderRegister = 2;
-    params[rs.NumParameters].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-    rs.NumParameters++;
-    blob.Reset();
-    error.Reset();
-    if (FAILED(SerializeRootSignatureFor(rs, blob, error)))
-        Fatal("renderer: motion root signature: %s", error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
-    Check(d->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_r.motionRootSignature)),
-        "CreateRootSignature(motion)");
-
-    D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kBindlessBase + kBindless;
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.srvHeap)), "CreateDescriptorHeap(srv)");
-    g_r.srvStride = d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    hd.NumDescriptors = 2 + 2 * kFrames; // null 2D, null cube, per frame: ring and guest-memory raw views
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-    Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.stagingHeap)), "CreateDescriptorHeap(staging)");
-    hd.NumDescriptors = 1;
-    D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
-    nullSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    nullSrv.Texture2D.MipLevels = 1;
-    d->CreateShaderResourceView(nullptr, &nullSrv, Cpu(g_r.stagingHeap.Get(), 0, g_r.srvStride));
-    nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-    nullSrv.TextureCube.MipLevels = 1;
-    d->CreateShaderResourceView(nullptr, &nullSrv, Cpu(g_r.stagingHeap.Get(), 1, g_r.srvStride));
-    d->CopyDescriptorsSimple(2, Cpu(g_r.srvHeap.Get(), kBindlessBase, g_r.srvStride), Cpu(g_r.stagingHeap.Get(), 0, g_r.srvStride),
-        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
-    nullSrv.Texture3D.MipLevels = 1;
-    d->CreateShaderResourceView(nullptr, &nullSrv, Cpu(g_r.srvHeap.Get(), kBindlessBase + 2, g_r.srvStride));
-
-    InitPipelineLibrary(d);
-
-    // Views for the EDRAM surfaces (created on first use).
-    hd.NumDescriptors = kMaxSurfaces;
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.rtvHeap)), "CreateDescriptorHeap(rtv)");
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.dsvHeap)), "CreateDescriptorHeap(dsv)");
-    hd.NumDescriptors = 1;
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-
-    for (UINT i = 0; i < kFrames; i++)
-    {
-        FrameResources& f = g_r.frames[i];
-        Check(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.allocator)), "CreateCommandAllocator");
-        f.descriptorBase = i * kDescriptorsPerFrame;
-    }
-    Check(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_r.frames[0].allocator.Get(), nullptr, IID_PPV_ARGS(&g_r.realList)),
-        "CreateCommandList");
-    g_r.realList->Close();
-    g_r.recorder.Init(g_r.realList.Get());
-    g_mainContext.list = &g_r.recorder;
-    Check(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_r.fence)), "CreateFence");
-    g_r.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     InitVulkan();
+    LoadPipelineManifest();
+    ShaderScanStart();
     PresenterUseRenderer();
     g_r.ok = true;
-    Log("renderer: D3D12 renderer ready");
+    Log("renderer: Vulkan renderer ready");
 }
 
 double g_gpuWaitSeconds = 0; // CP thread blocked on the host GPU (frame resources)
@@ -3085,7 +2690,6 @@ void SignalFence(uint64_t value)
 }
 void ReleaseWithFrame(vk::Image& image); // (below)
 bool g_asyncFrameEnded = false; // the last frame's end was queued on the replay thread (REGPU_ASYNC_PRESENT)
-ID3D12GraphicsCommandList* AcquireList();
 
 // A new output resolution (regpu::SetOutputSize), taken at the start of a frame with the host GPU idle:
 // the EDRAM surfaces (made at the output size on first use) are dropped and come back at the new size,
@@ -3111,15 +2715,13 @@ void DropSurfaces()
         {
             for (auto& [base, s] : *map)
             {
-                Frame().garbage.push_back(std::move(s.resource));
                 ReleaseWithFrame(s.vk);
             }
             map->clear();
         }
     }
     C().colorBase = C().depthBase = ~0u; // nothing bound: the frame start selects the new surfaces
-    C().color.Reset();
-    C().depth.Reset();
+    C().vkColor = C().vkDepth = nullptr;
 }
 
 void ApplyOutputSize()
@@ -3201,7 +2803,6 @@ void ApplyMsaa()
     Log("renderer: anti-aliasing %ux (live)", g_msaa);
 }
 
-void TransitionColor(D3D12_RESOURCE_STATES to);
 // The bound colour surface to a Vulkan use (D3D12's TransitionColor with a state; workers never call it).
 void TransitionColor(vk::Use to)
 {
@@ -3257,14 +2858,7 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
         return it->second;
     }
     if (map.size() >= kMaxSurfaces)
-        return map.begin()->second; // out of views: share one (should not happen)
-    // The lowest view slot no surface holds (EvictSurfaces frees slots in the middle).
-    uint64_t usedSlots = 0;
-    for (auto& [b, other] : map)
-        usedSlots |= 1ull << other.slot;
-    UINT index = 0;
-    while (usedSlots >> index & 1)
-        index++;
+        return map.begin()->second; // too many: share one (should not happen)
     if (auto r = g_releasedSurfaces.find({ depth, base }); r != g_releasedSurfaces.end() && g_r.frame - r->second < 4 * SurfaceIdleFrames())
     {
         // A base drawn to again soon after its release (FM3: a depth base used every ~16 s in a race) stays from now
@@ -3274,7 +2868,6 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
         Log("renderer: EDRAM %s surface at base %03X came back after its release: kept from now on", depth ? "depth" : "colour", base);
     }
     Renderer::Surface& s = map[base];
-    s.slot = index;
     s.lastFrame = g_r.frame;
     // Every surface is a render target that is also sampled (resolves, depth copies) and copied.
     vk::ImageDesc desc;
@@ -3294,7 +2887,7 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
     }
     else
     {
-        desc.format = vk::ToVkFormat(kColorFormat);
+        desc.format = kVkColorFormat;
         desc.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         desc.name = "EDRAM colour surface";
     }
@@ -3339,8 +2932,7 @@ void EvictSurfaces()
                 g_releasedSurfaces[{ d == 1, it->first }] = g_r.frame;
                 Log("renderer: EDRAM %s surface at base %03X released (unused for %llu frames)", d ? "depth" : "colour", it->first,
                     (unsigned long long)(g_r.frame - it->second.lastFrame));
-                Frame().garbage.push_back(std::move(it->second.resource)); // (released when the GPU is done with this frame)
-                ReleaseWithFrame(it->second.vk);
+                ReleaseWithFrame(it->second.vk); // (released when the GPU is done with this frame)
                 it = map.erase(it);
             }
             else
@@ -3391,7 +2983,7 @@ struct SurfaceUse
 std::mutex g_surfaceUseMutex;
 std::map<std::pair<bool, uint32_t>, SurfaceUse> g_surfaceUse;
 LiveSwitch g_traceSurfaceUse("REGPU_TRACE_SURFACE_USE");
-void TraceSurfaceUse(const D3D12_RECT& r)
+void TraceSurfaceUse(const Rect& r)
 {
     if (!g_traceSurfaceUse)
         return;
@@ -3509,7 +3101,7 @@ void PropagateDepthClear(uint32_t first, uint32_t end, uint32_t value)
             continue;
         const LONG tileW = LONG(80 / across), tileH = LONG(16 / down), right = LONG(pitch);
         const LONG r0 = LONG(t0 / tilesPerRow), c0 = LONG(t0 % tilesPerRow), r1 = LONG((t1 - 1) / tilesPerRow), c1 = LONG((t1 - 1) % tilesPerRow + 1);
-        D3D12_RECT guest[3];
+        Rect guest[3];
         UINT count = 0;
         if (r0 == r1)
             guest[count++] = { c0 * tileW, r0 * tileH, std::min(c1 * tileW, right), (r0 + 1) * tileH };
@@ -3520,12 +3112,12 @@ void PropagateDepthClear(uint32_t first, uint32_t end, uint32_t value)
                 guest[count++] = { 0, (r0 + 1) * tileH, right, r1 * tileH };
             guest[count++] = { 0, r1 * tileH, std::min(c1 * tileW, right), (r1 + 1) * tileH };
         }
-        D3D12_RECT host[3];
+        Rect host[3];
         UINT hostCount = 0;
         const LONG maxW = LONG(SurfaceWidth()), maxH = LONG(SurfaceHeight());
         for (UINT i = 0; i < count; i++)
         {
-            const D3D12_RECT h{ std::min(maxW, LONG(std::lround(guest[i].left * sx))), std::min(maxH, LONG(std::lround(guest[i].top * sy))),
+            const Rect h{ std::min(maxW, LONG(std::lround(guest[i].left * sx))), std::min(maxH, LONG(std::lround(guest[i].top * sy))),
                 std::min(maxW, LONG(std::lround(guest[i].right * sx))), std::min(maxH, LONG(std::lround(guest[i].bottom * sy))) };
             if (h.right > h.left && h.bottom > h.top)
                 host[hostCount++] = h;
@@ -3715,7 +3307,6 @@ void BeginFrameIfNeeded()
         WaitFenceValue(f.fence, INFINITE);
         g_gpuWaitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
     }
-    f.garbage.clear();
     for (auto& destroy : f.vkGarbage)
         destroy();
     f.vkGarbage.clear();
@@ -3869,7 +3460,6 @@ void BeginFrameIfNeeded()
     }
     // This slot's command buffers have completed (its fence, above): its pools start over. Only this thread and the
     // replay thread use pool 0, and the replay is in another slot's buffers until the switch below.
-    f.poolUsed = 0;
     for (FrameResources::VkPoolSet& ps : f.vkPools)
     {
         if (ps.used)
@@ -4320,7 +3910,6 @@ void BeginFrameIfNeeded()
         else
             UpdateSlotSets(f, f.vkRing.buffer, f.vkRing.size, false);
     }
-    f.descriptorsUsed = 2;
     EvictBindless();
 
     g_drawState.Invalidate(); // (sets 1-3, the bindless tables, are bound again by the first draw of a buffer)
@@ -5778,6 +5367,10 @@ struct Manifest
         return !out.empty();
     }
 } g_manifest;
+void LoadPipelineManifest()
+{
+    g_manifest.Load();
+}
 
 // Seed coverage: every pipeline a draw asks for, counted once, against the host's pipeline seed
 // (BuildSeedPipelines fills g_seedKeys). "Not in the seed" = a first boot on another PC would build
@@ -5816,74 +5409,8 @@ std::filesystem::path ShaderCachePath(uint64_t key, bool optimized, bool pixel)
     (void)pixel;
     snprintf(name, sizeof(name), "%016llx.vk1.spv", (unsigned long long)key);
     return RegpuUserDir() / "shadercache" / name;
-    if (DxcFor(pixel))
-        snprintf(name, sizeof(name), "%016llx%s.dxil", (unsigned long long)key, DxcCacheTag().c_str());
-    else if (optimized && OptimizeLevel() != 1)
-        snprintf(name, sizeof(name), "%016llx.o%d.dxbc", (unsigned long long)key, OptimizeLevel());
-    else
-        snprintf(name, sizeof(name), optimized ? "%016llx.o.dxbc" : "%016llx.dxbc", (unsigned long long)key);
-    return RegpuUserDir() / "shadercache" / name;
 }
 
-// REGPU_OPTIMIZE_SHADERS: optimised builds, one at a time at the lowest priority.
-struct ShaderOptimizer
-{
-    struct Job
-    {
-        uint64_t key;
-        bool pixel;
-        std::string hlsl;
-    };
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::deque<Job> jobs;
-    std::unordered_set<uint64_t> queued;
-    std::atomic<uint32_t> built{ 0 };
-
-    void Push(uint64_t key, bool pixel, const std::string& hlsl)
-    {
-        {
-            std::lock_guard lock(mutex);
-            if (!queued.insert(key).second)
-                return;
-            jobs.push_back({ key, pixel, hlsl });
-        }
-        static std::once_flag started;
-        // REGPU_OPTIMIZE_THREADS=n: n builders (default 1, at the lowest priority).
-        std::call_once(started, [this] {
-            const int n = getenv("REGPU_OPTIMIZE_THREADS") ? std::clamp(atoi(getenv("REGPU_OPTIMIZE_THREADS")), 1, 16) : 1;
-            for (int i = 0; i < n; i++)
-                std::thread([this] { Run(); }).detach();
-        });
-        cv.notify_one();
-    }
-
-    void Run()
-    {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
-        for (;;)
-        {
-            Job job;
-            {
-                std::unique_lock lock(mutex);
-                cv.wait(lock, [this] { return !jobs.empty(); });
-                job = std::move(jobs.front());
-                jobs.pop_front();
-            }
-            const D3D_SHADER_MACRO vertexStage[] = { { "REGPU_VERTEX_STAGE", "1" }, { nullptr, nullptr } };
-            ComPtr<ID3DBlob> code, errors;
-            if (FAILED(D3DCompile(job.hlsl.data(), job.hlsl.size(), nullptr, job.pixel ? nullptr : vertexStage, nullptr, "main",
-                    job.pixel ? "ps_5_1" : "vs_5_1",
-                    (OptimizeLevel() == 3 ? D3DCOMPILE_OPTIMIZATION_LEVEL3 : OptimizeLevel() == 2 ? D3DCOMPILE_OPTIMIZATION_LEVEL2 : D3DCOMPILE_OPTIMIZATION_LEVEL1) |
-                        D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0,
-                    &code, &errors)))
-                continue; // the unoptimised build stays
-            WriteCacheFile(ShaderCachePath(job.key, true, job.pixel), code->GetBufferPointer(), code->GetBufferSize());
-            if (const uint32_t n = ++built; n == 1 || n % 100 == 0)
-                Log("renderer: %u shaders optimised in the background", n);
-        }
-    }
-} g_optimizer;
 
 // The stored bytecode for cs.cacheKey, optimised first; an unoptimised one is queued for its
 // optimised build.
@@ -7053,42 +6580,6 @@ const CompiledShader* ManifestPixelShader(const PipelineKey& key, const Compiled
     return f && f->state.load(std::memory_order_acquire) != CompiledShader::Failed ? f : nullptr;
 }
 
-D3D12_BLEND Blend(uint32_t f)
-{
-    switch (f)
-    {
-    case 0: return D3D12_BLEND_ZERO;
-    case 1: return D3D12_BLEND_ONE;
-    case 4: return D3D12_BLEND_SRC_COLOR;
-    case 5: return D3D12_BLEND_INV_SRC_COLOR;
-    case 6: return D3D12_BLEND_SRC_ALPHA;
-    case 7: return D3D12_BLEND_INV_SRC_ALPHA;
-    case 8: return D3D12_BLEND_DEST_COLOR;
-    case 9: return D3D12_BLEND_INV_DEST_COLOR;
-    case 10: return D3D12_BLEND_DEST_ALPHA;
-    case 11: return D3D12_BLEND_INV_DEST_ALPHA;
-    case 12: return D3D12_BLEND_BLEND_FACTOR;
-    case 14: return D3D12_BLEND_ALPHA_FACTOR;
-    case 13: return D3D12_BLEND_INV_BLEND_FACTOR;
-    case 15: return D3D12_BLEND_INV_ALPHA_FACTOR;
-    case 16: return D3D12_BLEND_SRC_ALPHA_SAT;
-    default: return D3D12_BLEND_ONE;
-    }
-}
-
-D3D12_BLEND AlphaBlend(uint32_t f)
-{
-    // Colour factors are invalid for alpha in D3D12: use their alpha forms.
-    switch (f)
-    {
-    case 4: return D3D12_BLEND_SRC_ALPHA;
-    case 5: return D3D12_BLEND_INV_SRC_ALPHA;
-    case 8: return D3D12_BLEND_DEST_ALPHA;
-    case 9: return D3D12_BLEND_INV_DEST_ALPHA;
-    default: return Blend(f);
-    }
-}
-
 // Xenos blend factors (RB_BLENDCONTROL, the D3D9 order) as Vulkan's (Blend above for D3D12).
 VkBlendFactor VkBlend(uint32_t f)
 {
@@ -7139,332 +6630,27 @@ VkBlendOp VkBlendOpFor(uint32_t op)
     }
 }
 
-D3D12_BLEND_OP BlendOp(uint32_t op)
+// The pipeline cache (vk::Device::pipelineCache, Config::userDir/vk-pipelines-<vendor>-<device>.bin): compiled GPU code
+// survives between runs. Written when new pipelines were made, at most every 10 s, on a thread of its own (D3D12's
+// pipeline library stalled the command processor for a frame when it was written there); at exit on the caller's.
+std::atomic<uint32_t> g_newPipelines{ 0 };
+void MaybeSavePipelineCache()
 {
-    switch (op)
-    {
-    case 1: return D3D12_BLEND_OP_SUBTRACT;
-    case 2: return D3D12_BLEND_OP_MIN;
-    case 3: return D3D12_BLEND_OP_MAX;
-    case 4: return D3D12_BLEND_OP_REV_SUBTRACT;
-    default: return D3D12_BLEND_OP_ADD;
-    }
-}
-
-// Persistent pipeline library: compiled GPU code survives between runs
-// (Config::userDir/pipelines.bin; keyed by the driver, so a driver update just misses).
-struct PipelineLibrary
-{
-    ComPtr<ID3D12PipelineLibrary> library;
-    std::atomic<int> stored{ 0 };
-    std::mutex saveMutex;
-    // Stores and loads share the library; serializing takes it alone. Serialize running
-    // during a StorePipeline is not something the runtime promises to handle, and a cold
-    // load with many pipelines building at once locked up (Mugello).
-    std::shared_mutex access;
-    std::chrono::steady_clock::time_point lastSave = std::chrono::steady_clock::now();
-    std::vector<char> loaded;
-    // FM3 port session 43 (less RAM): the file mapped read-only instead of read into private memory (its pages are the
-    // file's, so Windows can drop and re-read them under memory pressure: 100-130 MB for an FXC library). The library
-    // keeps using the view; saving replaces the file with a POSIX-semantics rename, which works while it is mapped (the
-    // view keeps the old contents). REGPU_LIBRARY_IN_MEMORY=1 (start-time): read into memory as before.
-    const char* blob = nullptr;
-    size_t blobSize = 0;
-    HANDLE mapFile = INVALID_HANDLE_VALUE, mapping = nullptr;
-    bool LoadMapped(const std::filesystem::path& path)
-    {
-        if (getenv("REGPU_LIBRARY_IN_MEMORY"))
-            return false;
-        mapFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (mapFile == INVALID_HANDLE_VALUE)
-            return false;
-        LARGE_INTEGER size{};
-        if (!GetFileSizeEx(mapFile, &size) || size.QuadPart <= 0 || !(mapping = CreateFileMappingW(mapFile, nullptr, PAGE_READONLY, 0, 0, nullptr)))
-            return CloseHandle(mapFile), mapFile = INVALID_HANDLE_VALUE, false;
-        blob = static_cast<const char*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
-        if (!blob)
-            return CloseHandle(mapping), CloseHandle(mapFile), mapping = nullptr, mapFile = INVALID_HANDLE_VALUE, false;
-        blobSize = size_t(size.QuadPart);
-        return true;
-    }
-    // Compaction: entries are never removed, so every translator or driver change leaves the old ones
-    // behind (FM2 port: 574 MB read at every boot). Every pipeline this session loads or builds also
-    // goes into `fresh`; once that holds every pipeline the manifest lists and is at least 10% smaller,
-    // it replaces the old library and is what gets saved. REGPU_NO_LIBRARY_COMPACT=1 keeps the old one.
-    ComPtr<ID3D12PipelineLibrary> fresh;
-    std::atomic<size_t> freshCount{ 0 };
-
-    // pipelines.bin on Windows' default GPU; another one (REGPU_ADAPTER: a laptop's or a processor's built-in GPU) has
-    // its own pipelines-<vendor>-<device>.bin (FM3 port, session 33): the drivers reject each other's library, and the
-    // one run last overwrote the other's (the RX 7900 XTX's 426 MB library was lost to one iGPU test boot).
-    std::filesystem::path path = RegpuUserDir() / "pipelines.bin";
-    std::filesystem::path Path() const { return path; }
-
-    void Init(ID3D12Device* device)
-    {
-        ComPtr<ID3D12Device1> d1;
-        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&d1))))
-            return;
-        {
-            ComPtr<IDXGIFactory4> factory;
-            ComPtr<IDXGIAdapter1> first, mine;
-            DXGI_ADAPTER_DESC1 a{}, m{};
-            const LUID luid = device->GetAdapterLuid();
-            if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapters1(0, &first)) && SUCCEEDED(first->GetDesc1(&a)) &&
-                (a.AdapterLuid.LowPart != luid.LowPart || a.AdapterLuid.HighPart != luid.HighPart) &&
-                SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&mine))) && SUCCEEDED(mine->GetDesc1(&m)))
-            {
-                char name[48];
-                snprintf(name, sizeof(name), "pipelines-%04X-%04X.bin", m.VendorId, m.DeviceId);
-                path = RegpuUserDir() / name;
-            }
-        }
-        // DXIL pipelines in their own library (REGPU_DXC): pipelines-dxil.bin, pipelines-dxil-<vendor>-<device>.bin.
-        if (DxcEnabled())
-            path = RegpuUserDir() / ("pipelines-dxil" + DxcCacheTag() + path.filename().string().substr(9));
-        // REGPU_PIPELINE_LIBRARY_TAG=<text> (tests, FM3 port session 43): a library file of its own (pipelines-<tag>...),
-        // for cold-library measurements that leave the player's library alone.
-        if (const char* tag = getenv("REGPU_PIPELINE_LIBRARY_TAG"); tag && *tag)
-            path = RegpuUserDir() / ("pipelines-" + std::string(tag) + path.filename().string().substr(9));
-        if (!LoadMapped(Path()))
-            if (std::ifstream in{ Path(), std::ios::binary | std::ios::ate })
-            {
-                loaded.resize(size_t(in.tellg()));
-                in.seekg(0);
-                in.read(loaded.data(), std::streamsize(loaded.size()));
-                blob = loaded.data();
-                blobSize = loaded.size();
-            }
-        if (const HRESULT hr = d1->CreatePipelineLibrary(blob, blobSize, IID_PPV_ARGS(&library)); FAILED(hr))
-        {
-            if (blobSize)
-                Log("renderer: %s (%zu bytes) not usable (%08lX): starting a new one", Path().filename().string().c_str(), blobSize, (unsigned long)hr);
-            blobSize = 0;
-            if (FAILED(d1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&library))))
-                library.Reset();
-        }
-        Log("renderer: pipeline library %s (%zu bytes %s)", library ? "ready" : "unavailable", blobSize, mapping ? "mapped from the file" : "loaded");
-        if (library && blobSize && !getenv("REGPU_NO_LIBRARY_COMPACT") && FAILED(d1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&fresh))))
-            fresh.Reset();
-    }
-
-    // The shaders' compiled code is part of the name: the game's shader hashes alone stay the same
-    // when the translation changes (a translator fix, REGPU_DYNAMIC_VFETCH), and a stale entry under
-    // the name then failed to load and blocked storing the new one, rebuilding it every launch
-    // (FM2 port: 181-496 of 498 pipelines rebuilt each launch, 0 after).
-    static std::wstring Name(const PipelineKey& k, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd)
-    {
-        uint64_t code = Fnv(pd.VS.pShaderBytecode, pd.VS.BytecodeLength, 3) * 0x9E3779B97F4A7C15ull ^
-            (pd.PS.pShaderBytecode ? Fnv(pd.PS.pShaderBytecode, pd.PS.BytecodeLength, 4) : 0);
-        // The fixed-function state too: an entry only loads with the description it was stored with, so
-        // when the renderer's state for a key changed (depth bias, formats, sample count) the old entry
-        // kept the name and blocked the new one (FM2 port: 2723 of 3031 rebuilt every launch).
-        // REGPU_PIPELINE_NAME_SHADERS_ONLY=1 names by the shaders alone, as before.
-        static const bool shadersOnly = getenv("REGPU_PIPELINE_NAME_SHADERS_ONLY") != nullptr;
-        if (!shadersOnly)
-        {
-            code = (code ^ Fnv(&pd.BlendState, sizeof(pd.BlendState), 5)) * 0x9E3779B97F4A7C15ull;
-            code = (code ^ Fnv(&pd.RasterizerState, sizeof(pd.RasterizerState), 6)) * 0x9E3779B97F4A7C15ull;
-            code = (code ^ Fnv(&pd.DepthStencilState, sizeof(pd.DepthStencilState), 7)) * 0x9E3779B97F4A7C15ull;
-            code = (code ^ Fnv(pd.RTVFormats, sizeof(pd.RTVFormats), 8)) * 0x9E3779B97F4A7C15ull;
-            const uint32_t misc[] = { pd.SampleMask, uint32_t(pd.IBStripCutValue), uint32_t(pd.PrimitiveTopologyType), pd.NumRenderTargets,
-                uint32_t(pd.DSVFormat), pd.SampleDesc.Count, pd.SampleDesc.Quality, pd.InputLayout.NumElements };
-            code = (code ^ Fnv(misc, sizeof(misc), 9)) * 0x9E3779B97F4A7C15ull;
-        }
-        wchar_t name[128];
-        swprintf(name, 128, L"%016llx_%016llx_%08x_%08x_%08x_%08x_%016llx", (unsigned long long)k.vs, (unsigned long long)k.ps, k.blend, k.depth,
-            k.stencilMaskMode, k.flags, (unsigned long long)code);
-        return name;
-    }
-
-    // REGPU_PSO_LOCK (start-time; FM3 port, session 35): 1 = the library's loads and stores one at a time (exclusive
-    // instead of shared), 2 = also pipeline creation one at a time, 0 = shared, as before. Default 1 with DXC, else 0:
-    // with DXIL pipelines AMD's drivers (RDNA2 and RDNA3 branches) crashed in amdxc64.dll (a null read) on 5 of 16 cached
-    // boots while loads and stores ran on several threads at once; 0 of 16 at 1 and at 2. FXC's never crashed.
-    static int PsoLock()
-    {
-        static const int v = [] { const char* e = getenv("REGPU_PSO_LOCK"); return e && *e ? atoi(e) : (DxcEnabled() ? 1 : 0); }();
-        return v;
-    }
-    struct LibraryLock
-    {
-        std::shared_lock<std::shared_mutex> shared;
-        std::unique_lock<std::shared_mutex> exclusive;
-        explicit LibraryLock(std::shared_mutex& m)
-        {
-            if (PsoLock() >= 1)
-                exclusive = std::unique_lock(m);
-            else
-                shared = std::shared_lock(m);
-        }
-    };
-    static HRESULT Create(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd, ComPtr<ID3D12PipelineState>& pso)
-    {
-        static std::mutex one;
-        std::unique_lock<std::mutex> lock;
-        if (PsoLock() >= 2)
-            lock = std::unique_lock(one);
-        return device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
-    }
-
-    HRESULT CreateOrLoad(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd, const PipelineKey& key, ComPtr<ID3D12PipelineState>& pso, bool* hit)
-    {
-        *hit = false;
-        if (PipelineIsPoisoned(key.vs, key.ps))
-            return E_FAIL; // (see kBadPipelinesFile)
-        if (library)
-        {
-            const std::wstring name = Name(key, pd);
-            {
-                LibraryLock lock(access);
-                *hit = SUCCEEDED(library->LoadGraphicsPipeline(name.c_str(), &pd, IID_PPV_ARGS(&pso)));
-            }
-            if (*hit)
-            {
-                KeepFresh(name, pso.Get());
-                return S_OK;
-            }
-            // The slow part (the driver compiling) runs outside the lock.
-            g_compiling = { key.vs, key.ps, true };
-            const HRESULT hr = Create(device, pd, pso);
-            g_compiling.active = false;
-            if (SUCCEEDED(hr))
-            {
-                LibraryLock lock(access);
-                if (SUCCEEDED(library->StorePipeline(name.c_str(), pso.Get())))
-                    stored++;
-            }
-            if (SUCCEEDED(hr))
-                KeepFresh(name, pso.Get());
-            return hr;
-        }
-        g_compiling = { key.vs, key.ps, true };
-        const HRESULT hr = Create(device, pd, pso);
-        g_compiling.active = false;
-        return hr;
-    }
-
-    void KeepFresh(const std::wstring& name, ID3D12PipelineState* pso)
-    {
-        if (!fresh)
-            return;
-        {
-            LibraryLock lock(access); // (stores share the library, as in CreateOrLoad)
-            if (!fresh)
-                return;
-            if (SUCCEEDED(fresh->StorePipeline(name.c_str(), pso)))
-                freshCount++;
-        }
-        size_t listed;
-        {
-            std::lock_guard manifestLock(g_manifest.mutex);
-            listed = g_manifest.known.size();
-        }
-        if (!listed || freshCount < listed)
-            return;
-        bool swap = false;
-        {
-            std::unique_lock lock(access);
-            // Only when it saves something: else the old library stays and is not written again.
-            if (fresh && fresh->GetSerializedSize() * 10 < blobSize * 9)
-            {
-                library = fresh;
-                swap = true;
-            }
-            fresh.Reset();
-        }
-        if (swap)
-        {
-            Log("renderer: pipeline library compacted to this session's %zu pipelines; saved at the next save", freshCount.load());
-            stored++;
-        }
-    }
-
-    // Writes the library out when new pipelines were stored (at most every 10 s). Never on
-    // the calling thread: serializing and writing the whole library (tens to hundreds of MB)
-    // there stalled the command processor for one frame every 10 s of gameplay. force (exit)
-    // writes synchronously.
-    std::atomic<bool> saving{ false };
-
-    void MaybeSave(bool force = false)
-    {
-        if (!library || !stored.load())
-            return;
-        if (force)
-        {
-            SaveNow();
-            return;
-        }
-        if (std::chrono::steady_clock::now() - lastSave < std::chrono::seconds(10) || saving.exchange(true))
-            return;
-        lastSave = std::chrono::steady_clock::now();
-        std::thread([this] {
-            // Not lower: it holds the library alone while serializing, and starving it then
-            // would stall every pipeline build.
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-            SaveNow();
-            saving = false;
-        }).detach();
-    }
-
-    void SaveNow()
-    {
-        std::lock_guard lock(saveMutex);
-        const int pending = stored.exchange(0);
-        if (!pending)
-            return;
-        const auto start = std::chrono::steady_clock::now();
-        std::vector<char> blob;
-        {
-            std::unique_lock lock(access);
-            blob.resize(library->GetSerializedSize());
-            if (blob.empty() || FAILED(library->Serialize(blob.data(), blob.size())))
-            {
-                stored += pending;
-                return;
-            }
-        }
-        const auto serialized = std::chrono::steady_clock::now();
-        const auto tmp = Path().string() + ".tmp";
-        { std::ofstream(tmp, std::ios::binary).write(blob.data(), std::streamsize(blob.size())); }
-        std::error_code ec;
-        // (A POSIX-semantics rename first: the library file may be mapped (LoadMapped), which an ordinary replace refuses.)
-        bool renamed = false;
-        {
-            const std::wstring target = std::filesystem::absolute(Path()).wstring();
-            HANDLE t = CreateFileW(std::filesystem::path(tmp).c_str(), DELETE | GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (t != INVALID_HANDLE_VALUE)
-            {
-                std::vector<uint8_t> info(sizeof(FILE_RENAME_INFO) + target.size() * sizeof(wchar_t));
-                auto* r = reinterpret_cast<FILE_RENAME_INFO*>(info.data());
-                r->Flags = 0x1 /* FILE_RENAME_FLAG_REPLACE_IF_EXISTS */ | 0x2 /* FILE_RENAME_FLAG_POSIX_SEMANTICS */;
-                r->FileNameLength = DWORD(target.size() * sizeof(wchar_t));
-                memcpy(r->FileName, target.data(), r->FileNameLength);
-                renamed = SetFileInformationByHandle(t, FileRenameInfoEx, r, DWORD(info.size())) != 0;
-                CloseHandle(t);
-            }
-        }
-        if (!renamed)
-            std::filesystem::rename(tmp, Path(), ec);
-        if (!renamed && ec)
-        {
-            Log("renderer: pipeline library not saved (%s)", ec.message().c_str());
-            std::filesystem::remove(tmp, ec);
-        }
+    static std::atomic<bool> saving{ false };
+    static auto lastSave = std::chrono::steady_clock::now();
+    if (!g_newPipelines.load(std::memory_order_relaxed) || std::chrono::steady_clock::now() - lastSave < std::chrono::seconds(10) || saving.exchange(true))
+        return;
+    lastSave = std::chrono::steady_clock::now();
+    g_newPipelines = 0;
+    std::thread([] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        const size_t bytes = vk::SavePipelineCache(*g_r.vkd);
         if (getenv("REGPU_PERF"))
-            Log("perf: pipeline library saved in the background (%.0f MB): serialize %.0f ms, write %.0f ms", blob.size() / 1048576.0,
-                std::chrono::duration<double, std::milli>(serialized - start).count(),
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - serialized).count());
-    }
-} g_pipelineLibrary;
-
-void InitPipelineLibrary(ID3D12Device* device)
-{
-    g_pipelineLibrary.Init(device);
-    g_manifest.Load();
-    ShaderScanStart();
+            Log("perf: pipeline cache saved in the background (%.1f MB)", bytes / 1048576.0);
+        saving = false;
+    }).detach();
 }
+
 
 struct PipelinePool
 {
@@ -7581,7 +6767,7 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     pd.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // (the class; the draw sets the exact topology)
     pd.primitiveRestart = key.flags & 0x100;            // D3D12's strip cut 0xFFFF
     pd.colorCount = 1;
-    pd.colorFormats[0] = vk::ToVkFormat(kColorFormat);
+    pd.colorFormats[0] = kVkColorFormat;
     pd.depthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
     pd.samples = VkSampleCountFlagBits(g_msaa);
     // Motion-vector variants: a second target for the motion. Flag 0x800 (it was 4, which MakePipelineKey also sets for
@@ -7634,6 +6820,8 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
         char name[48];
         snprintf(name, sizeof(name), "%016llx/%016llx", (unsigned long long)key.vs, (unsigned long long)key.ps);
         entry->vk = pd.vs && pd.ps ? vk::CreateGraphicsPipeline(*g_r.vkd, pd, name) : VK_NULL_HANDLE;
+        if (entry->vk)
+            g_newPipelines.fetch_add(1, std::memory_order_relaxed);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStart).count();
         const bool hit = entry->vk && ms < 2.0;
         if (ms > 30.0 && getenv("REGPU_PERF"))
@@ -8942,7 +8130,7 @@ IndexListEntry* CachedIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t d
 struct TileState
 {
     int originX = 0, originY = 0;
-    D3D12_RECT rect{ 0, 0, 1 << 14, 1 << 14 };
+    Rect rect{ 0, 0, 1 << 14, 1 << 14 };
     uint32_t surface = ~0u; // RB_SURFACE_INFO of the tiled pass (~0: any)
 };
 thread_local TileState g_tile;
@@ -8951,7 +8139,7 @@ thread_local TileState g_tile;
 // tile pass are not tiles: Too Human's 16x16 draws after a tile's resolves set the origin back to the
 // first tile's, and the right tile's stencil reset after them went to the left tile.
 // REGPU_TILE_FROM_ANY_DRAW=1: any draw not covering the pass sets it, as before.
-bool TileBand(const D3D12_RECT& r, uint32_t passWidth, uint32_t passHeight)
+bool TileBand(const Rect& r, uint32_t passWidth, uint32_t passHeight)
 {
     static LiveSwitch anyDraw("REGPU_TILE_FROM_ANY_DRAW");
     return anyDraw || (r.left <= 0 && r.right >= LONG(passWidth)) || (r.top <= 0 && r.bottom >= LONG(passHeight));
@@ -9166,7 +8354,7 @@ void ScreenScissor(int32_t r[4])
     }
 }
 
-D3D12_RECT WindowScissor()
+Rect WindowScissor()
 {
     const uint32_t offsetReg = gpureg::Get(PA_SC_WINDOW_OFFSET);
     const int32_t wx = int32_t(offsetReg << 17) >> 17, wy = int32_t((offsetReg >> 16) << 17) >> 17;
@@ -9219,20 +8407,6 @@ D3D12_RECT WindowScissor()
     return { std::clamp<LONG>(x0, 0, maxX), std::clamp<LONG>(y0, 0, maxY), std::clamp<LONG>(x1, 0, maxX), std::clamp<LONG>(y1, 0, maxY) };
 }
 
-void TransitionColor(D3D12_RESOURCE_STATES to)
-{
-    if (C().colorState == to)
-        return;
-    D3D12_RESOURCE_BARRIER b{};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = C().color.Get();
-    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = C().colorState;
-    b.Transition.StateAfter = to;
-    C().list->ResourceBarrier(1, &b);
-    C().colorState = to;
-}
-
 // ReGPU's own passes (vk::Pass): a constant buffer (b registers; D3D12's root constants) from the upload ring.
 bool PassConstants(vk::PassArgs& args, uint32_t binding, const void* data, size_t bytes)
 {
@@ -9253,7 +8427,7 @@ void UsePass(const vk::Pass& pass, const vk::PassArgs& args)
 }
 // A graphics pass's dynamic state: a D3D-convention viewport and the scissor, and the rest at rest (the pipelines take
 // stencil reference, blend constants and topology from the list, as the draws' do).
-void PassViewport(const D3D12_VIEWPORT& viewport, const D3D12_RECT& scissor)
+void PassViewport(const Viewport& viewport, const Rect& scissor)
 {
     const VkViewport v = ToVkViewport(viewport);
     const VkRect2D r = ToVkRect(scissor);
@@ -9344,23 +8518,23 @@ void EnsureResolved(ResolvedTexture& dest, uint32_t width, uint32_t height, uint
 }
 
 void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info);
-void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint32_t info, bool depth, const D3D12_RECT& rect,
+void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint32_t info, bool depth, const Rect& rect,
     const regpu::Writeback& request);
 
 // destRange: the destination's fixed-point range after the scale (the 16-bit integer range for the
 // 16-bit fixed formats); null none. destRow: the image row the surface's rect lands at (0: its own
 // row; a band of a taller image lands destRow rows down).
-void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, VkFormat format, const D3D12_RECT& rect, float scale, bool swapRB = false,
+void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, VkFormat format, const Rect& rect, float scale, bool swapRB = false,
     const float* destRange = nullptr, uint32_t toGamma = 0, LONG destRow = 0);
 
-bool ResolveIntoEnclosing(uint32_t base, uint32_t pitch, uint32_t declaredHeight, uint32_t guestBpp, VkFormat format, const D3D12_RECT& rect, float scale,
+bool ResolveIntoEnclosing(uint32_t base, uint32_t pitch, uint32_t declaredHeight, uint32_t guestBpp, VkFormat format, const Rect& rect, float scale,
     const float* destRange, uint32_t toGamma, bool atBase = false);
 
 // REGPU_DUMP_EACH_RESOLVE (debug): images copied to readback buffers mid-frame, written out at the frame's end.
 std::mutex g_midDumpLock;
 std::vector<ResolveDump> g_midDumps;
 std::atomic<int> g_midDumpSerial{ 0 };
-void QueueMidFrameDump(uint32_t base, uint32_t surface, const D3D12_RECT& rect)
+void QueueMidFrameDump(uint32_t base, uint32_t surface, const Rect& rect)
 {
     auto it = g_r.resolved.find(base);
     if (it == g_r.resolved.end() || !it->second.resource)
@@ -9389,7 +8563,7 @@ void QueueMidFrameDump(uint32_t base, uint32_t surface, const D3D12_RECT& rect)
     g_midDumps.push_back(std::move(d));
 }
 
-void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, VkFormat format, const D3D12_RECT& rect, float scale, bool swapRB,
+void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, VkFormat format, const Rect& rect, float scale, bool swapRB,
     const float* destRange, uint32_t toGamma, LONG destRow)
 {
     // REGPU_FREEZE_RESOLVES=<hex base>[,<hex base>...]: those images keep what they hold, later resolves
@@ -9434,7 +8608,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, VkF
         NoteResolvedMemory(base, dest);
     dest.frame = g_r.frame;
     // The image rectangle written (the surface's rect, destRow rows down).
-    const D3D12_RECT sr{ rect.left, rect.top + destRow, std::min<LONG>(rect.right, width), std::min<LONG>(rect.bottom + destRow, height) };
+    const Rect sr{ rect.left, rect.top + destRow, std::min<LONG>(rect.right, width), std::min<LONG>(rect.bottom + destRow, height) };
     FrameResources& f = Frame();
     vk::Image* surface = depth ? C().vkDepth : C().vkColor;
     if (sr.right <= sr.left || sr.bottom <= sr.top || !surface)
@@ -9486,7 +8660,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, VkF
             rb.Add(*g_r.resolveScratch, vk::Use::CopyDest);
             rb.Record(*C().vkList);
             // (The surface's rows: a band of a taller image (destRow) is read from its surface rows, srcOrigin.)
-            const D3D12_RECT src = ToHost(D3D12_RECT{ sr.left, sr.top - destRow, sr.right, sr.bottom - destRow });
+            const Rect src = ToHost(Rect{ sr.left, sr.top - destRow, sr.right, sr.bottom - destRow });
             VkImageResolve r{};
             r.srcSubresource = r.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             r.srcOffset = r.dstOffset = { std::max<int32_t>(src.left, 0), std::max<int32_t>(src.top, 0), 0 };
@@ -9515,7 +8689,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, VkF
     UsePass(pass, args);
     // Width and height stay in game pixels (the size the title knows); the texture and the
     // rectangle are scaled.
-    PassViewport(D3D12_VIEWPORT{ 0, 0, float(hostWidth), float(hostHeight), 0, 1 }, ToHost(sr));
+    PassViewport(Viewport{ 0, 0, float(hostWidth), float(hostHeight), 0, 1 }, ToHost(sr));
     C().vkList->Draw(3, 1, 0, 0);
     dest.serial = ++g_resolveSerial;
     // Depth resolves also keep the guest's D24S8 words (RGBA8: stencil, depth low to high byte), for
@@ -9556,7 +8730,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, VkF
             vk::Transition(*C().vkList, *dest.packed, vk::Use::ColorTarget);
             C().vkList->SetTargets(ImageTargets(*dest.packed));
             UsePass(g_r.depthPackBlit, pack);
-            PassViewport(D3D12_VIEWPORT{ 0, 0, float(hostWidth), float(hostHeight), 0, 1 }, ToHost(sr));
+            PassViewport(Viewport{ 0, 0, float(hostWidth), float(hostHeight), 0, 1 }, ToHost(sr));
             C().vkList->Draw(3, 1, 0, 0);
             vk::Transition(*C().vkList, *dest.packed, vk::Use::Sampled);
         }
@@ -9586,7 +8760,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, VkF
 // the source is read scaled. REGPU_NO_RESOLVE_INTO_ENCLOSING=1 (live): not drawn (A/B).
 // atBase: the rectangle's destination is an image's own base (its texel 0, 0), and the copy is smaller than that image
 // (see the resolve's "into its own image" case): only the image at the base matches, at 0, 0.
-bool ResolveIntoEnclosing(uint32_t base, uint32_t pitch, uint32_t declaredHeight, uint32_t guestBpp, VkFormat format, const D3D12_RECT& rect, float scale,
+bool ResolveIntoEnclosing(uint32_t base, uint32_t pitch, uint32_t declaredHeight, uint32_t guestBpp, VkFormat format, const Rect& rect, float scale,
     const float* destRange, uint32_t toGamma, bool atBase)
 {
     static LiveSwitch off("REGPU_NO_RESOLVE_INTO_ENCLOSING");
@@ -9754,10 +8928,10 @@ bool ResolveIntoEnclosing(uint32_t base, uint32_t pitch, uint32_t declaredHeight
                 : format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? (ms ? g_r.colorBlitMs10[g_msaa] : g_r.colorBlit10)
                                                                : (ms ? g_r.colorBlitMs16[g_msaa] : g_r.colorBlit16),
             args);
-        const D3D12_RECT hostRect{ LONG(float(x + uint32_t(rect.left)) * encSx), LONG(float(y + uint32_t(rect.top)) * encSy),
+        const Rect hostRect{ LONG(float(x + uint32_t(rect.left)) * encSx), LONG(float(y + uint32_t(rect.top)) * encSy),
             std::min<LONG>(LONG(enc.hostWidth), LONG(float(x + uint32_t(rect.right)) * encSx)),
             std::min<LONG>(LONG(enc.hostHeight), LONG(float(y + uint32_t(rect.bottom)) * encSy)) };
-        PassViewport(D3D12_VIEWPORT{ 0, 0, float(enc.hostWidth), float(enc.hostHeight), 0, 1 }, hostRect);
+        PassViewport(Viewport{ 0, 0, float(enc.hostWidth), float(enc.hostHeight), 0, 1 }, hostRect);
         C().vkList->Draw(3, 1, 0, 0);
         vk::Barriers back;
         back.Add(*enc.resource, vk::Use::Sampled);
@@ -9780,7 +8954,7 @@ bool ResolveIntoEnclosing(uint32_t base, uint32_t pitch, uint32_t declaredHeight
             part.mode = regpu::Writeback::Mode::Deferred;
             part.x0 = x + uint32_t(rect.left), part.x1 = x + uint32_t(rect.right);
             part.y0 = y + uint32_t(rect.top), part.y1 = y + uint32_t(rect.bottom);
-            QueueDeferredWriteback(encBase, enc.width, enc.height, enc.writebackInfo, false, D3D12_RECT{ 0, 0, LONG(enc.width), LONG(enc.height) }, part);
+            QueueDeferredWriteback(encBase, enc.width, enc.height, enc.writebackInfo, false, Rect{ 0, 0, LONG(enc.width), LONG(enc.height) }, part);
         }
         drew = true;
     }
@@ -9876,9 +9050,9 @@ bool TemporalInit()
 }
 
 // A tile of the scene was resolved (its depth may be cleared next): keep its depth.
-void CopySceneDepth(const D3D12_RECT& gameRect)
+void CopySceneDepth(const Rect& gameRect)
 {
-    const D3D12_RECT r = ToHost(gameRect);
+    const Rect r = ToHost(gameRect);
     if (!g_upscale.depth || !C().vkDepth)
     {
         g_tstat.depthNoTarget++;
@@ -10288,7 +9462,7 @@ void GradeIntoBackBuffer(VkCommandBuffer cb, VkImageView target, VkFormat format
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &color;
     vkCmdBeginRendering(cb, &ri);
-    const VkViewport v = ToVkViewport(D3D12_VIEWPORT{ 0, 0, float(width), float(height), 0, 1 });
+    const VkViewport v = ToVkViewport(Viewport{ 0, 0, float(width), float(height), 0, 1 });
     const VkRect2D sc{ { 0, 0 }, { width, height } };
     vkCmdSetViewport(cb, 0, 1, &v);
     vkCmdSetScissor(cb, 0, 1, &sc);
@@ -10978,7 +10152,7 @@ void UpscaleScene(uint32_t base)
 
 // Copies the render target resolved to `base` into guest memory, tiled, for the title to read.
 void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info);
-void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint32_t info, bool depth, const D3D12_RECT& rect,
+void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint32_t info, bool depth, const Rect& rect,
     const regpu::Writeback& request);
 
 // REGPU_WRITEBACK_8888_ONLY=1: resolve write-backs only for 8_8_8_8 colour (and depth), as before (A/B).
@@ -11083,8 +10257,8 @@ void Resolve()
     }
     // Clamped to the tile, as the hardware does: in a tile pass the
     // resolves for the other tiles become empty.
-    const D3D12_RECT tile = WindowScissor();
-    D3D12_RECT rect{ std::clamp<LONG>(LONG(std::lround(x0)), tile.left, tile.right), std::clamp<LONG>(LONG(std::lround(y0)), tile.top, tile.bottom),
+    const Rect tile = WindowScissor();
+    Rect rect{ std::clamp<LONG>(LONG(std::lround(x0)), tile.left, tile.right), std::clamp<LONG>(LONG(std::lround(y0)), tile.top, tile.bottom),
         std::clamp<LONG>(LONG(std::lround(x1)), tile.left, tile.right), std::clamp<LONG>(LONG(std::lround(y1)), tile.top, tile.bottom) };
     if (rect.right <= rect.left || rect.bottom <= rect.top)
         return;
@@ -11268,7 +10442,7 @@ void Resolve()
             }
         }
         // The band's rows in the image (what the write-backs copy).
-        const D3D12_RECT imageRect{ rect.left, rect.top + destRow, rect.right, rect.bottom + destRow };
+        const Rect imageRect{ rect.left, rect.top + destRow, rect.right, rect.bottom + destRow };
         g_r.resolved[base].guestBpp = guestBpp;
         g_r.resolved[base].copyPitch = pitch;
         // 16-bit fixed destinations (k_16, k_16_16, k_16_16_16_16: formats 24-26) hold integers: the copy converts
@@ -11426,8 +10600,8 @@ void Resolve()
                     // And the host surface it was copied from, through the ordinary copy (1280x720 at the pass's
                     // scale) into a spare image at a base no title uses this high, dumped the same way.
                     constexpr uint32_t kSnapBase = 0x1C000000;
-                    BlitResolve(false, kSnapBase, kWidth, kHeight, VK_FORMAT_R8G8B8A8_UNORM, D3D12_RECT{ 0, 0, LONG(kWidth), LONG(kHeight) }, 1.0f);
-                    QueueMidFrameDump(kSnapBase, gpureg::Get(RB_SURFACE_INFO), D3D12_RECT{ 0, 0, LONG(kWidth), LONG(kHeight) });
+                    BlitResolve(false, kSnapBase, kWidth, kHeight, VK_FORMAT_R8G8B8A8_UNORM, Rect{ 0, 0, LONG(kWidth), LONG(kHeight) }, 1.0f);
+                    QueueMidFrameDump(kSnapBase, gpureg::Get(RB_SURFACE_INFO), Rect{ 0, 0, LONG(kWidth), LONG(kHeight) });
                     break;
                 }
                 const char* comma = strchr(p, ',');
@@ -11439,7 +10613,7 @@ void Resolve()
     // Clears after a tile's resolve prepare the EDRAM for the next tile, which
     // we draw lower on the same host surface: a full-width clear covers every
     // row from the tile down.
-    D3D12_RECT clearRect = rect;
+    Rect clearRect = rect;
     const uint32_t surfacePitch = gpureg::Get(RB_SURFACE_INFO) & 0x3FFF;
     static LiveSwitch noClearExtend("REGPU_NO_CLEAR_EXTEND");
     // (Not in a merged tile pass (TileMerge): the later tiles' rows are drawn already.)
@@ -11466,13 +10640,15 @@ void Resolve()
         }
         else
             ClearColor((gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF, gpureg::Get(RB_COLOR_CLEAR_LO), c, color);
-        TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
-        const D3D12_RECT hostClear = ToHost(clearRect);
+        TransitionColor(vk::Use::ColorTarget);
+        const Rect hostClear = ToHost(clearRect);
         static LiveSwitch traceClears("REGPU_TRACE_CLEARS");
         if (traceClears)
             Log("resolve clear: %08X rect %ld,%ld-%ld,%ld host %ld,%ld-%ld,%ld colour base %03X surface %08X worker %d", c, clearRect.left, clearRect.top, clearRect.right,
                 clearRect.bottom, hostClear.left, hostClear.top, hostClear.right, hostClear.bottom, C().colorBase, gpureg::Get(RB_SURFACE_INFO), int(C().worker));
-        C().list->ClearRenderTargetView(C().rtv, color, 1, &hostClear);
+        const VkRect2D rect = ToVkRect(hostClear);
+        if (C().vkColor)
+            C().vkList->ClearColor(C().vkColor->target, C().vkColor->Extent(), color, 1, &rect);
     }
     if ((control >> 9) & 1) // depth/stencil clear: depth 24 bits | stencil 8
     {
@@ -11485,8 +10661,13 @@ void Resolve()
             depth = e ? std::ldexp(1.0f + float(m) / 1048576.0f, int(e) - 15) : std::ldexp(float(m) / 1048576.0f, -14);
             depth = std::clamp(depth, 0.0f, 1.0f);
         }
-        const D3D12_RECT hostClear = ToHost(clearRect);
-        C().list->ClearDepthStencilView(C().dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, depth, UINT8(v & 0xFF), 1, &hostClear);
+        const VkRect2D hostClear = ToVkRect(ToHost(clearRect));
+        if (C().vkDepth)
+        {
+            vk::Transition(*C().vkList, *C().vkDepth, vk::Use::DepthTarget);
+            C().vkList->ClearDepthStencil(C().vkDepth->target, C().vkDepth->Extent(), true, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, depth,
+                uint8_t(v & 0xFF), 1, &hostClear);
+        }
         // The same tiles under other depth surfaces (whole rows of the surface only: a narrower clear's
         // tiles aren't one range).
         if (const uint32_t info = gpureg::Get(RB_SURFACE_INFO), pitch = info & 0x3FFF; pitch && clearRect.left == 0 && clearRect.right >= LONG(pitch))
@@ -11648,7 +10829,6 @@ struct Hold
 } g_hold;
 
 void HoldPresent();
-void SubmitLists(UINT n, ID3D12CommandList* const* lists);
 
 // Spins until done() is true. Presents the overlay roughly 8 times a second once the wait
 // has lasted 150 ms.
@@ -12476,16 +11656,11 @@ void BootPresent(const std::vector<uint8_t>& rgba)
 
 void RendererPredictBegin()
 {
-    // The lookahead only queues Direct3D 12 pipelines: nothing would take them off the queue on Vulkan.
-    if (VulkanRendererEnabled())
-        return;
     PredictBeginImpl();
 }
 
 void RendererPredictShader(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
 {
-    if (VulkanRendererEnabled())
-        return;
     dwords = ucode::UsedDwords(microcodeBE, dwords);
     auto& hash = type == 0 ? g_predVs : g_predPs;
     auto& code = type == 0 ? g_predVsCode : g_predPsCode;
@@ -12506,8 +11681,6 @@ void RendererPredictShader(uint32_t type, const uint32_t* microcodeBE, uint32_t 
 
 void RendererPredictDraw(uint32_t initiator)
 {
-    if (VulkanRendererEnabled())
-        return;
     const uint32_t edramMode = gpureg::Get(RB_MODECONTROL) & 7;
     if ((edramMode != 4 && edramMode != 5) || !g_predVs || !g_predPs || !g_predVsDwords || !g_predPsDwords)
         return;
@@ -12550,16 +11723,11 @@ bool RendererCompileIdle()
 void RendererSaveCaches()
 {
     g_diskWriter.Flush();
-    g_pipelineLibrary.MaybeSave(true);
-#if defined(REGPU_VULKAN)
-    if (VulkanRendererEnabled())
-        RendererVkSavePipelineCache();
-#endif
+    vk::SavePipelineCache(*g_r.vkd);
 }
 
 void RendererSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t usedDwords, uint64_t hash)
 {
-    REGPU_VK_IF_ENABLED(RendererVkSetShader(type, microcodeBE, usedDwords, hash))
     std::vector<uint32_t>& code = type == 0 ? C().vsCode : C().psCode;
     uint64_t& current = type == 0 ? C().vsHash : C().psHash;
     // Titles reload the bound shader before most draws: the same hash is the same used microcode, so
@@ -12573,7 +11741,6 @@ void RendererSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t used
 
 void RendererOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
 {
-    REGPU_VK_IF_ENABLED(RendererVkOnShaderLoad(type, microcodeBE, dwords))
     std::vector<uint32_t>& code = type == 0 ? C().vsCode : C().psCode;
     code.assign(microcodeBE, microcodeBE + ucode::UsedDwords(microcodeBE, dwords));
     (type == 0 ? C().vsHash : C().psHash) = Fnv(code.data(), code.size() * 4) ^ type;
@@ -12656,26 +11823,6 @@ namespace
 {
 std::mutex g_poolMutex;
 
-ID3D12GraphicsCommandList* AcquireList()
-{
-    FrameResources& f = Frame();
-    std::lock_guard lock(g_poolMutex);
-    if (f.poolUsed == f.pool.size())
-    {
-        auto& e = f.pool.emplace_back();
-        Check(g_r.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&e.first)), "CreateCommandAllocator(piece)");
-        Check(g_r.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, e.first.Get(), nullptr, IID_PPV_ARGS(&e.second)),
-            "CreateCommandList(piece)");
-    }
-    else
-    {
-        auto& e = f.pool[f.poolUsed];
-        e.first->Reset();
-        e.second->Reset(e.first.Get(), nullptr);
-    }
-    return f.pool[f.poolUsed++].second.Get();
-}
-
 // The state every draw list starts with (the bindless sets, 1-3, are bound by its first draw: DrawState).
 void ListPrologue(vk::RecordedList& list)
 {
@@ -12688,28 +11835,9 @@ void ListPrologue(vk::RecordedList& list)
 // and go with the next real submission (the frame's, a fence's, or one that must reach the GPU now).
 // REGPU_NO_DEFER_LISTS=1: at once.
 std::mutex g_pendingMutex;
-std::vector<ID3D12CommandList*> g_pendingLists;
 
 // Submits the queued lists, then these.
-void SubmitLists(UINT n, ID3D12CommandList* const* lists)
-{
-    std::lock_guard lock(g_pendingMutex);
-    g_pendingLists.insert(g_pendingLists.end(), lists, lists + n);
-    if (!g_pendingLists.empty())
-        g_r.queue->ExecuteCommandLists(UINT(g_pendingLists.size()), g_pendingLists.data());
-    g_pendingLists.clear();
-}
-
 // Queues lists for the next submission (or submits them, with REGPU_NO_DEFER_LISTS).
-void QueueLists(UINT n, ID3D12CommandList* const* lists)
-{
-    static const bool now = getenv("REGPU_NO_DEFER_LISTS") != nullptr;
-    if (now)
-        return SubmitLists(n, lists);
-    std::lock_guard lock(g_pendingMutex);
-    g_pendingLists.insert(g_pendingLists.end(), lists, lists + n);
-}
-
 // The same for Vulkan command buffers (ended): one vkQueueSubmit2 for all queued.
 std::vector<VkCommandBuffer> g_vkPendingLists;
 void SubmitVkLists(uint32_t n, const VkCommandBuffer* lists)
@@ -13106,7 +12234,7 @@ void FinishDeferredWritebacks(UINT frameIndex)
 }
 
 // Queues the rows of this resolve (rect) inside the requested region for a deferred write-back.
-void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint32_t info, bool depth, const D3D12_RECT& rect,
+void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint32_t info, bool depth, const Rect& rect,
     const regpu::Writeback& request)
 {
     const auto it = g_r.resolved.find(base);
@@ -13629,10 +12757,6 @@ void RendererFenceWait(uint64_t value, void*)
 
 void RendererOcclusionBegin()
 {
-    // Not on Vulkan: this would start the whole Direct3D 12 renderer beside it for a query that never sees a draw.
-    // RendererOcclusionEnd then has no result, and the title gets the fixed answer (visible).
-    if (VulkanRendererEnabled())
-        return;
     if (!g_r.ok)
         Init();
     BeginFrameIfNeeded();
@@ -13703,8 +12827,6 @@ extern uint32_t g_logged;
 // (no result yet counts as visible: the caller answers 1000 samples).
 bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total, uint32_t address)
 {
-    if (VulkanRendererEnabled())
-        return false;
     const UINT order = g_occlusionOrder;
     const bool open = g_occlusionOpen;
     const bool known = OcclusionEndImpl(samples, total, address);
@@ -13767,8 +12889,6 @@ bool OcclusionEndImpl(uint32_t& samples, uint32_t& total, uint32_t address)
 // the D3D query around its draws in stream order (RendererOcclusionBegin for every start, EndOn at the end).
 bool RendererOcclusionAnswer(uint32_t& samples, uint32_t& total, uint32_t address, uint32_t kindOrder)
 {
-    if (VulkanRendererEnabled())
-        return false;
     return OcclusionLookup(samples, total, ~0u, { uint64_t(address) << 1 | 1, kindOrder }, false);
 }
 
@@ -13823,7 +12943,7 @@ void RendererTrackTile(RendererTile& tile)
     const uint32_t mode = gpureg::Get(RB_MODECONTROL) & 7;
     if (mode != 4 && mode != 5)
         return;
-    const D3D12_RECT scissor = WindowScissor();
+    const Rect scissor = WindowScissor();
     const uint32_t offsetReg = gpureg::Get(PA_SC_WINDOW_OFFSET);
     const bool vertexOffset = (gpureg::Get(PA_SU_SC_MODE_CNTL) >> 16) & 1;
     const int32_t wx = vertexOffset ? int32_t(offsetReg << 17) >> 17 : 0, wy = vertexOffset ? int32_t((offsetReg >> 16) << 17) >> 17 : 0;
@@ -13981,12 +13101,12 @@ bool StereoHudDraw()
     }();
     static LiveSwitch inView("REGPU_VR_HUD_IN_VIEW");
     // (Not the resolve that follows: a copy packet runs with the composite's shaders still loaded.)
-    return hudUnder && (g_stereoClipX != 0.0f || regpu::xr::MonoHudPanel() || g_tripleSide) && C().psHash == hudUnder && WidePass() && !inView && C().color && !RendererIsResolveDraw();
+    return hudUnder && (g_stereoClipX != 0.0f || regpu::xr::MonoHudPanel() || g_tripleSide) && C().psHash == hudUnder && WidePass() && !inView && C().vkColor && !RendererIsResolveDraw();
 }
 
 void StereoCaptureHud()
 {
-    const D3D12_RECT host = ToHost(D3D12_RECT{ 0, 0, LONG(FrameW()), LONG(FrameH()) });
+    const Rect host = ToHost(Rect{ 0, 0, LONG(FrameW()), LONG(FrameH()) });
     const UINT w = UINT(host.right - host.left), h = UINT(host.bottom - host.top);
     vk::Image* target = regpu::xr::StereoTarget(2, w, h);
     if (!target || !C().vkColor)
@@ -14057,7 +13177,6 @@ void ScanVrTag()
 
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
-    REGPU_VK_IF_ENABLED(RendererVkOnDraw(initiator, dmaBase, dmaSize))
     ScanVrTag();
     if (StereoHudDraw())
     {
@@ -15060,7 +14179,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         else if (wantMotion && !motion)
             g_tstat.shaderNotReady++;
     }
-    D3D12_GPU_VIRTUAL_ADDRESS motionPrevious = 0; // last frame's vertex constants of this draw (b2)
+    // Last frame's vertex constants of this draw (b2): at this offset of the previous slot's ring (motionKnown), else
+    // this draw's own (no motion).
+    uint32_t motionOffset = 0;
+    bool motionKnown = false;
     VkPipeline pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true, stripCut && directIndex) : VK_NULL_HANDLE;
     const CompiledShader* psUsed = nullptr; // the pixel shader drawn with, when not a motion pipeline
     if (wantMotion && motion && !pso)
@@ -15289,9 +14411,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             // kFrames): the draw reads them there (b2).
             auto& entry = g_upscale.constants.At(key).c;
             const uint32_t parity = g_upscale.constantsFrame & 1;
-            const D3D12_GPU_VIRTUAL_ADDRESS now = f.ring->GetGPUVirtualAddress() + vsOffset;
-            const bool known = entry.frame + 1 == g_upscale.constantsFrame && !g_upscale.reset;
-            motionPrevious = known ? entry.address[parity ^ 1] : now;
+            const UINT prevSlot = (g_r.frameIndex + kFrames - 1) % kFrames;
+            const bool known = entry.frame + 1 == g_upscale.constantsFrame && !g_upscale.reset && entry.slot[parity ^ 1] == prevSlot;
+            motionKnown = known;
+            motionOffset = known ? entry.offset[parity ^ 1] : uint32_t(vsOffset);
             g_tstat.motion++;
             if (known)
                 g_tstat.known++;
@@ -15321,7 +14444,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 memcpy(entry.first, cur, sizeof(cur));
                 entry.firstFrame = g_upscale.constantsFrame;
             }
-            entry.address[parity] = now;
+            entry.offset[parity] = uint32_t(vsOffset);
+            entry.slot[parity] = uint8_t(g_r.frameIndex);
             entry.frame = g_upscale.constantsFrame;
             vc->vjitter[0] = g_upscale.jitterNdc[0];
             vc->vjitter[1] = g_upscale.jitterNdc[1];
@@ -16047,7 +15171,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // space, so tiled draws stay unshifted. The title's rectangle draws (depth resets)
     // reset the window offset to zero and use tile-relative coordinates instead:
     // those land in the current tile, so shift them by the tile's origin.
-    D3D12_RECT scissor = WindowScissor();
+    Rect scissor = WindowScissor();
     float shiftX = 0, shiftY = 0;
     {
         const uint32_t offsetReg = gpureg::Get(PA_SC_WINDOW_OFFSET);
@@ -16114,17 +15238,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             scissor.bottom = std::min(scissor.bottom, g_tile.rect.bottom);
         }
     }
-    const D3D12_VIEWPORT vp{ shiftX * ScaleX(), shiftY * ScaleY(), float(PassWidth()) * ScaleX(), float(PassHeight()) * ScaleY(), 0, 1 };
+    const Viewport vp{ shiftX * ScaleX(), shiftY * ScaleY(), float(PassWidth()) * ScaleX(), float(PassHeight()) * ScaleY(), 0, 1 };
     if (scissor.right <= scissor.left || scissor.bottom <= scissor.top)
     {
         TraceSkip("empty scissor", initiator);
         g_r.skippedThisFrame++;
         return;
     }
-    D3D12_RECT hostScissor = ToHost(scissor);
+    Rect hostScissor = ToHost(scissor);
     if (TileMerge::LaterClear& lc = TileMerge::g_laterClear; lc.pending[3] > lc.pending[1])
     {
-        const D3D12_RECT rows = ToHost(D3D12_RECT{ lc.pending[0], lc.pending[1], lc.pending[2], lc.pending[3] });
+        const Rect rows = ToHost(Rect{ lc.pending[0], lc.pending[1], lc.pending[2], lc.pending[3] });
         lc.pending[3] = lc.pending[1];
         if (lc.color)
         {
@@ -16575,11 +15699,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     // The constant blocks: set 0's dynamic uniform ranges at this draw's ring offsets (D3D12: root CBVs b0, b1, b2), and
     // the bindless sets once per command buffer (only set 0 is bound per draw). b2: last frame's vertex constants of
-    // a motion draw, at motionPrevious (still a D3D12 address: the motion variants are converted in phase 4; 0 until).
+    // a motion draw, in the previous slot's ring (the set 0 variant whose b2 is over it), or its own.
     {
-        const UINT bank = g_samplerBank.load(std::memory_order_relaxed) % kSamplerBanks;
-        VkDescriptorSet set0 = f.vkSet0[bank];
-        const uint32_t offsets[3] = { uint32_t(vsOffset), uint32_t(psOffset), 0 };
+        const UINT bank = SamplerBank() % kSamplerBanks;
+        VkDescriptorSet set0 = motion && motionKnown ? f.vkSet0Motion[bank] : f.vkSet0[bank];
+        const uint32_t offsets[3] = { uint32_t(vsOffset), uint32_t(psOffset), motion ? motionOffset : 0u };
         if (!ds.texturesBound)
         {
             C().vkList->BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, g_r.vkBindings.layout, 1, 3, g_r.vkBindings.textureSets);
@@ -16629,8 +15753,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             int(WidePass()), int(g_drawSamplesResolve), gpureg::Get(RB_SURFACE_INFO) & 0x3FFF,
             !C().worker && g_occlusionOpen ? " [in occlusion query]" : GetShader(C().vsHash, C().vsCode, false).info.memExport ? " [memexport]" : "", tex.c_str());
         Log("    host: scissor %ld,%ld-%ld,%ld viewport %g,%g %gx%g depth %p colour %p (bases %03X %03X)", hostScissor.left, hostScissor.top,
-            hostScissor.right, hostScissor.bottom, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, static_cast<void*>(C().depth.Get()),
-            static_cast<void*>(C().color.Get()), C().depthBase, C().colorBase);
+            hostScissor.right, hostScissor.bottom, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, static_cast<void*>(C().vkDepth),
+            static_cast<void*>(C().vkColor), C().depthBase, C().colorBase);
         uint32_t bools[8];
         for (int i = 0; i < 8; i++)
             bools[i] = gpureg::Get(gpureg::BoolConstants + i);
@@ -16783,11 +15907,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         ? GetPipeline(vs, ps, edramMode == 5, cullable, false, stripCut && directIndex, true) : VK_NULL_HANDLE;
     {
         const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const D3D_PRIMITIVE_TOPOLOGY topology = indexedCount && prim == 6 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        const VkPrimitiveTopology topology = indexedCount && prim == 6 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         if (topology != g_drawState.topology)
         {
             g_drawState.topology = topology;
-            C().vkList->SetPrimitiveTopology(ToVkTopology(topology));
+            C().vkList->SetPrimitiveTopology(topology);
         }
         // Index buffers live in the index arena or this frame's upload ring: bound as a view of the whole buffer,
         // with the draw's place as its start index, consecutive draws share one binding (a new view almost every
@@ -16838,7 +15962,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             const int exp = expDraw();
             if (exp == 3)
             {
-                const D3D12_RECT one{ 0, 0, 1, 1 };
+                const Rect one{ 0, 0, 1, 1 };
                 const VkRect2D r = ToVkRect(one);
                 C().vkList->SetScissors(1, &r);
                 g_drawState.scissor = one;
@@ -16909,7 +16033,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // depth-only MSAA view (Top Spin 4 clears its 1024x1024 shadow colour layer to white with a
     // depth of 1/256). The host keeps colour and depth apart, so the clear is mirrored into the
     // colour target over the rectangle. REGPU_NO_EDRAM_ALIAS_CLEAR=1: off.
-    if (static LiveSwitch noAliasClear("REGPU_NO_EDRAM_ALIAS_CLEAR"); !noAliasClear && (initiator & 0x3F) == 8 && edramMode == 5 && C().color &&
+    if (static LiveSwitch noAliasClear("REGPU_NO_EDRAM_ALIAS_CLEAR"); !noAliasClear && (initiator & 0x3F) == 8 && edramMode == 5 && C().vkColor &&
         !ps.info.usedTextureSlots && !vs.info.usedTextureSlots && !vs.info.vertexFetchConstants.empty())
     {
         const uint32_t colorInfo = gpureg::Get(RB_COLOR_INFO), depthInfo = gpureg::Get(RB_DEPTH_INFO), depthControl = gpureg::Get(RB_DEPTHCONTROL);
@@ -16933,7 +16057,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 const float sx = vc->vscale[3] > 0 ? vc->vscale[3] : 1.0f, sy = vc->voffset[3] > 0 ? vc->voffset[3] : 1.0f;
                 const float x0 = std::min({ f(0), f(7), f(14) }) * sx, x1 = std::max({ f(0), f(7), f(14) }) * sx;
                 const float y0 = std::min({ f(1), f(8), f(15) }) * sy, y1 = std::max({ f(1), f(8), f(15) }) * sy;
-                D3D12_RECT r{ std::max<LONG>(LONG(x0), scissor.left), std::max<LONG>(LONG(y0), scissor.top), std::min<LONG>(LONG(x1), scissor.right),
+                Rect r{ std::max<LONG>(LONG(x0), scissor.left), std::max<LONG>(LONG(y0), scissor.top), std::min<LONG>(LONG(x1), scissor.right),
                     std::min<LONG>(LONG(y1), scissor.bottom) };
                 if (r.right > r.left && r.bottom > r.top)
                 {
@@ -16942,8 +16066,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                     const uint32_t word = depthBits << 8 | (stencilWrite ? stencilRefMask & (stencilRefMask >> 16) & 0xFF : 0);
                     const float color[4] = { float(word & 0xFF) / 255.0f, float((word >> 8) & 0xFF) / 255.0f, float((word >> 16) & 0xFF) / 255.0f,
                         float(word >> 24) / 255.0f };
-                    const D3D12_RECT host = ToHost(r);
-                    C().list->ClearRenderTargetView(C().rtv, color, 1, &host);
+                    const VkRect2D host = ToVkRect(ToHost(r));
+                    if (C().vkColor)
+                        C().vkList->ClearColor(C().vkColor->target, C().vkColor->Extent(), color, 1, &host);
                     if (TraceFrame() && g_r.frame + 1 == TraceFrame())
                         Log("    depth clear mirrored into colour: %ld,%ld-%ld,%ld word %08X", r.left, r.top, r.right, r.bottom, word);
                 }
@@ -17018,18 +16143,13 @@ void BenchmarkWriteReport(const char* path)
     }
     MEMORYSTATUSEX memory{ sizeof(memory) };
     GlobalMemoryStatusEx(&memory);
-    if (g_r.device)
+    if (g_r.vkd)
     {
-        ComPtr<IDXGIFactory4> factory;
-        ComPtr<IDXGIAdapter1> adapter;
-        DXGI_ADAPTER_DESC1 desc{};
-        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapterByLuid(g_r.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))) &&
-            SUCCEEDED(adapter->GetDesc1(&desc)))
-        {
-            char name[128];
-            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name), nullptr, nullptr);
-            gpu = std::string(name) + " (" + std::to_string(desc.DedicatedVideoMemory >> 20) + " MB)";
-        }
+        uint64_t local = 0;
+        for (uint32_t i = 0; i < g_r.vkd->memory.memoryHeapCount; i++)
+            if (g_r.vkd->memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                local = std::max<uint64_t>(local, g_r.vkd->memory.memoryHeaps[i].size);
+        gpu = g_r.vkd->name + " (" + std::to_string(local >> 20) + " MB)";
     }
     const Settings& st = GetSettings();
     static const char* upscalers[] = { "off", "FSR 1", "FSR 3", "DLSS", "FSR 4" };
@@ -17257,23 +16377,20 @@ void LogThread()
                     Log("perf lite: frame times (ms:count):%s", line.c_str());
                 }
                 // Video memory every 5th line (session 33 of the FM3 port: high resolutions): what the process uses of the
-                // budget the OS gives it, from DXGI on this log thread (nothing on the draw thread).
+                // budget the OS gives it (VMA's budget, VK_EXT_memory_budget where the driver has it), on this log thread.
                 static uint32_t vramLines = 0;
-                if (vramLines++ % 5 == 0 && g_r.device)
+                if (vramLines++ % 5 == 0 && g_r.vkd)
                 {
-                    static ComPtr<IDXGIAdapter3> adapter = [] {
-                        ComPtr<IDXGIFactory4> factory;
-                        ComPtr<IDXGIAdapter3> a;
-                        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
-                            factory->EnumAdapterByLuid(g_r.device->GetAdapterLuid(), IID_PPV_ARGS(&a));
-                        return a;
-                    }();
-                    DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
-                    if (adapter && SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
-                        SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared)))
-                        Log("perf lite: VRAM %llu MB used of %llu MB budget | system memory for the GPU %llu MB of %llu MB",
-                            (unsigned long long)(local.CurrentUsage >> 20), (unsigned long long)(local.Budget >> 20),
-                            (unsigned long long)(shared.CurrentUsage >> 20), (unsigned long long)(shared.Budget >> 20));
+                    VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+                    vmaGetHeapBudgets(g_r.vkd->allocator, budgets);
+                    uint64_t localUse = 0, localBudget = 0, sharedUse = 0, sharedBudget = 0;
+                    for (uint32_t i = 0; i < g_r.vkd->memory.memoryHeapCount; i++)
+                        if (g_r.vkd->memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                            localUse += budgets[i].usage, localBudget += budgets[i].budget;
+                        else
+                            sharedUse += budgets[i].usage, sharedBudget += budgets[i].budget;
+                    Log("perf lite: VRAM %llu MB used of %llu MB budget | system memory for the GPU %llu MB of %llu MB", (unsigned long long)(localUse >> 20),
+                        (unsigned long long)(localBudget >> 20), (unsigned long long)(sharedUse >> 20), (unsigned long long)(sharedBudget >> 20));
                 }
                 windowFirst = r, cpuFirst = cpuNow;
                 frameMs.clear();
@@ -17402,7 +16519,6 @@ void RendererStereoCaptureEye(int eye, uint32_t frontBuffer)
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer);
 void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
 {
-    REGPU_VK_IF_ENABLED(RendererVkOnSwap(frameNumber, frontBuffer))
     const auto t0 = std::chrono::steady_clock::now();
     RendererOnSwapImpl(frameNumber, frontBuffer);
     const auto now = std::chrono::steady_clock::now();
@@ -17533,46 +16649,17 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
                 double(g_uploadStats.sampledHits.exchange(0)) / g_perf.frames);
         if (perf && g_perf.frames)
         {
-            // Order of RecordedList::Op.
-            static const char* const names[] = { "barrier", "copy", "rootsig", "table", "cbv", "root32", "targets", "pipeline", "viewport",
-                "scissor", "stencilref", "blendfactor", "topology", "heaps", "draw", "endquery", "resolvequery", "clearrtv", "cleardsv",
-                "creatertv", "createdsv", "drawindexed", "indexbuffer", "copybuffer", "csrootsig", "cstable", "csroot32", "dispatch", "beginquery" };
+            // Order of vk::RecordedList's ops.
+            static const char* const names[] = { "barrier", "targets", "clearcolor", "cleardepth", "pipeline", "sets", "push", "viewports",
+                "scissors", "stencilref", "blendconstants", "topology", "indexbuffer", "draw", "drawindexed", "dispatch", "copybuffer",
+                "buffertoimage", "imagetobuffer", "copyimage", "resolve", "fill", "resetqueries", "beginquery", "endquery", "copyqueries",
+                "timestamp", "predication", "beginlabel", "endlabel", "handoff", "call", "switch", "endrendering" };
             std::string s;
             for (size_t i = 0; i < std::size(names); i++)
-                if (const uint64_t n = g_recordedOps[i].exchange(0); n >= g_perf.frames)
+                if (const uint64_t n = vk::g_recordedOps[i].exchange(0); n >= g_perf.frames)
                     s += " " + std::string(names[i]) + " " + std::to_string(n / g_perf.frames);
-            Log("perf:   recorded per frame:%s | %llu barriers", s.c_str(), (unsigned long long)(g_recordedBarriers.exchange(0) / g_perf.frames));
-            // REGPU_TRACE_BARRIERS=1: barriers per frame by call site (module offset, for llvm-symbolizer) and
-            // transition (before -> after state, or UAV/aliasing).
-            static const bool traceBarriers = getenv("REGPU_TRACE_BARRIERS") != nullptr;
-            static std::mutex barrierMutex;
-            static std::map<std::tuple<uintptr_t, uint32_t, uint32_t>, uint64_t> barrierSites;
-            if (traceBarriers && !g_barrierSites)
-                g_barrierSites = [](void* caller, UINT n, const D3D12_RESOURCE_BARRIER* b) {
-                    HMODULE self = nullptr;
-                    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                        reinterpret_cast<LPCWSTR>(&InitDepthBlit), &self);
-                    const uintptr_t at = uintptr_t(caller) - uintptr_t(self);
-                    std::lock_guard lock(barrierMutex);
-                    for (UINT i = 0; i < n; i++)
-                    {
-                        const bool transition = b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                        barrierSites[{ at, transition ? uint32_t(b[i].Transition.StateBefore) : 0xFFFF0000u | b[i].Type,
-                            transition ? uint32_t(b[i].Transition.StateAfter) : 0 }]++;
-                    }
-                };
-            if (traceBarriers)
-            {
-                std::lock_guard lock(barrierMutex);
-                std::vector<std::pair<uint64_t, std::tuple<uintptr_t, uint32_t, uint32_t>>> v;
-                for (auto& [k, n] : barrierSites)
-                    v.push_back({ n, k });
-                std::sort(v.rbegin(), v.rend());
-                for (size_t i = 0; i < v.size() && i < 12; i++)
-                    Log("perf:   barriers %llu/frame at +%llx: %x -> %x", (unsigned long long)(v[i].first / g_perf.frames),
-                        (unsigned long long)std::get<0>(v[i].second), std::get<1>(v[i].second), std::get<2>(v[i].second));
-                barrierSites.clear();
-            }
+            Log("perf:   recorded per frame:%s | %llu barriers", s.c_str(), (unsigned long long)(vk::g_recordedBarriers.exchange(0) / g_perf.frames));
+            // (REGPU_TRACE_BARRIERS, the D3D12 recorder's barriers by call site, has no Vulkan counterpart yet.)
         }
         if (perf && !g_created.empty())
         {
@@ -17591,7 +16678,7 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         g_skippedPipeline = 0;
         g_pipelineMs = 0;
         g_pipelinesCreated = 0;
-        g_pipelineLibrary.MaybeSave();
+        MaybeSavePipelineCache();
         g_created.clear();
         g_gpuWaitSeconds = 0;
         g_perfDrawsLogged += g_perf.draws;
@@ -18429,7 +17516,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             // Depth: the values between the clear values (0, 1) stretched over the grey range, so a
             // map of depths close together (a shadow map) shows its shapes.
             float lo = 1.0f, hi = 0.0f;
-            if (d.format == DXGI_FORMAT_R32_FLOAT)
+            if (d.format == VK_FORMAT_R32_SFLOAT)
                 for (UINT y = 0; y < d.height; y++)
                     for (UINT x = 0; x < d.width; x++)
                         if (const float f = reinterpret_cast<const float*>(mapped + size_t(y) * d.pitch)[x]; f > 0.0f && f < 1.0f)
@@ -18438,7 +17525,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
                 for (UINT x = 0; x < d.width; x++)
                 {
                     uint8_t* o = &out[(size_t(y) * d.width + x) * 4];
-                    if (d.format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+                    if (d.format == VK_FORMAT_R16G16B16A16_SFLOAT)
                     {
                         const uint16_t* h = reinterpret_cast<const uint16_t*>(mapped + size_t(y) * d.pitch) + x * 4;
                         for (int c = 0; c < 4; c++)
@@ -18450,7 +17537,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
                             o[c] = uint8_t(std::clamp(f, 0.0f, 1.0f) * 255.0f + 0.5f);
                         }
                     }
-                    else if (d.format == DXGI_FORMAT_R32_FLOAT)
+                    else if (d.format == VK_FORMAT_R32_SFLOAT)
                     {
                         const float f = reinterpret_cast<const float*>(mapped + size_t(y) * d.pitch)[x];
                         if (x == 0 && y == 0)

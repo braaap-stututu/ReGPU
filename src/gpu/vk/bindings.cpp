@@ -9,7 +9,7 @@ namespace vk
 namespace
 {
 constexpr uint32_t kSet0Bindings[] = { 0, 1, 2, 100, 101, 200 };
-constexpr uint32_t kMaxSet0 = 64; // frame slots x sampler banks x ring regrowths
+constexpr uint32_t kMaxSet0 = 256; // frame slots x sampler banks x 2 (b2 over this or the last slot's ring) x ring regrowths
 }
 
 bool CreateDrawBindings(Device& d, DrawBindings& b, uint32_t vsBytes, uint32_t psBytes, uint32_t motionBytes)
@@ -101,7 +101,7 @@ bool CreateDrawBindings(Device& d, DrawBindings& b, uint32_t vsBytes, uint32_t p
 }
 
 VkDescriptorSet CreateSet0(Device& d, DrawBindings& b, VkBuffer ring, VkDeviceSize ringBytes, VkBuffer guest, VkDeviceSize guestBytes,
-    const VkSampler (&samplers)[kSamplerCount])
+    const VkSampler (&samplers)[kSamplerCount], VkBuffer motionRing, VkDeviceSize motionRingBytes)
 {
     VkDescriptorSet set = VK_NULL_HANDLE;
     VkDescriptorSetAllocateInfo ai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
@@ -111,7 +111,11 @@ VkDescriptorSet CreateSet0(Device& d, DrawBindings& b, VkBuffer ring, VkDeviceSi
     Check(vkAllocateDescriptorSets(d.device, &ai, &set), "vkAllocateDescriptorSets (set 0)");
     VkDescriptorBufferInfo constants[3];
     for (int i = 0; i < 3; i++)
-        constants[i] = { ring, 0, std::min<VkDeviceSize>(b.constantBytes[i] ? b.constantBytes[i] : 16, ringBytes) };
+    {
+        const bool other = i == 2 && motionRing; // (b2 over another ring: last frame's)
+        constants[i] = { other ? motionRing : ring, 0,
+            std::min<VkDeviceSize>(b.constantBytes[i] ? b.constantBytes[i] : 16, other ? motionRingBytes : ringBytes) };
+    }
     const VkDescriptorBufferInfo ringInfo{ ring, 0, ringBytes };
     const VkDescriptorBufferInfo guestInfo{ guest, 0, guestBytes };
     VkDescriptorImageInfo samplerInfo[kSamplerCount];

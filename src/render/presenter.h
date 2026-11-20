@@ -27,12 +27,6 @@ void PresenterCountFrame();
 // Keyboard input goes to the game only while the window has focus.
 bool PresenterHasFocus();
 
-struct ID3D12Device;
-struct ID3D12CommandQueue;
-
-// Shared D3D12 device and queue (the renderer's D3D12 objects, until the conversion has removed them).
-ID3D12Device* RenderDevice();
-ID3D12CommandQueue* RenderQueue();
 namespace vk
 {
 struct Device;
