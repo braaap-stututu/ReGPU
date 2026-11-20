@@ -779,6 +779,27 @@ float RegFloat(uint32_t index)
     return f;
 }
 
+// A translated shader's SPIR-V (vk::AdaptHlsl + DXC) and, once a pipeline needs it, its module. Shared by the shader's
+// variants and patched copies, as the D3D12 bytecode blob was; GetBufferPointer / GetBufferSize as the blob had, for
+// the shader cache's file writes. Never freed (shaders live for the run).
+struct SpirvCode
+{
+    std::vector<uint32_t> words;
+    std::atomic<VkShaderModule> module{ VK_NULL_HANDLE };
+    std::mutex moduleLock;
+    const void* GetBufferPointer() const { return words.data(); }
+    size_t GetBufferSize() const { return words.size() * 4; }
+    VkShaderModule Module(vk::Device& d)
+    {
+        if (VkShaderModule m = module.load(std::memory_order_acquire))
+            return m;
+        std::lock_guard lock(moduleLock);
+        if (!module.load(std::memory_order_relaxed))
+            module.store(vk::CreateShaderModule(d, words).module, std::memory_order_release);
+        return module.load(std::memory_order_relaxed);
+    }
+};
+
 struct CompiledShader
 {
     enum State { Pending, Ready, Failed };
@@ -787,7 +808,7 @@ struct CompiledShader
     uint64_t hash = 0, cacheKey = 0;
     bool pixel = false;
     std::vector<uint32_t> ucodeBE; // saved to the shader cache once a pipeline uses it
-    ComPtr<ID3DBlob> code;
+    std::shared_ptr<SpirvCode> code; // Vulkan: SPIR-V (was the D3D12 bytecode blob)
     TranslatedShader info;
     const CompiledShader* hlslSource = nullptr; // canonical variants: the shader whose code (and HLSL) this reuses
     mutable const CompiledShader* motion = nullptr; // its motion-vector variant, once looked up
@@ -1010,6 +1031,7 @@ struct BoundTexture
 struct PipelineEntry
 {
     ComPtr<ID3D12PipelineState> pso;
+    VkPipeline vk = VK_NULL_HANDLE; // Vulkan: replaces pso
     std::atomic<int> state{ 0 }; // 0 building, 1 ready, 2 failed
     // The build, run once by whoever claims it first: a pool thread, or a draw that must wait for it
     // (WaitForPipeline), so that draw doesn't wait behind every build queued before it.
@@ -5830,6 +5852,12 @@ int OptimizeLevel()
 std::filesystem::path ShaderCachePath(uint64_t key, bool optimized, bool pixel)
 {
     char name[48];
+    // Vulkan: one SPIR-V build per shader (DXC optimises; there is no fxc level), tagged by the layout mapping
+    // (vk::AdaptHlsl) it was made for. The D3D12 caches (.dxbc, .dxil) are left alone.
+    (void)optimized;
+    (void)pixel;
+    snprintf(name, sizeof(name), "%016llx.vk1.spv", (unsigned long long)key);
+    return RegpuUserDir() / "shadercache" / name;
     if (DxcFor(pixel))
         snprintf(name, sizeof(name), "%016llx%s.dxil", (unsigned long long)key, DxcCacheTag().c_str());
     else if (optimized && OptimizeLevel() != 1)
@@ -5903,23 +5931,20 @@ struct ShaderOptimizer
 // optimised build.
 bool LoadCachedBytecode(CompiledShader& cs)
 {
-    for (const bool optimized : { true, false })
-    {
-        if (optimized && (!g_optimizeShaders || DxcFor(cs.pixel))) // (DXC: one build, already optimised)
-            continue;
-        std::ifstream in{ ShaderCachePath(cs.cacheKey, optimized, cs.pixel), std::ios::binary | std::ios::ate };
-        if (!in)
-            continue;
-        const auto size = size_t(in.tellg());
-        if (!size || FAILED(D3DCreateBlob(size, &cs.code)))
-            continue;
-        in.seekg(0);
-        in.read(static_cast<char*>(cs.code->GetBufferPointer()), std::streamsize(size));
-        if (!optimized && g_optimizeShaders && !DxcFor(cs.pixel))
-            g_optimizer.Push(cs.cacheKey, cs.pixel, cs.info.hlsl);
-        return true;
-    }
-    return false;
+    // (Vulkan: one SPIR-V build, already optimised by DXC: no background optimiser.)
+    std::ifstream in{ ShaderCachePath(cs.cacheKey, false, cs.pixel), std::ios::binary | std::ios::ate };
+    if (!in)
+        return false;
+    const auto size = size_t(in.tellg());
+    if (!size || size % 4)
+        return false;
+    auto code = std::make_shared<SpirvCode>();
+    code->words.resize(size / 4);
+    in.seekg(0);
+    if (!in.read(reinterpret_cast<char*>(code->words.data()), std::streamsize(size)) || code->words[0] != 0x07230203u) // SPIR-V magic
+        return false;
+    cs.code = std::move(code);
+    return true;
 }
 
 struct ShaderCompiler
@@ -6080,31 +6105,26 @@ struct ShaderCompiler
             cs.state.store(CompiledShader::Ready, std::memory_order_release);
             return false;
         }
-        ComPtr<ID3DBlob> errors;
-        // Runtime compiles skip optimisation: fxc can take minutes on the
-        // larger translated shaders.
+        // HLSL to SPIR-V through DXC (vk_shader.h), with the registers mapped to the Vulkan layout (vk::AdaptHlsl). The
+        // translated source picks its sampling form per stage (hlsl.cpp: a vertex shader can't sample with an implicit
+        // LOD): CompileHlsl defines REGPU_VERTEX_STAGE for vertex shaders.
         const auto start = std::chrono::steady_clock::now();
-        // The translated source picks its sampling form per stage (see hlsl.cpp: a vertex
-        // shader cannot sample with an implicit LOD).
-        const D3D_SHADER_MACRO vertexStage[] = { { "REGPU_VERTEX_STAGE", "1" }, { nullptr, nullptr } };
+        auto code = std::make_shared<SpirvCode>();
         std::string dxcErrors;
-        const HRESULT hr = DxcFor(cs.pixel) ? DxcCompileShader(cs.info.hlsl, cs.pixel, &cs.code, &dxcErrors)
-            : D3DCompile(cs.info.hlsl.data(), cs.info.hlsl.size(), nullptr, cs.pixel ? nullptr : vertexStage, nullptr, "main",
-                  cs.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &cs.code, &errors);
+        const bool compiled = vk::CompileHlsl(vk::AdaptHlsl(cs.info.hlsl), cs.pixel, cs.cacheKey, {}, code->words, &dxcErrors);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        if (FAILED(hr))
+        if (!compiled)
         {
             Log("renderer: %s %016llx failed to compile:\n%s", cs.pixel ? "ps" : "vs", (unsigned long long)cs.hash,
-                !dxcErrors.empty() ? dxcErrors.c_str() : errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+                !dxcErrors.empty() ? dxcErrors.c_str() : "?");
             cs.state.store(CompiledShader::Failed, std::memory_order_release);
             return false;
         }
+        cs.code = std::move(code);
         g_stats.shadersBuilt++;
         if (ms > 200)
             Log("renderer: %s %016llx compiled in %.0f ms (background)", cs.pixel ? "ps" : "vs", (unsigned long long)cs.hash, ms);
         WriteCacheFile(ShaderCachePath(cs.cacheKey, false, cs.pixel), cs.code->GetBufferPointer(), cs.code->GetBufferSize());
-        if (g_optimizeShaders && !DxcFor(cs.pixel))
-            g_optimizer.Push(cs.cacheKey, cs.pixel, cs.info.hlsl);
         cs.state.store(CompiledShader::Ready, std::memory_order_release);
         return true;
     }
@@ -6117,7 +6137,7 @@ struct ShaderCompiler
 std::unordered_map<uint64_t, const CompiledShader*> g_canonical;
 // Bytecode already loaded, by HLSL hash: a shader whose HLSL matches one in memory doesn't
 // read the shader cache from disk again.
-std::unordered_map<uint64_t, ComPtr<ID3DBlob>> g_bytecode;
+std::unordered_map<uint64_t, std::shared_ptr<SpirvCode>> g_bytecode;
 
 uint64_t CanonicalKey(const ucode::Shader& parsed)
 {
@@ -7111,6 +7131,56 @@ D3D12_BLEND AlphaBlend(uint32_t f)
     }
 }
 
+// Xenos blend factors (RB_BLENDCONTROL, the D3D9 order) as Vulkan's (Blend above for D3D12).
+VkBlendFactor VkBlend(uint32_t f)
+{
+    switch (f)
+    {
+    case 0: return VK_BLEND_FACTOR_ZERO;
+    case 1: return VK_BLEND_FACTOR_ONE;
+    case 4: return VK_BLEND_FACTOR_SRC_COLOR;
+    case 5: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    case 6: return VK_BLEND_FACTOR_SRC_ALPHA;
+    case 7: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    case 8: return VK_BLEND_FACTOR_DST_COLOR;
+    case 9: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+    case 10: return VK_BLEND_FACTOR_DST_ALPHA;
+    case 11: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+    case 12: return VK_BLEND_FACTOR_CONSTANT_COLOR;
+    case 14: return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+    case 13: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+    case 15: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+    case 16: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+    default: return VK_BLEND_FACTOR_ONE;
+    }
+}
+
+// The alpha factors as D3D12 had them (its colour factors are invalid for alpha: their alpha forms). Vulkan allows the
+// colour factors for alpha, with the same meaning, but the D3D12 mapping is kept so both blend alike.
+VkBlendFactor VkAlphaBlend(uint32_t f)
+{
+    switch (f)
+    {
+    case 4: return VK_BLEND_FACTOR_SRC_ALPHA;
+    case 5: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    case 8: return VK_BLEND_FACTOR_DST_ALPHA;
+    case 9: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+    default: return VkBlend(f);
+    }
+}
+
+VkBlendOp VkBlendOpFor(uint32_t op)
+{
+    switch (op)
+    {
+    case 1: return VK_BLEND_OP_SUBTRACT;
+    case 2: return VK_BLEND_OP_MIN;
+    case 3: return VK_BLEND_OP_MAX;
+    case 4: return VK_BLEND_OP_REVERSE_SUBTRACT;
+    default: return VK_BLEND_OP_ADD;
+    }
+}
+
 D3D12_BLEND_OP BlendOp(uint32_t op)
 {
     switch (op)
@@ -7487,108 +7557,99 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     const uint32_t blend = key.blend, depth = key.depth;
     const uint32_t mask = (key.stencilMaskMode >> 24) & 0xF, mode = (key.stencilMaskMode >> 28) & 7, stencil = key.stencilMaskMode & 0xFFFFFF;
     const bool alphaToMask = key.flags & 1, cullable = (key.flags >> 1) & 1;
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
-    pd.pRootSignature = g_r.rootSignature.Get();
-    pd.VS = { vs.code->GetBufferPointer(), vs.code->GetBufferSize() };
-    pd.PS = { ps.code->GetBufferPointer(), ps.code->GetBufferSize() };
-    auto& rt = pd.BlendState.RenderTarget[0];
+    vk::PipelineDesc pd;
+    pd.layout = g_r.vkBindings.layout; // (the motion variants' b2 is in set 0 too: one layout)
+    vk::BlendTarget& rt = pd.blend[0];
     const uint32_t srcC = blend & 31, opC = (blend >> 5) & 7, dstC = (blend >> 8) & 31;
     const uint32_t srcA = (blend >> 16) & 31, opA = (blend >> 21) & 7, dstA = (blend >> 24) & 31;
-    rt.BlendEnable = !(srcC == 1 && dstC == 0 && opC == 0 && srcA == 1 && dstA == 0 && opA == 0);
-    rt.SrcBlend = Blend(srcC);
-    rt.DestBlend = Blend(dstC);
-    rt.BlendOp = BlendOp(opC);
-    rt.SrcBlendAlpha = AlphaBlend(srcA);
-    rt.DestBlendAlpha = AlphaBlend(dstA);
-    rt.BlendOpAlpha = BlendOp(opA);
-    rt.RenderTargetWriteMask = UINT8(mask);
+    rt.enable = !(srcC == 1 && dstC == 0 && opC == 0 && srcA == 1 && dstA == 0 && opA == 0);
+    rt.srcColor = VkBlend(srcC);
+    rt.dstColor = VkBlend(dstC);
+    rt.colorOp = VkBlendOpFor(opC);
+    rt.srcAlpha = VkAlphaBlend(srcA);
+    rt.dstAlpha = VkAlphaBlend(dstA);
+    rt.alphaOp = VkBlendOpFor(opA);
+    rt.writeMask = VkColorComponentFlags(mask); // RB_COLOR_MASK's RGBA bits are Vulkan's R G B A bits
     // (One sample: dithered in the pixel shader instead, see DrawImpl, unless REGPU_NO_ALPHA_DITHER.)
-    pd.BlendState.AlphaToCoverageEnable = alphaToMask && (g_msaa > 1 || getenv("REGPU_NO_ALPHA_DITHER"));
-    pd.SampleMask = UINT_MAX;
-    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pd.RasterizerState.DepthClipEnable = (key.flags >> 2) & 1 ? FALSE : TRUE;
+    pd.alphaToCoverage = alphaToMask && (g_msaa > 1 || getenv("REGPU_NO_ALPHA_DITHER"));
+    pd.depthClip = !((key.flags >> 2) & 1);
     if (key.biasScale | key.biasOffset)
     {
         float scale, offset;
         memcpy(&scale, &key.biasScale, 4);
         memcpy(&offset, &key.biasOffset, 4);
         // As Xenia: the scale is in 1/16ths of the slope; the offset in depth units, taken as 2^-24
-        // each (a 32-bit float depth's step between 0.5 and 1).
-        pd.RasterizerState.SlopeScaledDepthBias = scale / 16.0f;
-        pd.RasterizerState.DepthBias = INT(std::clamp(double(offset) * double(1 << 24), -2147483647.0, 2147483647.0));
+        // each (a 32-bit float depth's step between 0.5 and 1). (Vulkan's constant factor is in the same units as
+        // D3D12's integer DepthBias on a float depth buffer.)
+        pd.depthBiasSlope = scale / 16.0f;
+        pd.depthBiasConstant = float(std::clamp(double(offset) * double(1 << 24), -2147483647.0, 2147483647.0));
     }
-    pd.DepthStencilState.DepthEnable = (depth >> 1) & 1;
-    pd.DepthStencilState.DepthWriteMask = ((depth >> 2) & 1) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC(((depth >> 4) & 7) + 1);
+    pd.depthTest = (depth >> 1) & 1;
+    pd.depthWrite = (depth >> 2) & 1;
+    pd.depthCompare = VkCompareOp((depth >> 4) & 7); // Xenos NEVER..ALWAYS is Vulkan's order
     // Stencil: Xenos ops (the D3D9 order) 0 keep, 1 zero, 2 replace, 3 incr clamp, 4 decr clamp,
-    // 5 invert, 6 incr wrap, 7 decr wrap. Back faces use their own ops when enabled.
-    static const D3D12_STENCIL_OP kOps[8] = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_ZERO, D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_INCR_SAT,
-        D3D12_STENCIL_OP_DECR_SAT, D3D12_STENCIL_OP_INVERT, D3D12_STENCIL_OP_INCR, D3D12_STENCIL_OP_DECR };
+    // 5 invert, 6 incr wrap, 7 decr wrap: Vulkan's VkStencilOp order. Back faces use their own ops when enabled.
     static LiveSwitch noStencil("REGPU_NO_STENCIL");
     if ((depth & 1) && !noStencil)
     {
-        auto& ds = pd.DepthStencilState;
-        ds.StencilEnable = TRUE;
-        ds.StencilReadMask = UINT8(stencil >> 8);
-        ds.StencilWriteMask = UINT8(stencil >> 16);
+        pd.stencilTest = true;
+        pd.stencilReadMask = uint8_t(stencil >> 8);
+        pd.stencilWriteMask = uint8_t(stencil >> 16);
         auto faceOps = [&](uint32_t shift) {
-            D3D12_DEPTH_STENCILOP_DESC op{};
-            op.StencilFunc = D3D12_COMPARISON_FUNC(((depth >> shift) & 7) + 1);
-            op.StencilFailOp = kOps[(depth >> (shift + 3)) & 7];
-            op.StencilPassOp = kOps[(depth >> (shift + 6)) & 7];
-            op.StencilDepthFailOp = kOps[(depth >> (shift + 9)) & 7];
+            vk::StencilFace op;
+            op.compare = VkCompareOp((depth >> shift) & 7);
+            op.fail = VkStencilOp((depth >> (shift + 3)) & 7);
+            op.pass = VkStencilOp((depth >> (shift + 6)) & 7);
+            op.depthFail = VkStencilOp((depth >> (shift + 9)) & 7);
             return op;
         };
-        ds.FrontFace = faceOps(8);
+        pd.front = faceOps(8);
         // Rectangles and point sprites aren't polygons to the Xenos: they have no back face (the facing
         // test applies to triangles only), so their host triangles take the front ops too. A rectangle
         // list drawn clockwise with two-sided stencil (a depth reset under a windscreen: NOTEQUAL front,
         // ALWAYS back) otherwise applied the back ops and reset the whole screen. From the FM4 port.
         // REGPU_RECT_BACK_STENCIL=1: the facing decides (A/B; read when a pipeline is built).
         static LiveSwitch rectBackStencil("REGPU_RECT_BACK_STENCIL");
-        ds.BackFace = (depth >> 7) & 1 && (cullable || rectBackStencil) ? faceOps(20) : ds.FrontFace;
+        pd.back = (depth >> 7) & 1 && (cullable || rectBackStencil) ? faceOps(20) : pd.front;
     }
-    // Culling: bit 0 front, bit 1 back; bit 2 set means clockwise faces are front.
+    // Culling: bit 0 front, bit 1 back; bit 2 set means clockwise faces are front. (The viewport is flipped to D3D's
+    // y-up convention with a negative height, which keeps D3D's winding: the same front face as D3D12.)
     static LiveSwitch flip("REGPU_CULL_FLIP");
-    pd.RasterizerState.FrontCounterClockwise = ((mode & 4) == 0) != flip;
+    pd.frontFace = ((mode & 4) == 0) != flip ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
     // Only real triangle primitives keep the guest winding; generated geometry
     // (rectangle corners, point sprites) is never culled.
     static LiveSwitch noCull("REGPU_NO_CULL"); // A/B
-    pd.RasterizerState.CullMode = !cullable || noCull ? D3D12_CULL_MODE_NONE
-        : (mode & 3) == 1 ? D3D12_CULL_MODE_FRONT : (mode & 3) == 2 ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
-    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.IBStripCutValue = key.flags & 0x100 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
-    pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = kColorFormat;
-    pd.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-    pd.SampleDesc.Count = g_msaa;
-    pd.SampleDesc.Quality = g_msaaQuality;
+    pd.cull = !cullable || noCull ? VK_CULL_MODE_NONE : (mode & 3) == 1 ? VK_CULL_MODE_FRONT_BIT : (mode & 3) == 2 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    pd.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // (the class; the draw sets the exact topology)
+    pd.primitiveRestart = key.flags & 0x100;            // D3D12's strip cut 0xFFFF
+    pd.colorCount = 1;
+    pd.colorFormats[0] = vk::ToVkFormat(kColorFormat);
+    pd.depthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    pd.samples = VkSampleCountFlagBits(g_msaa);
     // Motion-vector variants: a second target for the motion. Flag 0x800 (it was 4, which MakePipelineKey also sets for
     // draws without depth clipping: those were built with the motion root signature and two targets, and left out
     // of the manifest).
     const bool motion = key.flags & 0x800;
     if (motion)
     {
-        pd.pRootSignature = g_r.motionRootSignature.Get();
-        pd.NumRenderTargets = 3;
-        pd.RTVFormats[1] = DXGI_FORMAT_R16G16_FLOAT;
-        pd.RTVFormats[2] = DXGI_FORMAT_R8_UNORM;
-        pd.BlendState.IndependentBlendEnable = TRUE;
-        auto& mv = pd.BlendState.RenderTarget[1];
-        mv = D3D12_RENDER_TARGET_BLEND_DESC{};
+        pd.colorCount = 3;
+        pd.colorFormats[1] = VK_FORMAT_R16G16_SFLOAT;
+        pd.colorFormats[2] = VK_FORMAT_R8_UNORM;
+        pd.independentBlend = true;
         // Blended draws (glass, smoke) keep the motion of what is behind them.
-        mv.RenderTargetWriteMask = rt.BlendEnable ? 0 : D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
+        vk::BlendTarget& mv = pd.blend[1];
+        mv = {};
+        mv.writeMask = rt.enable ? 0 : VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
         // The reactive mask (Upscale::reactive): blended draws keep the larger of what is there and what they
         // write. Opaque draws leave it alone: the dynamic blended draws come late in a scene, and a full-screen
         // opaque pass after them would otherwise wipe it.
-        auto& re = pd.BlendState.RenderTarget[2];
-        re = D3D12_RENDER_TARGET_BLEND_DESC{};
-        re.BlendEnable = TRUE;
-        re.SrcBlend = re.SrcBlendAlpha = D3D12_BLEND_ONE;
-        re.DestBlend = re.DestBlendAlpha = D3D12_BLEND_ONE;
-        re.BlendOp = re.BlendOpAlpha = D3D12_BLEND_OP_MAX;
-        re.RenderTargetWriteMask = rt.BlendEnable ? D3D12_COLOR_WRITE_ENABLE_RED : 0;
+        vk::BlendTarget& re = pd.blend[2];
+        re = {};
+        re.enable = true;
+        re.srcColor = re.srcAlpha = VK_BLEND_FACTOR_ONE;
+        re.dstColor = re.dstAlpha = VK_BLEND_FACTOR_ONE;
+        re.colorOp = re.alphaOp = VK_BLEND_OP_MAX;
+        re.writeMask = rt.enable ? VK_COLOR_COMPONENT_R_BIT : 0;
     }
     auto entry = std::make_shared<PipelineEntry>();
     g_r.pipelines[key] = entry;
@@ -7608,15 +7669,21 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     entry->build =[e = entry.get(), pd, vsKeep = vs.code, psKeep = ps.code, key]() mutable {
         PipelineEntry* entry = e;
         const auto createStart = std::chrono::steady_clock::now();
-        bool hit = false;
-        const HRESULT hr = g_pipelineLibrary.CreateOrLoad(g_r.device, pd, key, entry->pso, &hit);
+        // Through the device's VkPipelineCache (kept on disk), which replaces the D3D12 pipeline library: a cache hit
+        // isn't reported by Vulkan, so a build under 2 ms counts as loaded.
+        pd.vs = vsKeep->Module(*g_r.vkd);
+        pd.ps = psKeep->Module(*g_r.vkd);
+        char name[48];
+        snprintf(name, sizeof(name), "%016llx/%016llx", (unsigned long long)key.vs, (unsigned long long)key.ps);
+        entry->vk = pd.vs && pd.ps ? vk::CreateGraphicsPipeline(*g_r.vkd, pd, name) : VK_NULL_HANDLE;
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStart).count();
+        const bool hit = entry->vk && ms < 2.0;
         if (ms > 30.0 && getenv("REGPU_PERF"))
             Log("perf: pipeline %016llx/%016llx took %.1f ms to create (background)", (unsigned long long)key.vs, (unsigned long long)key.ps, ms);
-        if (FAILED(hr))
-            Log("renderer: pipeline %016llx/%016llx failed (%08lX)", (unsigned long long)key.vs, (unsigned long long)key.ps, hr);
+        if (!entry->vk)
+            Log("renderer: pipeline %016llx/%016llx failed", (unsigned long long)key.vs, (unsigned long long)key.ps);
         (hit ? g_stats.pipelinesLoaded : g_stats.pipelinesBuilt)++;
-        entry->state.store(FAILED(hr) ? 2 : 1, std::memory_order_release);
+        entry->state.store(entry->vk ? 1 : 2, std::memory_order_release);
         g_stats.End(!hit);
     };
     pool.Push([entry] { entry->Build(); });
