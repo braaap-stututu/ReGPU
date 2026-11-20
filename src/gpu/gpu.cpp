@@ -622,6 +622,11 @@ void SegDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 void WorkerLoop()
 {
     SetThreadDescription(GetCurrentThread(), L"gpu draw worker");
+    // REGPU_DRAW_THREAD_PRIORITY=<Win32 level> (start-time; 1 above normal, 2 highest, 15 time critical): the draw thread
+    // (and the replay thread, recorded_list.h) above the title's threads, which a port may map to "highest" (session 33
+    // of the FM3 port: the 1% slowest frames at a frame cap, from the draw thread being pre-empted?).
+    if (const char* p = getenv("REGPU_DRAW_THREAD_PRIORITY"); p && *p)
+        SetThreadPriority(GetCurrentThread(), atoi(p));
     // the port's sampler (PGR4_SAMPLE_THREAD=w) follows this thread
     if (!g_profiledWorker)
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_profiledWorker, 0, FALSE, DUPLICATE_SAME_ACCESS);
@@ -1932,6 +1937,9 @@ void PaceSwap(uint64_t frame)
     }
 }
 }
+
+// (For the presenter's pacing, render/presenter.cpp.)
+uint32_t RegpuFrameCap() { return FrameCap(); }
 
 void regpu::SetFrameLimit(uint32_t maxFps, bool vsync)
 {

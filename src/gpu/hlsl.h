@@ -40,6 +40,8 @@ struct TranslatedShader
     uint32_t interpolatorsWritten = 0;
     // Where the shader's own code starts in hlsl (after the shared preamble).
     size_t bodyStart = 0;
+    // REGPU_PLAIN_MUL_PS=2: this pixel shader multiplies as IEEE (no op in it can give inf or NaN).
+    bool plainMul = false;
     // The other parts of the constant blocks the code reads (ScanBlockUse in renderer.cpp, after the game's
     // rewrite): bool constants, loop constants, the vertex fetch layout (vfl), the game's vuser constants.
     // A draw writes the unread ones to the upload ring no more. True (written) until scanned.
@@ -70,3 +72,5 @@ int LeanFetchLevel();
 bool LeanVertexFetch();
 // REGPU_PLAIN_MUL_PS=1: pixel shaders multiply as IEEE (vertex shaders keep D3D9's 0 x anything = 0).
 bool PlainMulPixel();
+// 0 off, 1 every pixel shader, 2 pixel shaders without inf/NaN-making ops (session 33 of the FM3 port).
+int PlainMulPixelLevel();

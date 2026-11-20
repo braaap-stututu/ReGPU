@@ -109,6 +109,12 @@ public:
         struct A { D3D12_TEXTURE_COPY_LOCATION dst, src; UINT x, y, z; BOOL hasBox; D3D12_BOX box; } a{ *dst, *src, x, y, z, box != nullptr, box ? *box : D3D12_BOX{} };
         Put(kCopyTexture, &a, sizeof(a));
     }
+    // An MSAA surface's samples averaged by the hardware into a 1x one (REGPU_RESOLVE_TWO_STEP, renderer.cpp BlitResolve).
+    void ResolveSubresourceRegion(ID3D12Resource* dst, UINT dstX, UINT dstY, ID3D12Resource* src, const D3D12_RECT& rect, DXGI_FORMAT format)
+    {
+        struct A { ID3D12Resource* dst; ID3D12Resource* src; UINT x, y; D3D12_RECT rect; DXGI_FORMAT format; } a{ dst, src, dstX, dstY, rect, format };
+        Put(kResolveRegion, &a, sizeof(a));
+    }
     void SetGraphicsRootSignature(ID3D12RootSignature* r) { Put(kRootSignature, &r, sizeof(r)); }
     void SetComputeRootSignature(ID3D12RootSignature* r) { Put(kComputeRootSignature, &r, sizeof(r)); }
     void SetComputeRootDescriptorTable(UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) { struct A { UINT i; D3D12_GPU_DESCRIPTOR_HANDLE h; } a{ i, h }; Put(kComputeTable, &a, sizeof(a)); }
@@ -190,7 +196,7 @@ private:
         kBarrier, kCopyTexture, kRootSignature, kTable, kCbv, kRoot32, kTargets, kPipeline, kViewports, kScissors, kStencilRef, kBlendFactor,
         kTopology, kHeaps, kDraw, kEndQuery, kResolveQuery, kClearRtv, kClearDsv, kCreateRtv, kCreateDsv, kDrawIndexed, kIndexBuffer, kCopyBuffer,
         kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch, kBeginQuery, kHandOff, kComputeSrv, kComputeUav, kPredication,
-        kCall, kSwitch
+        kCall, kSwitch, kResolveRegion
     };
     static constexpr size_t kChunk = 64 << 10;
 
@@ -264,6 +270,8 @@ private:
     void Worker()
     {
         SetThreadDescription(GetCurrentThread(), L"command list replay");
+        if (const char* p = getenv("REGPU_DRAW_THREAD_PRIORITY"); p && *p) // (gpu.cpp WorkerLoop)
+            SetThreadPriority(GetCurrentThread(), atoi(p));
         for (;;)
         {
             RecordBytes chunk;
@@ -306,6 +314,18 @@ private:
                 struct A { D3D12_TEXTURE_COPY_LOCATION dst, src; UINT x, y, z; BOOL hasBox; D3D12_BOX box; };
                 const A& c = At<A>(a);
                 l->CopyTextureRegion(&c.dst, c.x, c.y, c.z, &c.src, c.hasBox ? &c.box : nullptr);
+                break;
+            }
+            case kResolveRegion:
+            {
+                struct A { ID3D12Resource* dst; ID3D12Resource* src; UINT x, y; D3D12_RECT rect; DXGI_FORMAT format; };
+                A c = At<A>(a);
+                ID3D12GraphicsCommandList1* l1 = nullptr;
+                if (SUCCEEDED(l->QueryInterface(IID_PPV_ARGS(&l1))))
+                {
+                    l1->ResolveSubresourceRegion(c.dst, 0, c.x, c.y, c.src, 0, &c.rect, c.format, D3D12_RESOLVE_MODE_AVERAGE);
+                    l1->Release();
+                }
                 break;
             }
             case kRootSignature: l->SetGraphicsRootSignature(At<ID3D12RootSignature*>(a)); break;

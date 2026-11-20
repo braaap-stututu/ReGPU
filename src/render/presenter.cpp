@@ -3,10 +3,12 @@
 // the guest. Until the D3D hooks draw real content the frame is a clear
 // whose shade pulses with the frame count, proving the path end to end.
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -14,6 +16,8 @@
 #include <wrl/client.h>
 
 #include "log.h"
+#include "live_switch.h"
+#include "precise_sleep.h"
 #include "render/presenter.h"
 #include "settings.h"
 
@@ -441,7 +445,7 @@ void PresenterUseRenderer()
 }
 
 bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, ID3D12Resource* overlay, uint32_t overlayW, uint32_t overlayH,
-    ID3D12Resource* timer, uint32_t timerW, uint32_t timerH, ID3D12Resource* fps, uint32_t fpsW, uint32_t fpsH)
+    ID3D12Resource* timer, uint32_t timerW, uint32_t timerH, ID3D12Resource* fps, uint32_t fpsW, uint32_t fpsH, PresenterGrade grade, void* gradeCtx)
 {
     if (!g_p.ready)
         return false;
@@ -468,9 +472,27 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, I
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     }
-    list->ResourceBarrier(1, &b);
-    if (!offsetX && !offsetY && sd.Width == bd.Width && sd.Height == bd.Height)
-        list->CopyResource(backBuffer, src);
+    const bool sameSize = !offsetX && !offsetY && sd.Width == bd.Width && sd.Height == bd.Height;
+    if (grade && sameSize)
+    {
+        // The gamma pass writes the back buffer itself: one full-size write and read less than grading into an image
+        // and copying that (session 33: ~4% at 4K 4x).
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        list->ResourceBarrier(1, &b);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(i) * g_p.rtvStride;
+        grade(list, size_t(rtv.ptr), UINT(bd.Width), bd.Height, gradeCtx);
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        list->ResourceBarrier(1, &b);
+    }
+    else
+        list->ResourceBarrier(1, &b);
+    if (sameSize)
+    {
+        if (!grade)
+            list->CopyResource(backBuffer, src);
+    }
     else
     {
         D3D12_TEXTURE_COPY_LOCATION dst{}, from{};
@@ -517,8 +539,52 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, I
     return true;
 }
 
+uint32_t RegpuFrameCap();
+bool RegpuPerfLiteOn();
+
 void PresenterPresent()
 {
+    using Clock = std::chrono::steady_clock;
+    // REGPU_PRESENT_PACE=1 (live, session 33 of the FM3 port): presents held to an even spacing at the frame cap. The cap
+    // gates the title's VdSwap, at the start of the pipeline; the frame then reaches here after the command processor,
+    // the draw thread and the replay thread, whose time varies with the frame's load: the presents came unevenly (the
+    // 1% slowest present gaps ~15% over the cap's at 1440p even in light seconds). Here a frame waits for its slot
+    // (high-resolution timer, then a short spin); one that comes late starts the spacing again from now.
+    static LiveSwitch pace("REGPU_PRESENT_PACE");
+    static Clock::time_point slot{};
+    if (pace && g_p.ready && !GetSettings().vsync)
+    {
+        const auto interval = std::chrono::microseconds(1000000 / std::max(RegpuFrameCap(), 30u));
+        const auto now = Clock::now();
+        if (slot > now && slot - now <= interval)
+            PreciseSleepUntil(slot, 300);
+        slot = std::max(slot + interval, Clock::now() - interval / 4); // (a little catch-up; no burst after a late one)
+    }
+    // Present gaps for the light performance log: their 99th percentile once a second (what reaches the screen; the
+    // perf lite line's frame times are the draw thread's).
+    if (RegpuPerfLiteOn())
+    {
+        static std::vector<float> gaps;
+        static Clock::time_point last{}, windowStart = Clock::now();
+        const auto now = Clock::now();
+        if (last != Clock::time_point{})
+            gaps.push_back(std::chrono::duration<float, std::milli>(now - last).count());
+        last = now;
+        if (now - windowStart >= std::chrono::seconds(1) && gaps.size() > 10)
+        {
+            std::vector<float> sorted = gaps;
+            const size_t k = std::min(sorted.size() - 1, size_t(double(sorted.size()) * 0.99));
+            std::nth_element(sorted.begin(), sorted.begin() + ptrdiff_t(k), sorted.end());
+            const float p99 = sorted[k], worst = *std::max_element(gaps.begin(), gaps.end());
+            double sum = 0;
+            for (float g : gaps)
+                sum += g;
+            Log("perf lite: presents %zu, gap avg %.3f ms, p99 %.3f ms, max %.2f ms%s", gaps.size(), sum / double(gaps.size()), p99, worst,
+                pace ? " (paced)" : "");
+            gaps.clear();
+            windowStart = now;
+        }
+    }
     // Vsync: wait for the display's refresh; off: present at once (tearing allowed).
     if (g_p.ready)
     {

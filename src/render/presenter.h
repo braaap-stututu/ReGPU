@@ -31,8 +31,13 @@ ID3D12CommandQueue* RenderQueue();
 // overlay (COPY_SOURCE RGBA8, overlayW x overlayH) is copied over the top-left corner when given.
 // timer (same kind, timerW x timerH) goes in the very corner, the overlay below it.
 // fps (same kind, fpsW x fpsH: the fps panel) goes at the top centre.
+// grade (FM3 port, session 33): instead of the copy, grade(list, rtv.ptr, width, height, gradeCtx) draws src into the back
+// buffer (its RTV, in RENDER_TARGET state; the display gamma pass) when src is the back buffer's size; else src is
+// copied as is.
+using PresenterGrade = void (*)(ID3D12GraphicsCommandList* list, size_t rtv, uint32_t width, uint32_t height, void* ctx);
 bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, ID3D12Resource* overlay = nullptr, uint32_t overlayW = 0, uint32_t overlayH = 0,
-    ID3D12Resource* timer = nullptr, uint32_t timerW = 0, uint32_t timerH = 0, ID3D12Resource* fps = nullptr, uint32_t fpsW = 0, uint32_t fpsH = 0);
+    ID3D12Resource* timer = nullptr, uint32_t timerW = 0, uint32_t timerH = 0, ID3D12Resource* fps = nullptr, uint32_t fpsW = 0, uint32_t fpsH = 0,
+    PresenterGrade grade = nullptr, void* gradeCtx = nullptr);
 void PresenterPresent();
 // The swap chain to a new output size (host GPU idle; renderer.cpp ApplyOutputSize).
 void PresenterResize(uint32_t width, uint32_t height);
