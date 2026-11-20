@@ -32,6 +32,9 @@ void StereoHudCaptured();
 // Head-tracked mono frames (REGPU_VR=cockpit) take the HUD apart too (the same capture as stereo: renderer.cpp
 // StereoHudDraw): true on a posed frame while a headset session runs (or REGPU_VR_STEREO_TEST).
 bool MonoHudPanel();
+// The pose tag (regpu::vr::SubmitTaggedPose) of the frame whose copy is recorded next (CaptureFrame); 0 = none. Set by
+// the renderer right before the frame's back-buffer copy, on the thread that records it.
+void SetCaptureTag(uint32_t tag);
 // Headset pacing (REGPU_VR_PACE, default on in cockpit/stereo; 0 off): the frame cap the headset wants (its display
 // rate x REGPU_VR_PACE_MULT, default 1), or 0 (no session, pacing off).
 uint32_t PaceCap();
