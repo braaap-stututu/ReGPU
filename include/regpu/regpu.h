@@ -139,6 +139,13 @@ struct Host
     void (*logThreadStacks)(const char* why) = nullptr;
     std::string (*currentStack)(int maxFrames) = nullptr;
     void (*slowFrame)(double ms) = nullptr;
+    // Optional: write tracking of guest physical memory, for the vertex arena (REGPU_VERTEX_ARENA). watchArm makes the
+    // pages of [offset, offset + bytes) (physical offsets) report their next write, false if they can't be watched;
+    // watchClean: no page of the range written since it was armed, nor since sequence `since`; watchSeq: the current
+    // write sequence number. Without them the arena hashes each buffer once a frame.
+    bool (*watchArm)(uint32_t offset, uint32_t bytes) = nullptr;
+    bool (*watchClean)(uint32_t offset, uint32_t bytes, uint64_t since) = nullptr;
+    uint64_t (*watchSeq)() = nullptr;
 };
 
 Config& GetConfig();
