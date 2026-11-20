@@ -83,6 +83,11 @@ bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total, uint32_t address);
 // Whether a query is counting now (begun or resumed, not paused or ended): its draws must be recorded on
 // the command processor's list (gpu.cpp, seg::g_query).
 bool RendererOcclusionCounting();
+// With the draw thread: the command processor answers a query's end (`kindOrder`: its place among this
+// frame's queries to `address`, counted by the caller), the draw thread records its end (after
+// RendererOcclusionBegin for each of its starts).
+bool RendererOcclusionAnswer(uint32_t& samples, uint32_t& total, uint32_t address, uint32_t kindOrder);
+void RendererOcclusionEndOn(uint32_t address, uint32_t kindOrder);
 // Follows the tile state draws set (see DrawImpl), for the state at each piece's start.
 void RendererTrackTile(RendererTile& tile);
 void RendererSetTile(const RendererTile& tile);

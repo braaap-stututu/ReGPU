@@ -859,6 +859,9 @@ std::vector<int64_t> g_occlusionResult;              // by order in the frame: h
 std::vector<int64_t> g_occlusionCoverage;            // by order in the frame: host samples covered, -1 none
 std::map<std::pair<uint64_t, UINT>, std::pair<int64_t, int64_t>> g_occlusionByKind; // address, place: passed, covered (-1 none)
 std::unordered_map<uint64_t, UINT> g_occlusionKindCount; // this frame's queries so far, by address
+// g_occlusionByKind, g_occlusionResult/Coverage: written at a frame slot's reuse by the recording thread, read
+// by the command processor when the draw thread records (RendererOcclusionAnswer).
+std::mutex g_occlusionResultLock;
 OcclusionParts g_occlusionCurrent;
 uint64_t g_occlusionFrame = ~0ull;
 UINT g_occlusionCount = 0, g_occlusionIndex = 0, g_occlusionOrder = 0, g_occlusionOrders = 0; // D3D queries used, open one, guest order, guest queries
@@ -2369,6 +2372,7 @@ void BeginFrameIfNeeded()
         const D3D12_RANGE range{ size_t(frameIndex) * kOcclusionPerFrame * 8, size_t(frameIndex + 1) * kOcclusionPerFrame * 8 };
         if (SUCCEEDED(g_occlusionReadback->Map(0, &range, reinterpret_cast<void**>(&counts))))
         {
+            std::lock_guard resultLock(g_occlusionResultLock);
             for (const OcclusionParts& q : g_occlusionPending[frameIndex])
             {
                 if (g_occlusionResult.size() <= q.order)
@@ -9191,29 +9195,63 @@ bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total, uint32_t address)
     return known;
 }
 
-bool OcclusionEndImpl(uint32_t& samples, uint32_t& total, uint32_t address)
+// The recording side of a query's end (the thread that records its draws): which query it is.
+bool OcclusionRecordEnd(uint64_t kind, UINT kindOrder)
 {
     if (!g_occlusionOpen && !g_occlusionPaused)
         return false;
-    const UINT order = g_occlusionOrder;
-    g_occlusionCurrent.kind = uint64_t(address) << 1 | 1;
-    g_occlusionCurrent.kindOrder = g_occlusionKindCount[g_occlusionCurrent.kind]++;
-    const std::pair<uint64_t, UINT> kind{ g_occlusionCurrent.kind, g_occlusionCurrent.kindOrder };
+    g_occlusionCurrent.kind = kind;
+    g_occlusionCurrent.kindOrder = kindOrder;
     if (g_occlusionOpen)
         EndOcclusionQuery();
     else
         g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent); // its last span already ended
     g_occlusionPaused = false;
-    // REGPU_OCCLUSION_BY_ORDER=1: answered by order in the frame, as before (A/B).
+    return true;
+}
+
+bool OcclusionLookup(uint32_t& samples, uint32_t& total, UINT order, const std::pair<uint64_t, UINT>& kind, bool allowByOrder);
+
+bool OcclusionEndImpl(uint32_t& samples, uint32_t& total, uint32_t address)
+{
+    const UINT order = g_occlusionOrder;
+    const uint64_t k = uint64_t(address) << 1 | 1;
+    if (!g_occlusionOpen && !g_occlusionPaused)
+        return false;
+    const UINT kindOrder = g_occlusionKindCount[k]++;
+    OcclusionRecordEnd(k, kindOrder);
+    return OcclusionLookup(samples, total, order, { k, kindOrder }, true);
+}
+
+// With the draw thread (gpu.cpp work::): the command processor answers a query's end from earlier frames'
+// results (its place among this frame's queries to `address` counted there), and the draw thread records
+// the D3D query around its draws in stream order (RendererOcclusionBegin for every start, EndOn at the end).
+bool RendererOcclusionAnswer(uint32_t& samples, uint32_t& total, uint32_t address, uint32_t kindOrder)
+{
+    return OcclusionLookup(samples, total, ~0u, { uint64_t(address) << 1 | 1, kindOrder }, false);
+}
+
+void RendererOcclusionEndOn(uint32_t address, uint32_t kindOrder)
+{
+    OcclusionRecordEnd(uint64_t(address) << 1 | 1, kindOrder);
+}
+
+// The answer for a query: the last finished result of the same kind (address, place in the frame).
+bool OcclusionLookup(uint32_t& samples, uint32_t& total, UINT order, const std::pair<uint64_t, UINT>& kind, bool allowByOrder)
+{
+    // REGPU_OCCLUSION_BY_ORDER=1: answered by order in the frame, as before (A/B; not with the draw thread).
     static LiveSwitch byOrder("REGPU_OCCLUSION_BY_ORDER");
     int64_t passed = -1, covered = -1;
-    if (byOrder)
     {
-        if (order < g_occlusionResult.size())
-            passed = g_occlusionResult[order], covered = g_occlusionCoverage[order];
+        std::lock_guard resultLock(g_occlusionResultLock);
+        if (byOrder && allowByOrder)
+        {
+            if (order < g_occlusionResult.size())
+                passed = g_occlusionResult[order], covered = g_occlusionCoverage[order];
+        }
+        else if (auto it = g_occlusionByKind.find(kind); it != g_occlusionByKind.end())
+            std::tie(passed, covered) = it->second;
     }
-    else if (auto it = g_occlusionByKind.find(kind); it != g_occlusionByKind.end())
-        std::tie(passed, covered) = it->second;
     if (const uint64_t t = TraceFrame(); t && g_r.frame + 1 == t)
         Log("occlusion query %u ends: kind %016llx #%u, answer passed %lld covered %lld (host samples)", order, (unsigned long long)kind.first,
             kind.second, (long long)passed, (long long)covered);
