@@ -80,7 +80,8 @@ FM3 (the `regpu-vulkan` branch of its port) on an RX 7900 XTX against its D3D12 
 - **Speed:** level. 4K 4x MSAA with CMAA 2: 230 fps and 4.18 ms of GPU a frame against 232 fps and 4.14 ms; without the
   filter 278 against 284 fps. Per pass (`REGPU_GPU_PASSES=1`), the main scene pass is ~5% slower and spread over many
   shaders (the driver's SPIR-V against its DXIL compile of the same HLSL); CMAA 2 is slightly faster. At 1080p both
-  hold the 360 fps cap with the draw thread equally busy.
+  hold the 360 fps cap with the draw thread equally busy. FM3's benchmark race at 4K (40 s, the AI driving): 233.1
+  against 233.5 fps, GPU 4.11 ms both, p99 4.89 against 5.76 ms (steadier on Vulkan).
 - **Measuring:** the light performance log's "GPU ms/frame" (timestamps around each frame) and `REGPU_GPU_PASSES=1`
   (per pass) / `REGPU_GPU_SHADERS=1` (per draw, by shaders) work as on D3D12. Compare the same settings on both sides:
   a profile with a different `aa=` makes one look slower.
@@ -91,4 +92,4 @@ FM3 (the `regpu-vulkan` branch of its port) on an RX 7900 XTX against its D3D12 
   that it is not available) until it moves to `XR_KHR_vulkan_enable2`.
 - **DLSS and XeSS** were converted without their SDKs on the converting machine: build them once with the SDKs.
 - **Linux:** the renderer is Vulkan, but the window, the overlay text (GDI), threads and a few file paths are Win32.
-- **Not run yet with a game:** races in motion, VR, DLSS (no NVIDIA GPU here), FSR 4 beyond its start.
+- **Not run yet with a game:** VR, DLSS (no NVIDIA GPU here), FSR 4 beyond its start.
