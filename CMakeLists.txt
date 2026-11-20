@@ -99,6 +99,13 @@ add_library(regpu STATIC ${REGPU_SOURCES})
 target_include_directories(regpu PUBLIC include ${REGPU_GUEST_INCLUDES})
 target_compile_definitions(regpu PUBLIC ${REGPU_GUEST_DEFINES})
 target_include_directories(regpu PRIVATE src "${REGPU_GENERATED}")
+# VR through OpenXR (src/render/xr.cpp, REGPU_VR=screen): the OpenXR SDK's include/openxr headers. The loader DLL is
+# loaded at run time (openxr_loader.dll beside the exe), so nothing links against it.
+set(REGPU_OPENXR_DIR "" CACHE PATH "OpenXR SDK folder with include/openxr/openxr.h (VR; empty: built without)")
+if(REGPU_OPENXR_DIR AND EXISTS "${REGPU_OPENXR_DIR}/include/openxr/openxr.h")
+    target_compile_definitions(regpu PRIVATE REGPU_OPENXR=1)
+    target_include_directories(regpu PRIVATE "${REGPU_OPENXR_DIR}/include")
+endif()
 target_compile_definitions(regpu PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_compile_definitions(regpu PRIVATE REGPU_POSTAA_FILTERS=${REGPU_POSTAA_FILTERS})
 if(REGPU_POSTAA_FILTERS)
