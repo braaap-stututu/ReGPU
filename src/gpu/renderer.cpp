@@ -5063,21 +5063,28 @@ struct ShaderCompiler
     {
         if (cs.state.load(std::memory_order_relaxed) != CompiledShader::Pending || !waiting.load(std::memory_order_relaxed))
             return;
-        std::lock_guard lock(mutex);
         bool found = false;
-        if (parked.erase(&cs))
-            found = true;
-        else if (auto it = std::find(background.begin(), background.end(), &cs); it != background.end())
         {
-            background.erase(it);
-            found = true;
+            std::lock_guard lock(mutex);
+            if (parked.erase(&cs))
+                found = true;
+            else if (auto it = std::find(background.begin(), background.end(), &cs); it != background.end())
+            {
+                background.erase(it);
+                found = true;
+            }
+            if (found)
+            {
+                waiting--;
+                jobs++;
+                queue.push_front(const_cast<CompiledShader*>(&cs));
+            }
         }
+        // A promoted shader must wake a worker: with every worker asleep (nothing queued, background empty or
+        // throttled) the job stayed queued forever and the draw waiting for it held the GPU (PGR3 port: the race load
+        // hung with "compile jobs 1 (queued 1 ...)" and every compile worker idle).
         if (found)
-        {
-            waiting--;
-            jobs++;
-            queue.push_front(const_cast<CompiledShader*>(&cs));
-        }
+            cv.notify_one();
     }
 
     void Run()
