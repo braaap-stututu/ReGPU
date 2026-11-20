@@ -82,7 +82,11 @@ bool CompileDxcInProcess(const std::string& hlsl, const char* profile, const cha
     }
     const std::wstring wideProfile = Wide(profile), wideEntry = Wide(entry);
     std::vector<LPCWSTR> arguments = {
-        L"-HV", L"2018", L"-T", wideProfile.c_str(), L"-E", wideEntry.c_str(), L"-spirv", L"-fvk-use-dx-layout",
+        // (-fspv-entrypoint-name: every module's entry point is "main", whatever the HLSL function is called: the
+        // pipelines name it so. -fspv-use-unknown-image-format: storage images take their view's format, where DXC
+        // would declare RWTexture2D<float4> Rgba32f and RGBA8 / RGBA16F views would be undefined.)
+        L"-HV", L"2018", L"-T", wideProfile.c_str(), L"-E", wideEntry.c_str(), L"-fspv-entrypoint-name=main", L"-fspv-use-unknown-image-format",
+        L"-spirv", L"-fvk-use-dx-layout",
         L"-fspv-target-env=vulkan1.2",
         L"-fvk-b-shift", L"0", L"0", L"-fvk-t-shift", L"100", L"0", L"-fvk-s-shift", L"200", L"0", L"-fvk-u-shift", L"300", L"0",
     };
@@ -176,7 +180,8 @@ bool CompileHlsl(const std::string& hlsl, bool pixel, uint64_t key, const std::f
 bool CompileHlslStage(const std::string& hlsl, const char* profile, const char* entry, const std::filesystem::path& cacheDir,
     std::vector<uint32_t>& spirv, std::string* error)
 {
-    const uint64_t key = HashSource(std::string(profile) + ":" + entry);
+    // (":main:unknown": modules whose entry point is named main and whose storage images have no declared format.)
+    const uint64_t key = HashSource(std::string(profile) + ":" + entry + ":main:unknown");
     return Compile(hlsl, profile, entry, false, key, cacheDir, spirv, error, false);
 }
 
@@ -262,7 +267,7 @@ bool Compile(const std::string& hlsl, const char* profile, const char* entry, bo
     // result the Direct3D 12 compiler gives; this is how to tell a miscompile from a translation.
     const char* optimise = getenv("REGPU_VK_SHADER_OD") || disableOptimizations ? " -Od" : "";
     const int written = snprintf(command, sizeof command,
-        "%s -HV 2018 -T %s -E %s -spirv -fvk-use-dx-layout -fspv-target-env=vulkan1.2%s%s"
+        "%s -HV 2018 -T %s -E %s -fspv-entrypoint-name=main -fspv-use-unknown-image-format -spirv -fvk-use-dx-layout -fspv-target-env=vulkan1.2%s%s"
         " -fvk-b-shift 0 0 -fvk-t-shift 100 0 -fvk-s-shift 200 0 -fvk-u-shift 300 0"
         " -Fo \"%s\" \"%s\" 2>&1",
         dxcCommand.c_str(), profile, entry, vertexDefine ? " -D REGPU_VERTEX_STAGE" : "", optimise, spvPath.c_str(),

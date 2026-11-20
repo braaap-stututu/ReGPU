@@ -51,7 +51,9 @@ with tempfile.TemporaryDirectory() as tmp:
     blobs = {}
     for entry in entries:
         spv = os.path.join(tmp, entry + '.spv')
-        r = subprocess.run([dxc, '-nologo', '-O3', '-HV', '2018', '-T', 'cs_6_0', '-E', entry, '-spirv', '-fvk-use-dx-layout',
+        # (The SPIR-V entry point is "main" whatever the HLSL function is called: the pipelines name it so. Storage images
+        # take their view's format: DXC would declare RWTexture2D<float4> Rgba32f.)
+        r = subprocess.run([dxc, '-nologo', '-O3', '-HV', '2018', '-T', 'cs_6_0', '-E', entry, '-fspv-entrypoint-name=main', '-fspv-use-unknown-image-format', '-spirv', '-fvk-use-dx-layout',
                             '-fspv-target-env=vulkan1.2', '-fvk-b-shift', '0', '0', '-fvk-t-shift', '100', '0', '-fvk-s-shift', '200', '0',
                             '-fvk-u-shift', '300', '0', '-Fo', spv, flat], capture_output=True, text=True)
         if r.returncode != 0:
