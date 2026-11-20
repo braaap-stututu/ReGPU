@@ -103,8 +103,8 @@ and vertex shaders under `REGPU_DYNAMIC_VFETCH` / `REGPU_LEAN_VFETCH` / `REGPU_P
 
 ## Not done yet
 
-- **VR (OpenXR):** its session is still the D3D12 one (`XR_KHR_D3D12_enable`); builds take the stub (`REGPU_VR` logs
-  that it is not available) until it moves to `XR_KHR_vulkan_enable2`.
+- **VR (OpenXR):** the session is on Vulkan (`XR_KHR_vulkan_enable`, else enable2; render/xr.cpp). Checked against a
+  runtime without a headset only (it waits and retries); run it with a headset: screen, cockpit and stereo modes.
 - **DLSS and XeSS** were converted without their SDKs on the converting machine: build them once with the SDKs.
 - **Linux:** the renderer is Vulkan, but the window, the overlay text (GDI), threads and a few file paths are Win32.
-- **Not run yet with a game:** VR, DLSS (no NVIDIA GPU here), FSR 4 beyond its start.
+- **Not run yet with a game:** VR with a headset, DLSS (no NVIDIA GPU here), FSR 4 beyond its start.
