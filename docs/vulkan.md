@@ -1,6 +1,7 @@
 # The Vulkan backend (experimental)
 
-The plan for the full conversion is in [vulkan-conversion-plan.md](vulkan-conversion-plan.md).
+Vulkan is to replace Direct3D 12 entirely ([vulkan-conversion-plan.md](vulkan-conversion-plan.md)). This backend is the
+starting material for that: its pieces move into the converted `renderer.cpp`, and `renderer_vk.cpp` then goes.
 
 ReGPU draws with Direct3D 12. `src/gpu/vk` is a second backend that draws the same command stream with Vulkan. It
 came from the Forza Motorsport 2 port (tankyx's renderer, FM2 `ecf4675`, where it is the default on Linux since

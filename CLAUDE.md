@@ -7,10 +7,14 @@ builds for. Read [`README.md`](README.md) for the build and the API, and
 
 ## Work in progress: the Vulkan conversion
 
-ReGPU is being converted to Vulkan. Start with [`docs/vulkan-conversion-plan.md`](docs/vulkan-conversion-plan.md) (state,
-the open design decision, phases), [`docs/vulkan.md`](docs/vulkan.md) (the experimental backend in `src/gpu/vk`) and
-[`docs/merge-2026-11.md`](docs/merge-2026-11.md) (where the code came from, and why conflicts were resolved as they
-were). Keep D3D12 working throughout: it is the reference the Vulkan output is compared with.
+**Vulkan is to be ReGPU's one render backend** (decided 20 Nov 2026): `renderer.cpp` is converted in place, on the
+`vulkan` branch, and Direct3D 12 is then removed, with no abstraction layer between the two. Start with:
+- [`docs/vulkan-conversion-plan.md`](docs/vulkan-conversion-plan.md): the decision, design rules and phases;
+- [`docs/vulkan.md`](docs/vulkan.md): the experimental backend in `src/gpu/vk`, the parts bin;
+- [`docs/merge-2026-11.md`](docs/merge-2026-11.md): where the code came from.
+
+The tag `d3d12-reference` is the frozen D3D12 renderer to compare Vulkan frames against. Keep every `REGPU_*` switch
+and its behaviour through the conversion.
 
 ## Ground rules
 

@@ -1,116 +1,135 @@
 # Converting ReGPU to Vulkan: the plan
 
-The goal is ReGPU running on Vulkan: a native Linux and Steam Deck path without vkd3d-proton, and Vulkan on Windows.
-The user will give the specifics; this file is the shared starting point. Read [vulkan.md](vulkan.md) for the
-backend as it is, and [merge-2026-11.md](merge-2026-11.md) for how the code got here.
+## The decision (20 Nov 2026)
 
-## Where things stand (20 Nov 2026, `main` at `182afe2`)
+**Vulkan is ReGPU's one render backend.** Direct3D 12 is not kept beside it and there is no abstraction layer
+between the two (the "A or B" choice in the first version of this plan is settled against both). The renderer
+`src/gpu/renderer.cpp` is converted in place to Vulkan. Once the Vulkan renderer runs the test titles, the D3D12
+code, fxc/d3dcompiler, DXGI and the experimental second renderer (`src/gpu/vk/renderer_vk.cpp`) are deleted.
 
-- **One renderer, D3D12:** `src/gpu/renderer.cpp`, 19.4k lines. About 1,400 of those lines touch D3D12 types or calls.
-  The rest is Xenos behaviour:
-  - EDRAM surfaces, resolves, tiling merges and write-backs;
-  - texture and vertex fetch setup;
-  - occlusion queries;
-  - upscaling and grading;
-  - all the per-game-tested switches.
-- **D3D12 coupling outside it:**
+**D3D12 as a reference.** It stays available only as a frozen reference: the tag **`d3d12-reference`** (= `main` at
+`982cb25`, the last D3D12 build) and a build of it kept on this machine, for frame-by-frame comparisons. Fixes
+are no longer made to it.
 
-  | File | Lines touching D3D12 | Total lines |
-  |---|---|---|
-  | `presenter.cpp` | 135 | 992 |
-  | `recorded_list.h` | 81 | 500 |
-  | `xr.cpp` (OpenXR on D3D12) | 78 | 1,238 |
+Read [vulkan.md](vulkan.md) for the experimental backend we start from, and [merge-2026-11.md](merge-2026-11.md) for
+how the code got here.
 
-  The upscaler glue (`fsr3.cpp`, `dlss.cpp`, `xess.cpp`) and the shader compilers (`d3dcompiler.cpp`, `dxc.cpp`) are
-  small.
-- **API-neutral already:**
-  - the command processor and the `Vd*` exports (`gpu.cpp`);
-  - the microcode decoder (`ucode.cpp`) and the translator (`hlsl.cpp`, HLSL that DXC can take to SPIR-V);
-  - texture decoding (`texture.cpp`) and index expansion (`indices.cpp`);
-  - the host API (`regpu.h`).
-- **A second renderer, Vulkan:** `src/gpu/vk`, 8.3k lines, from the FM2 port, behind `REGPU_VULKAN`. It reimplements
-  the draw, resolve and texture logic on its own, and lacks everything the D3D12 renderer gained since mid-November.
-  It builds, opens a device and compiles the preamble (`regpu_vkprobe`), but has never run a game in ReGPU.
-- **`RecordedList` (`recorded_list.h`):** the renderer already records every command into a buffer replayed on
-  another thread. Its ~40 ops mirror `ID3D12GraphicsCommandList`, so it is a natural seam for a backend interface:
-  - `DrawInstanced`, `DrawIndexedInstanced`, `Dispatch`;
-  - `ResourceBarrier`, `OMSetRenderTargets`, the root parameters;
-  - copies, resolves, queries, predication;
-  - `Call`.
+## Where things stand (`d3d12-reference`)
 
-## The decision to make first
+- **`src/gpu/renderer.cpp`: 19.4k lines.**
+  - About 1,400 of them touch D3D12 types or calls.
+  - The rest is Xenos behaviour, and that is what the conversion must keep: EDRAM surfaces, resolves, tiling
+    merges, write-backs, fetch setup, queries, upscaling and grading, and every per-game-tested `REGPU_*` switch.
+- **Other D3D12 code:**
+  - `presenter.cpp` (135 of 992 lines) and `recorded_list.h` (81 of 500).
+  - `xr.cpp` (OpenXR on D3D12, 78 of 1,238).
+  - The upscaler glue: `fsr3.cpp`, `dlss.cpp`, `xess.cpp`.
+  - The shader compilers: `d3dcompiler.cpp` (fxc) and `dxc.cpp` (DXIL).
+- **Already independent of the API, and kept:**
+  - `gpu.cpp`, `ucode.cpp`, `hlsl.cpp` (its HLSL compiles to SPIR-V through DXC; `vk::AdaptHlsl` maps the bindings).
+  - `texture.cpp` and `indices.cpp`.
+  - `constants.h`: the constant blocks, byte for byte.
+- **`src/gpu/vk` (from the FM2 port) is the parts bin:**
+  - `vk_loader` (run-time loading, no link to vulkan-1) and `vk_context` (device, features, descriptor indexing).
+  - `vk_swapchain` and `vk_shader` (DXC to SPIR-V, disk cache).
+  - `vk_texture` (bindless arrays, uploads, BC formats) and `vk_surface` (EDRAM surfaces as images).
+  - `vk_resolve` and `vk_blit` (resolve and blit passes), `vk_draw` (rings, descriptor sets), `vk_state` (pipeline
+    state from registers).
+  - `renderer_vk.cpp` is a working reference for each D3D12 piece's Vulkan form (FM2 ran it), then goes.
+  - `regpu_vkprobe` passes on the RX 7900 XTX.
 
-Pick one of these two ways. Everything after depends on it.
+## The public API changes (regpu.h)
 
-**A. Grow `src/gpu/vk` to parity.** Two renderers stay. Each D3D12-only feature (the gap list in vulkan.md) is
-reimplemented in `renderer_vk.cpp`.
-- **Pro:** quick early results; FM2 already ran it.
-- **Con:** every Xenos fix must be made twice, forever. The FM2 backend already fell behind in a few weeks.
+All of these are breaking changes for the ports. They land together, with the ports' updates (FM3, PGR3, PGR4,
+FH1/Glue2GPU and the rest) described in the README.
 
-**B. One renderer over a small GPU interface, with D3D12 and Vulkan beneath it (recommended).** `renderer.cpp` keeps all
-the Xenos logic. Its D3D12 calls go through an interface shaped like `RecordedList`: resources, views and descriptors,
-pipelines, commands, barriers, queries. `src/gpu/vk` is the parts bin for the Vulkan side:
-- context and loader;
-- swap chain;
-- SPIR-V compiling and the pipeline cache;
-- descriptor layouts;
-- its resolve and blit shaders.
+- `Config::renderer` goes away.
+- `Config::hostDevice` / `hostQueue` become a host `VkInstance`, `VkPhysicalDevice`, `VkDevice`, queue family and
+  `VkQueue`.
+- `Host::presentImage` hands over a `VkImage` with its layout and a semaphore, instead of an `ID3D12Resource` and its
+  state.
+- `hostWindow` stays: ReGPU makes the `VkSurfaceKHR` from the HWND on Windows, or from a Wayland/X11 handle on Linux.
+- The README build section drops fxc, d3dcompiler_47.dll and REGPU_FSR1_CS's fxc step. It adds the Vulkan headers
+  and DXC's dxcompiler.dll / dxil.dll.
+- Glue2GPU's plugin asks ReXGlue for the `vulkan` backend instead of `d3d12`.
 
-- **Pro:** every fix lands once; D3D12 stays as the reference, and the two backends can be compared frame by frame.
-- **Con:** a long refactor before Vulkan draws anything new; the barrier and descriptor models have to be designed
-  carefully (D3D12 resource states vs Vulkan layouts; root signatures vs descriptor sets and push constants).
+## Design rules for the converted renderer
 
-The Vulkan research report (`reports/Vulkan renderer porting and optimization.md` in the ReGPU-V workspace) argues for
-B. It recommends a thin RHI shaped like D3D12, with D3D12 kept as the reference backend and the two compared by image
-diffs. Its Vulkan baseline is the feature set vkd3d-proton needs:
-- Vulkan 1.3, descriptor indexing and push descriptors, robustness2;
-- `VK_EXT_descriptor_heap` as the fast path where present.
+- **Same structure, same switches.** `renderer.cpp` keeps its functions, data and `REGPU_*` switches. Where a D3D12
+  object was, a Vulkan one is. A reviewer should be able to diff the old and new function side by side.
+- **Recording.** `RecordedList` keeps its job (record on the draw thread, replay on another) with Vulkan ops
+  replayed into a `VkCommandBuffer`. Draw workers use secondary command buffers or their own primary ones.
+- **Synchronisation.** synchronization2 throughout. A small layout tracker per image replaces D3D12 resource states:
+  - EDRAM surfaces and resolved images.
+  - Implicit promotion/decay doesn't exist in Vulkan, so every transition the D3D12 code relied on implicitly becomes
+    explicit.
+- **Binding.**
+  - The shaders' model stays: `gtex`/`gcube`/`gvol` bindless (descriptor indexing, update-after-bind), eight samplers,
+    two constant blocks as dynamic UBOs, and `gmem`/`gphys` storage buffers.
+  - Root constants become push constants.
+  - `VK_EXT_descriptor_heap` can come later as a fast path.
+- **Memory.**
+  - Texture heaps and placed resources become VkDeviceMemory blocks with suballocation (or VMA).
+  - The upload ring stays host-visible; ReBAR is a device-local, host-visible memory type.
+  - Guest memory as `gphys` uses `VK_EXT_external_memory_host` where available, else copies.
+- **Pipelines.** `PipelineKey` and the pipeline manifest/seed stay. VkPipelineCache plus the disk cache replace the
+  D3D12 pipeline library. Dynamic state replaces per-state PSOs where the key allows.
+- **Shaders.** Translated shaders and ReGPU's own passes all go HLSL to SPIR-V with DXC:
+  - blits and resolves;
+  - `fsr1.hlsl` and `postaa*.hlsl`;
+  - gamma and enhance passes, motion variants.
+  - The fxc-specific workarounds and DXBC caches go. The shader cache key changes (all caches rebuild).
+- **Queries and predication.** Occlusion queries become a `VkQueryPool` (VK_QUERY_TYPE_OCCLUSION, precise).
+  SetPredication becomes `VK_EXT_conditional_rendering`, falling back to CPU decisions where it is missing.
+- **Debugging.**
+  - The debug server, captures and `regpuctl` keep working; screenshots read back a VkImage.
+  - Validation layers on behind `REGPU_VK_VALIDATION`.
+  - RenderDoc and RGP for GPU work.
 
-## Phases (for B; A reuses phases 0, 1 and 5)
+## Phases
 
-0. **Ground truth.** Pick the test titles (FM3, PGR3) and fixed scenes. Capture D3D12 reference frames with
-   `regpuctl.py shot` and the frame comparison tools. Add a Vulkan validation-layer run, plus RenderDoc and Radeon GPU
-   Profiler (RGP) captures on the RX 7900 XTX. Write a frame-diff script for D3D12 against Vulkan output.
-1. **Make the existing Vulkan backend draw a game.** This is the quickest way to find what breaks in the shared
-   pieces:
-   - run FM3 with `REGPU_RENDERER=vulkan`;
-   - fix the vulkan.md gaps it hits (`vf.w` units, 3D textures, the deferred swap chain so Vulkan can own the window);
-   - record which D3D12-only switches the title needs.
-2. **Define the interface.** Start from `RecordedList`'s ops and the resource creation in `renderer.cpp`: textures,
-   EDRAM surfaces, heaps and placed resources, upload rings, the GPU upload heap, readbacks, query heaps. Decide:
-   - **Barriers:** explicit, recorded once and translated per backend (D3D12 states and enhanced barriers; Vulkan
-     sync2 layouts and access masks).
-   - **Binding:** keep the bindless model the shaders use (`gtex`, `gcube`, `gvol`, eight samplers, two constant
-     blocks, `gmem`/`gphys`), mapped to descriptor heaps (D3D12) and descriptor indexing or descriptor heap (Vulkan).
-   - **Shaders:** DXC to DXIL and to SPIR-V from the same HLSL. The D3D12 path still uses fxc (DXBC) by default; moving
-     it to DXC first keeps one compiler.
-   - **Pipelines:** one key (`PipelineKey`), one disk cache per backend; the manifest and seeds stay shared.
-3. **Move the D3D12 renderer onto the interface** with no behaviour change. Prove it with the phase 0 frames,
-   byte-identical where possible. Do it in slices: upload and texture creation, then surfaces and resolves, then draws,
-   then queries and predication, then the frame end and present.
-4. **Implement the Vulkan backend of the interface** from `src/gpu/vk`'s pieces. Bring the slices up in the same order,
-   diffing against D3D12 at each step.
-5. **Presenter and host integration on Vulkan:**
-   - Vulkan swap chain and frame pacing;
-   - `REGPU_ASYNC_PRESENT`;
-   - overlay and gamma;
-   - the host presenter API (a `VkImage` handed over in place of an `ID3D12Resource`);
-   - Wayland and X11 on Linux.
-6. **The rest:**
-   - Upscalers: FSR 3/4 have Vulkan backends; DLSS and XeSS have Vulkan SDKs.
-   - Post AA, VR (OpenXR has a Vulkan binding) and triple screen.
-   - Hyper mode.
-   - Draw workers on Vulkan secondary or parallel command buffers.
-7. **Linux native build:**
-   - Toolchain: XenonRecomp output already builds with clang; replace the Win32-only pieces (window, threads, DLL
-     loading) behind the host.
-   - Distribute in the Steam Linux Runtime 4.0 SDK.
+The work happens on the long-lived branch **`vulkan`**. `main` stays at the D3D12 renderer until the branch renders
+the test titles, then the branch replaces it.
 
-## Housekeeping before starting
+0. **Ground truth.**
+   - Choose fixed scenes in FM3 and PGR3 (and one FH1 scene via Glue2GPU if possible).
+   - Capture them on the `d3d12-reference` build with `regpuctl.py shot` and save them as references.
+   - Write a frame-diff script.
+   - Run FM3 and PGR3 on `main` first, so merge regressions are known before the conversion starts.
+1. **Bring-up.**
+   - Vulkan device, window and swap chain from the presenter.
+   - The upload ring, and guest memory as storage buffers.
+   - Shaders through DXC to SPIR-V, one pipeline, the first draws into an EDRAM surface.
+   - The first resolve, presented.
+   - Use `renderer_vk.cpp` and FM2's notes for every piece.
+2. **The renderer core, slice by slice**, diffing against the references after each slice:
+   - textures (decode, upload, bindless, cubes, 3D);
+   - EDRAM surfaces and MSAA;
+   - resolves (blits, writes back to memory, bands, enclosing images, tiling merges);
+   - draws (vertex/index paths, the vertex arena, primitive types, the alpha test, motion variants);
+   - occlusion queries and predication;
+   - the frame end, grading and present.
+3. **Threads and speed:** the draw thread, workers, async present and the replay thread on Vulkan command buffers;
+   pipeline compile workers and caches; the texture streaming threads. Measure against the reference build's fps.
+4. **Upscaling and extras:**
+   - FSR 1, then FSR 3/4 (FidelityFX Vulkan backend), DLSS (NGX Vulkan) and XeSS (Vulkan).
+   - Post AA (FXAA, SMAA, CMAA 2, TAA), SSAA and EQAA (or its Vulkan absence).
+   - Hyper mode, VR (OpenXR Vulkan binding) and triple screen.
+5. **Host API and ports:** the regpu.h changes above, Glue2GPU, and a port each (FM3 first) updated against the
+   branch.
+6. **Remove D3D12:** DXGI, d3d12, d3dcompiler, fxc, DXIL, the FidelityFX DX12 libs, `renderer_vk.cpp` and the
+   `REGPU_VULKAN` option (Vulkan is always on). Merge `vulkan` into `main`.
+7. **Linux native.** Win32 pieces behind the host: windowing (SDL3 or Wayland/X11 surfaces), threads, DLL loading
+   (vulkan-1 / libvulkan.so.1, dxcompiler).
+   - Build with clang.
+   - Ship in the Steam Linux Runtime 4.0 SDK.
+   - Test on RADV (Steam Deck), ANV, NVK and NVIDIA's proprietary driver.
 
-- **FM3/PGR3 on `main`:** test FM3 and PGR3 against `main` (D3D12) first, so later diffs aren't blamed on the
-  conversion. Then point their submodules at `main` with an empty ReGPU patch stack.
-- **FM4's features:** decide which of [fm4-features-to-port.md](fm4-features-to-port.md) matter. Port them before
-  phase 3 if they are D3D12 renderer changes (cheaper than porting twice).
-- **Local build:** see `G:\claude code projects\ReGPU-V\work\scripts\README.md` on this machine. It covers the build
-  scripts, the dependencies in `work\deps`, and how to run `regpu_vkprobe`.
+## Before starting
+
+- **FM4's features:** decide which of [fm4-features-to-port.md](fm4-features-to-port.md) are wanted. A D3D12-side
+  feature is cheaper to port before phase 2 than after, or it can be ported straight into the Vulkan renderer later.
+- **Baseline:** the Vulkan baseline is Vulkan 1.3 with descriptor indexing, synchronization2, dynamic rendering, push
+  descriptors and robustness2. Optional: conditional rendering, external memory host, descriptor heap. The research
+  report in the ReGPU-V workspace has the driver coverage.
+- **Local build:** see `G:\claude code projects\ReGPU-V\work\scripts\README.md` on this machine.
