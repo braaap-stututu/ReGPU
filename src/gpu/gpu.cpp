@@ -317,12 +317,18 @@ void Replay(size_t first, size_t endPos)
 std::vector<uint32_t> g_sizes, g_lastSizes; // draws of each segment this frame / the last
 uint32_t g_index = 0;                        // the segment the next draw belongs to
 uint32_t g_directDraws = 0;                  // draws of the current segment drawn straight away
+// An occlusion query is counting (between a ZPD start and its pause or end): its draws go straight to the
+// renderer, recorded in stream order on the command processor's list where its D3D query part began (a
+// D3D12 query only counts the draws of its own list; a worker's piece would not be wrapped).
+bool g_query = false;
 constexpr uint32_t kParallelDraws = 2 * 96;  // fewer than this never make two pieces (Flush)
 
 // Whether the current segment's draws go straight to the renderer.
 bool Direct()
 {
     static LiveSwitch logAll("REGPU_LOG_ALL_SEGMENTS");
+    if (g_query)
+        return true;
     return !g_open && !logAll && g_index < g_lastSizes.size() && g_lastSizes[g_index] < kParallelDraws;
 }
 
@@ -1041,15 +1047,27 @@ uint32_t ExecutePacket(uint32_t ptr)
             Log("zpd: %08X %08X %08X %08X %08X %08X %08X %08X%s, RB_SAMPLE_COUNT_CTL %08X", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
                 end ? " (end)" : "", gpureg::Get(0x2324));
         }
-        // Real counts when draws are recorded here in stream order (not with the draw thread
-        // or workers, whose lists the query would not wrap): the sun flare fades behind trees.
+        // Real counts when draws are recorded here in stream order (not with the draw thread, whose
+        // list the query would not wrap): the sun flare fades behind trees. With draw workers the open
+        // logged segment is translated first and, while the query counts, its draws go straight to the
+        // renderer (seg::g_query); between a query's tile spans (RendererOcclusionBegin: pause/resume)
+        // and outside queries the workers go on. REGPU_NO_WORKER_QUERIES=1: with workers every query
+        // answers the fixed 1000, as before (A/B: no sun flare).
         static LiveSwitch fake("REGPU_FAKE_OCCLUSION"); // A/B: the old fixed answer
-        const bool real = !fake && !work::Active() && !seg::Enabled();
+        static LiveSwitch noWorkerQueries("REGPU_NO_WORKER_QUERIES");
+        const bool real = !fake && !work::Active() && !(seg::Enabled() && noWorkerQueries);
         uint32_t samples = 1000, total = 1000;
         if (real && !end)
+        {
+            if (seg::Enabled() && seg::g_open)
+                seg::Flush();
             RendererOcclusionBegin();
+            seg::g_query = seg::Enabled() && RendererOcclusionCounting();
+        }
         else if (real && !RendererOcclusionEnd(samples, total, counts))
             samples = total = 1000; // no result yet (the first frames): fully visible
+        if (end)
+            seg::g_query = false;
         memset(c, 0, 8 * 4);
         if (end)
         {
@@ -1633,6 +1651,7 @@ void PresentSwap(uint64_t frame, uint32_t frontBuffer)
     seg::Flush();
     seg::EndFrame();
     seg::g_tile = RendererTile{};
+    seg::g_query = false; // (the renderer ends a query still open at the swap)
     if (work::Active())
     {
         uint32_t* p = work::Begin(work::kSwap, 3);

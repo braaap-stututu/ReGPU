@@ -80,6 +80,9 @@ void RendererOcclusionBegin();
 // The query's samples that passed and, as the console's Total, the samples its draws covered, as
 // counted for the last finished query that wrote its counts to `address` (RB_SAMPLE_COUNT_ADDR).
 bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total, uint32_t address);
+// Whether a query is counting now (begun or resumed, not paused or ended): its draws must be recorded on
+// the command processor's list (gpu.cpp, seg::g_query).
+bool RendererOcclusionCounting();
 // Follows the tile state draws set (see DrawImpl), for the state at each piece's start.
 void RendererTrackTile(RendererTile& tile);
 void RendererSetTile(const RendererTile& tile);
