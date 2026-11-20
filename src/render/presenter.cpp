@@ -2,6 +2,7 @@
 // VdSwap hands a frame over; a render thread presents it without blocking
 // the guest. Until the D3D hooks draw real content the frame is a clear
 // whose shade pulses with the frame count, proving the path end to end.
+#include "render/xr.h"
 #include <algorithm>
 #include <chrono>
 #include <atomic>
@@ -276,6 +277,7 @@ void CreateWindowAndDevice()
     EnsureDevice();
     g_p.device = g_device;
     g_p.queue = g_queue;
+    regpu::xr::Start(g_device.Get(), g_queue.Get()); // (REGPU_VR: the headset thread, on this device and queue)
 
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width = outW;
@@ -588,6 +590,7 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, I
         const UINT shownW = UINT(std::min(sd.Width, bd.Width));
         list->CopyTextureRegion(&dst, offsetX + (shownW - fpsW) / 2, offsetY + 12, 0, &from, nullptr);
     }
+    regpu::xr::CaptureFrame(list, backBuffer); // (REGPU_VR: the finished frame for the headset's virtual screen)
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
