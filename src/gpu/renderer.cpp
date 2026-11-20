@@ -40,6 +40,7 @@
 #include <wrl/client.h>
 
 #include "gpu/hlsl.h"
+#include "gpu/xess.h"
 #include "gpu/dlss.h"
 #include "gpu/fsr3.h"
 #include "gpu/recorded_list.h"
@@ -3222,7 +3223,8 @@ void BeginFrameIfNeeded()
     // This frame's scene phase and scale (see UpscaleScene).
     {
         const Settings& st = GetSettings();
-        const bool temporalUpscaler = st.upscaler == Settings::Upscaler::Dlss || st.upscaler == Settings::Upscaler::Fsr3 || st.upscaler == Settings::Upscaler::Fsr4;
+        const bool temporalUpscaler = st.upscaler == Settings::Upscaler::Dlss || st.upscaler == Settings::Upscaler::Fsr3 || st.upscaler == Settings::Upscaler::Fsr4 ||
+            st.upscaler == Settings::Upscaler::Xess;
         const float scale = st.SceneScale();
         g_upscale.switchedThisFrame = false;
         // Anti-aliasing filters (session 36) need the scene's end too: TAA the temporal path (not with DLSS/FSR 3, which
@@ -8938,9 +8940,11 @@ void UpscaleResolved(uint32_t base);
 
 // DLSS or FSR 3 on the scene image at `base`: colour (render size), depth and motion (top left of
 // output-sized textures); the upscaled image replaces it like UpscaleResolved.
-bool EvaluateTemporal(uint32_t base, bool dlss)
+bool EvaluateTemporal(uint32_t base, bool dlss, bool xess = false)
 {
     if (dlss && !DlssInit(g_r.device))
+        return false;
+    if (xess && !XessInit(g_r.device))
         return false;
     auto it = g_r.resolved.find(base);
     if (it == g_r.resolved.end() || !it->second.resource)
@@ -9037,10 +9041,12 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     };
     static FsrJob fsrJobs[kFrames];
     static LiveSwitch fsrOnReal("REGPU_FSR_ON_REAL");
-    const bool queued = !dlss && !fsrOnReal;
+    const bool queued = !dlss && !xess && !fsrOnReal;
     bool ok;
     if (dlss)
         ok = DlssEvaluate(C().list->Real(), setup, in);
+    else if (xess)
+        ok = XessEvaluate(C().list->Real(), setup, in);
     else if (!queued)
         ok = Fsr3Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness);
     else
@@ -9103,13 +9109,15 @@ bool TaaScene(uint32_t base);
 void TemporalEvaluate(uint32_t base)
 {
     // TAA (Config::postAA, FM3 port session 36): the temporal path without an upscaler.
-    if (const Settings::Upscaler u = GetSettings().upscaler; u != Settings::Upscaler::Dlss && u != Settings::Upscaler::Fsr3 && u != Settings::Upscaler::Fsr4)
+    if (const Settings::Upscaler u = GetSettings().upscaler;
+        u != Settings::Upscaler::Dlss && u != Settings::Upscaler::Fsr3 && u != Settings::Upscaler::Fsr4 && u != Settings::Upscaler::Xess)
     {
         TaaScene(base);
         g_upscale.reset = false;
         return;
     }
-    const bool done = EvaluateTemporal(base, GetSettings().upscaler == Settings::Upscaler::Dlss);
+    const Settings::Upscaler u = GetSettings().upscaler;
+    const bool done = EvaluateTemporal(base, u == Settings::Upscaler::Dlss, u == Settings::Upscaler::Xess);
     if (!done)
         UpscaleResolved(base);
     g_upscale.reset = false;

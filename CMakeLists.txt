@@ -54,6 +54,11 @@ endif()
 if(NOT REGPU_DLSS)
     list(REMOVE_ITEM REGPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/dlss.cpp")
 endif()
+# Intel XeSS (src/gpu/xess.cpp, FM3 port session 43): the SDK's headers (libxess.dll is loaded at run time, beside the exe).
+set(REGPU_XESS_DIR "" CACHE PATH "Intel XeSS SDK folder (with inc/xess/xess_d3d12.h); empty: built without")
+if(NOT (REGPU_XESS_DIR AND EXISTS "${REGPU_XESS_DIR}/inc/xess/xess_d3d12.h"))
+    list(REMOVE_ITEM REGPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/xess.cpp")
+endif()
 
 # The FSR1, depth copy, gamma and enhance compute shaders, compiled into a header at build time.
 set(REGPU_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -101,6 +106,10 @@ target_compile_definitions(regpu PUBLIC ${REGPU_GUEST_DEFINES})
 target_include_directories(regpu PRIVATE src "${REGPU_GENERATED}")
 # VR through OpenXR (src/render/xr.cpp, REGPU_VR=screen): the OpenXR SDK's include/openxr headers. The loader DLL is
 # loaded at run time (openxr_loader.dll beside the exe), so nothing links against it.
+if(REGPU_XESS_DIR AND EXISTS "${REGPU_XESS_DIR}/inc/xess/xess_d3d12.h")
+    target_compile_definitions(regpu PRIVATE REGPU_XESS=1)
+    target_include_directories(regpu PRIVATE "${REGPU_XESS_DIR}/inc")
+endif()
 # Hyper's mesh decimation and vertex-cache order (src/gpu/renderer.cpp hyperdec, FM3 port session 43): meshoptimizer
 # (MIT, github.com/zeux/meshoptimizer) compiled in when its folder is given; empty: built without (the cuts log so).
 set(REGPU_MESHOPT_DIR "" CACHE PATH "meshoptimizer source folder (with src/meshoptimizer.h)")
