@@ -9,6 +9,7 @@ struct DlssSetup
     uint32_t renderWidth = 0, renderHeight = 0, outputWidth = 0, outputHeight = 0;
     uint32_t quality = 1; // settings.h: 0 native (DLAA) .. 4 ultra performance
     bool hdr = false, depthInverted = true;
+    bool fsr4 = false; // FSR: the 4.x version where the device offers it (fsr3.cpp)
     bool operator==(const DlssSetup&) const = default;
 };
 
