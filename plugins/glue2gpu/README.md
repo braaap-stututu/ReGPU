@@ -110,7 +110,8 @@ cmake -S plugin -B build/plugin -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMA
 cmake --build build/plugin
 ```
 
-`GLUE2GPU_REXGLUE` and `GLUE2GPU_REGPU` default to `thirdparty/ReIGlue` and `thirdparty/ReGPU`.
+`GLUE2GPU_REXGLUE` defaults to `thirdparty/ReIGlue`. Inside ReGPU (`plugins/glue2gpu`), `GLUE2GPU_REGPU` defaults to
+this repository, whose main branch includes the `rexglue-driver` work.
 
 Build with the same compiler as the SDK. The plugin imports `rexruntime.dll`, so an SDK that doesn't
 match the game's can fail to load.

@@ -7,7 +7,8 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(GLUE2GPU_REXGLUE "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/ReIGlue" CACHE PATH "ReIGlue / ReXGlue source (headers, SIMDe)")
-set(GLUE2GPU_REGPU "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/ReGPU" CACHE PATH "ReGPU checkout (rexglue-driver branch)")
+# (Inside ReGPU, plugins/glue2gpu: ReGPU is this repository.)
+set(GLUE2GPU_REGPU "${CMAKE_CURRENT_SOURCE_DIR}/../../.." CACHE PATH "ReGPU checkout")
 
 find_package(rexglue CONFIG REQUIRED)
 
