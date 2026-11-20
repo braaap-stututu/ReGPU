@@ -912,6 +912,9 @@ void OnRegs(uint32_t index, uint32_t count)
 std::unordered_set<uint64_t> g_seenStates;
 uint64_t g_shader[2] = {}; // the last shader load of each type (address << 32 | size)
 uint64_t g_repeatState = 0;
+constexpr int kGroups = 6;
+std::unordered_set<uint64_t> g_seenGroup[kGroups];
+uint64_t g_lastGroup[kGroups] = {}, g_groupSame[kGroups] = {}, g_groupSeen[kGroups] = {}, g_groupNew[kGroups] = {};
 void OnDrawState()
 {
     const uint32_t* f = reinterpret_cast<const uint32_t*>(work::g_file.data());
@@ -926,6 +929,50 @@ void OnDrawState()
     h = (h ^ g_shader[1]) * 0x100000001B3ull;
     if (!g_seenStates.insert(h).second)
         g_repeatState++;
+    // Fable's idea (session 46): a cache keyed per state part. Per group: same as the draw before, or seen earlier in
+    // the frame. Groups: 0 surface/viewport/scissor, 1 pipeline (shaders, depth/blend/raster/mode/mask, SQ program),
+    // 2 fetch constants, 3 bool/loop constants, 4 every other render register, 5 = 0+1 (the draw's translated setup).
+    auto hashRegs = [&](std::initializer_list<std::pair<uint32_t, uint32_t>> ranges, bool shaders) {
+        uint64_t g = 0xCBF29CE484222325ull;
+        for (const auto& [a, b] : ranges)
+            for (uint32_t r = a; r < b; r++)
+                g = (g ^ f[r]) * 0x100000001B3ull;
+        if (shaders)
+        {
+            g = (g ^ g_shader[0]) * 0x100000001B3ull;
+            g = (g ^ g_shader[1]) * 0x100000001B3ull;
+        }
+        return g;
+    };
+    uint64_t gh[kGroups];
+    gh[0] = hashRegs({ { 0x2000, 0x2006 }, { 0x200C, 0x200E }, { 0x2080, 0x2085 }, { 0x210F, 0x2115 }, { 0x2206, 0x2207 } }, false);
+    gh[1] = hashRegs({ { 0x2104, 0x2105 }, { 0x210D, 0x210F }, { 0x2180, 0x2182 }, { 0x2200, 0x2206 }, { 0x2208, 0x220C } }, true);
+    gh[2] = hashRegs({ { gpureg::FetchConstants, gpureg::BoolConstants } }, false);
+    gh[3] = hashRegs({ { gpureg::BoolConstants, gpureg::LoopConstants + 32 } }, false);
+    {
+        uint64_t g = 0xCBF29CE484222325ull;
+        for (uint32_t r = 0x2000; r < 0x2400; r++)
+        {
+            const bool in0 = r < 0x2006 || (r >= 0x200C && r < 0x200E) || (r >= 0x2080 && r < 0x2085) || (r >= 0x210F && r < 0x2115) || r == 0x2206;
+            const bool in1 = r == 0x2104 || (r >= 0x210D && r < 0x210F) || (r >= 0x2180 && r < 0x2182) || (r >= 0x2200 && r < 0x2206) ||
+                             (r >= 0x2208 && r < 0x220C);
+            if (!in0 && !in1)
+                g = (g ^ f[r]) * 0x100000001B3ull;
+        }
+        gh[4] = g;
+    }
+    gh[5] = (gh[0] * 0x9E3779B97F4A7C15ull) ^ gh[1];
+    for (int i = 0; i < kGroups; i++)
+    {
+        if (gh[i] == g_lastGroup[i])
+            g_groupSame[i]++;
+        else if (!g_seenGroup[i].insert(gh[i]).second)
+            g_groupSeen[i]++;
+        else
+            g_groupNew[i]++;
+        g_seenGroup[i].insert(gh[i]);
+        g_lastGroup[i] = gh[i];
+    }
 }
 void OnDraw()
 {
@@ -940,11 +987,26 @@ void OnDraw()
 void OnSwap()
 {
     g_seenStates.clear();
+    for (auto& g : g_seenGroup)
+        g.clear();
     if (++g_frames % 300 || !g_draws)
         return;
     Log("exp state: %.1f%% of draws repeat the whole state (render registers, fetch/bool/loop constants) of an earlier draw in the frame",
         100.0 * double(g_repeatState) / double(g_draws));
     g_repeatState = 0;
+    {
+        static const char* const names[kGroups] = { "surface/viewport", "pipeline", "fetch", "bool/loop", "other registers", "surface+pipeline" };
+        std::string s;
+        for (int i = 0; i < kGroups; i++)
+        {
+            char t[128];
+            snprintf(t, sizeof(t), " %s same %.1f%% earlier %.1f%% new %.1f%%;", names[i], 100.0 * double(g_groupSame[i]) / double(g_draws),
+                100.0 * double(g_groupSeen[i]) / double(g_draws), 100.0 * double(g_groupNew[i]) / double(g_draws));
+            s += t;
+            g_groupSame[i] = g_groupSeen[i] = g_groupNew[i] = 0;
+        }
+        Log("exp state groups (as the draw before / seen earlier in the frame / new):%s", s.c_str());
+    }
     const double n = double(g_draws);
     Log("exp state: %.0f draws a frame; same state as the draw before but float constants %.1f%%; changed: fetch only %.1f%%, "
         "bool/loop only %.1f%%, fetch+bool/loop %.1f%%, other registers (with or without those) %.1f%%, shader (with or without) %.1f%%",
@@ -997,11 +1059,46 @@ void WorkerLoop()
         {
             if (seg::g_open)
                 seg::Flush(); // caught up: translate the open segment before waiting
-            if (timeIdle)
+            if (timeIdle && !expTraceState)
             {
                 const auto w0 = std::chrono::steady_clock::now();
                 work::WaitHead(head);
                 RendererDrawThreadIdle(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
+            }
+            else if (expTraceState)
+            {
+                // Experimental trace (session 46, Fable's starvation check): how long the draw thread waits for the
+                // command processor, as a histogram, logged every 10 s.
+                static constexpr double kEdges[] = { 0.02, 0.1, 0.5, 2.0 }; // ms
+                static uint64_t count[5] = {};
+                static double total[5] = {};
+                static auto logAt = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                const auto w0 = std::chrono::steady_clock::now();
+                work::WaitHead(head);
+                const auto w1 = std::chrono::steady_clock::now();
+                const double ms = std::chrono::duration<double, std::milli>(w1 - w0).count();
+                if (timeIdle)
+                    RendererDrawThreadIdle(ms);
+                int b = 0;
+                while (b < 4 && ms >= kEdges[b])
+                    b++;
+                count[b]++;
+                total[b] += ms;
+                if (w1 >= logAt)
+                {
+                    const double wall = 10000.0 + std::chrono::duration<double, std::milli>(w1 - logAt).count();
+                    double all = 0;
+                    for (double t : total)
+                        all += t;
+                    Log("exp waits: draw thread waited %.1f%% of 10 s; <20us %llu (%.0f ms), 20-100us %llu (%.0f ms), 0.1-0.5ms %llu (%.0f ms), "
+                        "0.5-2ms %llu (%.0f ms), >2ms %llu (%.0f ms)", 100.0 * all / wall, (unsigned long long)count[0], total[0],
+                        (unsigned long long)count[1], total[1], (unsigned long long)count[2], total[2], (unsigned long long)count[3], total[3],
+                        (unsigned long long)count[4], total[4]);
+                    memset(count, 0, sizeof(count));
+                    for (double& t : total)
+                        t = 0;
+                    logAt = w1 + std::chrono::seconds(10);
+                }
             }
             else
                 work::WaitHead(head);

@@ -15724,6 +15724,39 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         pc->info[2] |= 64u | 0xAAu << 8;
     else if (static LiveSwitch noAlphaDither("REGPU_NO_ALPHA_DITHER"); !noAlphaDither && g_msaa == 1 && edramMode != 5 && (colorControl >> 4) & 1)
         pc->info[2] |= 64u | (colorControl >> 24) << 8;
+    // Experimental trace (session 46, Fable's null-PS idea): depth-only draws whose pixel shader can't change anything
+    // (no alpha test, no alpha to mask, no depth export, no kill or the kill skipped): a null-PS pipeline would do.
+    if (static LiveSwitch expTraceState("REGPU_EXP_TRACE_STATE"); expTraceState)
+    {
+        static uint64_t draws = 0, depthOnlyDraws = 0, nullPs = 0, textured = 0, noHlsl = 0;
+        draws++;
+        if (edramMode == 5)
+        {
+            depthOnlyDraws++;
+            const CompiledShader& src = ps.hlslSource ? *ps.hlslSource : ps;
+            const std::string& h = src.info.hlsl;
+            const size_t body = std::min(src.info.bodyStart, h.size());
+            const bool depthExport = h.find("SV_Depth", body) != std::string::npos;
+            const bool kills = h.find("& 4u)) discard", body) != std::string::npos; // (the code's kills; the alpha test's are pinfo.x)
+            const bool alphaTest = pc->info[0] != 7;
+            if (body >= h.size())
+                noHlsl++;
+            else if (!alphaTest && !(pc->info[2] & 64u) && !depthExport && (!kills || (pc->info[2] & 4u)))
+            {
+                nullPs++;
+                if (ps.info.usedTextureSlots)
+                    textured++;
+            }
+        }
+        if (draws >= 3000000)
+        {
+            Log("exp null ps: depth-only draws %.1f%% of draws, null-PS candidates %.1f%% of draws (%.1f%% of depth-only; %.1f%% of them sample textures; %.1f%% of draws unknown: no HLSL)",
+                100.0 * double(depthOnlyDraws) / double(draws), 100.0 * double(nullPs) / double(draws),
+                depthOnlyDraws ? 100.0 * double(nullPs) / double(depthOnlyDraws) : 0.0, nullPs ? 100.0 * double(textured) / double(nullPs) : 0.0,
+                100.0 * double(noHlsl) / double(draws));
+            draws = depthOnlyDraws = nullPs = textured = noHlsl = 0;
+        }
+    }
     // The pixel position register (PsParamGen) holds the pixel's integer position, D3D9's convention
     // (Xenia: the host pixel rounded down, then the render scale undone); the host pixel's centre was
     // half a host pixel past it. Screen-space lookups that add half a texel then read past the pixel's
