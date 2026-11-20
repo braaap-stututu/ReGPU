@@ -911,6 +911,7 @@ struct FrameResources
     vk::Buffer vkRing;                              // the upload ring (ring / ringCpu / ringSize)
     VkDescriptorSet vkSet0[kSamplerBanks] = {};     // set 0 over vkRing, guest memory and each sampler bank
     uint64_t vkTimeline = 0;                        // the queue timeline value of this slot's last submission (fence)
+    std::vector<std::function<void()>> vkGarbage;   // garbage: destroyed when this slot's frame has completed
 };
 
 // The pipeline this thread is handing to the driver compiler, named by RendererLogCrashContext if the driver faults.
@@ -1061,6 +1062,7 @@ struct Renderer
         D3D12_CPU_DESCRIPTOR_HANDLE view{};
         uint64_t lastFrame = 0; // the frame that last selected it (EvictSurfaces)
         UINT slot = 0;          // its view in the RTV/DSV heap
+        vk::Image vk;           // Vulkan: replaces resource, state and view (vk.target is the attachment view)
     };
     std::unordered_map<uint32_t, Surface> colorSurfaces, depthSurfaces;
     ComPtr<ID3D12Resource> readback;
@@ -1196,6 +1198,7 @@ RecordedList* g_prepList = nullptr;
 struct DrawContext
 {
     RecordedList* list = nullptr;
+    vk::RecordedList* vkList = nullptr; // Vulkan: replaces list
     uint32_t colorBase = ~0u, depthBase = ~0u;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{}, dsv{};
     // The bound surfaces.
@@ -2778,6 +2781,7 @@ void InitVulkan()
     vk::Check(vkBeginCommandBuffer(g_r.vkMain, &bi), "vkBeginCommandBuffer");
     g_r.frames[0].vkBuffersUsed = 1;
     g_r.vkRecorder.Init(g_r.vkMain);
+    g_mainContext.vkList = &g_r.vkRecorder;
     Log("renderer: Vulkan objects ready (%u frame slots, %llu MB upload ring each)", kFrames, (unsigned long long)(kRingSize >> 20));
 }
 
@@ -3038,6 +3042,7 @@ void Init()
 double g_gpuWaitSeconds = 0; // CP thread blocked on the host GPU (frame resources)
 
 FrameResources& Frame() { return g_r.frames[g_r.frameIndex]; }
+void ReleaseWithFrame(vk::Image& image); // (below)
 bool g_asyncFrameEnded = false; // the last frame's end was queued on the replay thread (REGPU_ASYNC_PRESENT)
 ID3D12GraphicsCommandList* AcquireList();
 
@@ -3066,7 +3071,10 @@ void DropSurfaces()
         for (auto* map : { &g_r.colorSurfaces, &g_r.depthSurfaces })
         {
             for (auto& [base, s] : *map)
+            {
                 Frame().garbage.push_back(std::move(s.resource));
+                ReleaseWithFrame(s.vk);
+            }
             map->clear();
         }
     }
@@ -3156,6 +3164,15 @@ void ApplyMsaa()
 
 void TransitionColor(D3D12_RESOURCE_STATES to);
 
+// Destroys a Vulkan image once the GPU has finished the current frame (D3D12: Frame().garbage.push_back).
+void ReleaseWithFrame(vk::Image& image)
+{
+    if (!image)
+        return;
+    Frame().vkGarbage.push_back([im = image]() mutable { vk::Destroy(*g_r.vkd, im); });
+    image = {};
+}
+
 // Gets (creating on first use) the host surface for an EDRAM base.
 bool TemporalInit();
 void BeginTemporalFrame();
@@ -3192,54 +3209,42 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
     Renderer::Surface& s = map[base];
     s.slot = index;
     s.lastFrame = g_r.frame;
-    D3D12_HEAP_PROPERTIES hp{};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC td{};
-    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    td.Width = SurfaceWidth();
-    td.Height = SurfaceHeight();
-    td.DepthOrArraySize = 1;
-    td.MipLevels = 1;
-    td.SampleDesc.Count = g_msaa;
-    td.SampleDesc.Quality = g_msaaQuality;
-    D3D12_CLEAR_VALUE cv{};
+    // Every surface is a render target that is also sampled (resolves, depth copies) and copied.
+    vk::ImageDesc desc;
+    desc.width = SurfaceWidth();
+    desc.height = SurfaceHeight();
+    desc.samples = VkSampleCountFlagBits(g_msaa);
+    desc.dedicated = true;
+    desc.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // (EQAA, g_msaaQuality: D3D12 only for now; Vulkan has it only through AMD's mixed-samples extension.)
     if (depth)
     {
-        td.Format = DXGI_FORMAT_R32G8X24_TYPELESS; // float depth (the title uses D24FS8, reverse-Z); typeless for resolves
-        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-        cv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-        cv.DepthStencil.Depth = 1.0f;
-        Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
-                  IID_PPV_ARGS(&s.resource)),
-            "CreateCommittedResource(depth surface)"); CountCreate("depth surface");
-        s.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        s.view = g_r.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-        s.view.ptr += SIZE_T(index) * g_r.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
-        dsvDesc.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-        dsvDesc.ViewDimension = g_msaa > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
-        C().list->CreateDepthStencilView(g_r.device, s.resource.Get(), dsvDesc, s.view); // in order with the recorded commands
-        // A depth surface the title tests against before anything writes it reads, on the console,
-        // whatever EDRAM held there: mostly a colour target with opaque alpha, which as depth is
-        // about 1.0. A new host resource reads 0 instead, and a less-or-equal pass against it never
-        // drew (Top Spin 4's bloom downsample into a 640x360 view whose depth it never clears: the
-        // composite then added a 2x blow-up of the scene's corner, posters ghosting over the
-        // players). New depth surfaces start at the far plane. REGPU_NO_DEPTH_INIT_FAR=1: unset.
-        if (static LiveSwitch noFar("REGPU_NO_DEPTH_INIT_FAR"); !noFar)
-            C().list->ClearDepthStencilView(s.view, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+        // Float depth (the title uses D24FS8, reverse-Z) with stencil; its depth is sampled for resolves (D3D12 made it
+        // typeless for that).
+        desc.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        desc.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        desc.name = "EDRAM depth surface";
     }
     else
     {
-        td.Format = kColorFormat;
-        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        cv.Format = td.Format;
-        Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
-                  IID_PPV_ARGS(&s.resource)),
-            "CreateCommittedResource(colour surface)"); CountCreate("colour surface");
-        s.view = g_r.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        s.view.ptr += SIZE_T(index) * g_r.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        C().list->CreateRenderTargetView(g_r.device, s.resource.Get(), s.view); // in order with the recorded commands
+        desc.format = vk::ToVkFormat(kColorFormat);
+        desc.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        desc.name = "EDRAM colour surface";
     }
+    s.vk = vk::CreateImage(*g_r.vkd, desc);
+    if (!s.vk)
+        Fatal("renderer: no video memory for a %ux%u EDRAM %s surface", desc.width, desc.height, depth ? "depth" : "colour");
+    CountCreate(depth ? "depth surface" : "colour surface");
+    // Starts as a target, as D3D12's did (created in RENDER_TARGET / DEPTH_WRITE), in order with the recorded commands.
+    vk::Transition(*C().vkList, s.vk, depth ? vk::Use::DepthTarget : vk::Use::ColorTarget);
+    // A depth surface the title tests against before anything writes it reads, on the console,
+    // whatever EDRAM held there: mostly a colour target with opaque alpha, which as depth is
+    // about 1.0. A new host resource reads 0 instead, and a less-or-equal pass against it never
+    // drew (Top Spin 4's bloom downsample into a 640x360 view whose depth it never clears: the
+    // composite then added a 2x blow-up of the scene's corner, posters ghosting over the
+    // players). New depth surfaces start at the far plane. REGPU_NO_DEPTH_INIT_FAR=1: unset.
+    if (static LiveSwitch noFar("REGPU_NO_DEPTH_INIT_FAR"); depth && !noFar)
+        C().vkList->ClearDepthStencil(s.vk.target, s.vk.Extent(), true, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 1.0f, 0, 0, nullptr);
     Log("renderer: EDRAM %s surface at base %03X", depth ? "depth" : "colour", base);
     return s;
 }
@@ -3268,6 +3273,7 @@ void EvictSurfaces()
                 Log("renderer: EDRAM %s surface at base %03X released (unused for %llu frames)", d ? "depth" : "colour", it->first,
                     (unsigned long long)(g_r.frame - it->second.lastFrame));
                 Frame().garbage.push_back(std::move(it->second.resource)); // (released when the GPU is done with this frame)
+                ReleaseWithFrame(it->second.vk);
                 it = map.erase(it);
             }
             else
@@ -3635,6 +3641,9 @@ void BeginFrameIfNeeded()
         g_gpuWaitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
     }
     f.garbage.clear();
+    for (auto& destroy : f.vkGarbage)
+        destroy();
+    f.vkGarbage.clear();
     ApplyOutputSize(); // (a new resolution: between frames)
     ApplyFrameSize();  // (a new guest frame size: the same)
     ApplyMsaa();
