@@ -44,6 +44,10 @@ struct TranslatedShader
     // rewrite): bool constants, loop constants, the vertex fetch layout (vfl), the game's vuser constants.
     // A draw writes the unread ones to the upload ring no more. True (written) until scanned.
     bool readsBools = true, readsLoops = true, readsFetchLayout = true, readsUser = true;
+    // The float constants the code reads are numbered by their rank in constantMask (PackConstants in
+    // renderer.cpp): a draw writes them packed from c[0], one sequential run instead of a scattered 16-byte store
+    // each (FM3 session 30). Not with relative addressing (the mask is all 256) or a game rewrite hook.
+    bool packedConstants = false;
 };
 
 TranslatedShader TranslateShader(const ucode::Shader& shader);
