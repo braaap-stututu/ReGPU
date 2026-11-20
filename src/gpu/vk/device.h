@@ -54,6 +54,9 @@ struct Device
     bool pushDescriptor = false;       // VK_KHR_push_descriptor
     bool swapchain = false;            // VK_KHR_swapchain (+ the instance's surface extensions)
     bool memoryBudget = false;         // VK_EXT_memory_budget
+    // VK_EXT_primitive_topology_list_restart: a pipeline made for the triangle-list class may enable primitive restart
+    // (the draw then sets the strip topology dynamically). Without it such pipelines drop the restart.
+    bool listRestart = false;
     bool ngx = false;                  // VK_NVX_binary_import and VK_NVX_image_view_handle (DLSS through NGX)
     bool storageReadWithoutFormat = false; // shaderStorageImageReadWithoutFormat (the post filters read storage images)
     bool occlusionPrecise = false;     // occlusionQueryPrecise (sample counts, not just zero / non-zero)

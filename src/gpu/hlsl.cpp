@@ -232,9 +232,11 @@ uint FetchMode(uint mode)
 #ifdef REGPU_VERTEX_STAGE
 #define REGPU_SAMPLE_BIAS_2D(t, s, uv, bias) ((t).SampleLevel((s), (uv), max((bias), 0)))
 #define REGPU_SAMPLE_BIAS_CUBE(t, s, dir, bias) ((t).SampleLevel((s), (dir), max((bias), 0)))
+#define REGPU_SAMPLE_BIAS_3D(t, s, uvw, bias) ((t).SampleLevel((s), (uvw), max((bias), 0)))
 #else
 #define REGPU_SAMPLE_BIAS_2D(t, s, uv, bias) ((t).SampleBias((s), (uv), (bias)))
 #define REGPU_SAMPLE_BIAS_CUBE(t, s, dir, bias) ((t).SampleBias((s), (dir), (bias)))
+#define REGPU_SAMPLE_BIAS_3D(t, s, uvw, bias) ((t).SampleBias((s), (uvw), (bias)))
 #endif
 
 // The Xenos texture fetch's gamma sign: the texel holds piecewise-linear gamma, converted to linear
@@ -327,10 +329,10 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
         Texture3D<float4> tv = gvol[index];
         const uint vmode = tinfo[slot].x & 3u;
         if (vertexStage) return tv.SampleLevel(sLinearClamp, coord, max(bias, 0));
-        if (vmode == 1) return tv.SampleBias(sLinearClamp, coord, bias);
-        if (vmode == 2) return tv.SampleBias(sPointClamp, coord, bias);
-        if (vmode == 3) return tv.SampleBias(sPointWrap, coord, bias);
-        return tv.SampleBias(sLinearWrap, coord, bias);
+        if (vmode == 1) return REGPU_SAMPLE_BIAS_3D(tv, sLinearClamp, coord, bias);
+        if (vmode == 2) return REGPU_SAMPLE_BIAS_3D(tv, sPointClamp, coord, bias);
+        if (vmode == 3) return REGPU_SAMPLE_BIAS_3D(tv, sPointWrap, coord, bias);
+        return REGPU_SAMPLE_BIAS_3D(tv, sLinearWrap, coord, bias);
     }
     if ((tinfo[slot].w & 0xFFu) == 3)
     {

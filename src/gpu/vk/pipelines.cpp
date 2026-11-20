@@ -37,7 +37,10 @@ VkPipeline CreateGraphicsPipeline(Device& d, const PipelineDesc& p, const char* 
     VkPipelineVertexInputStateCreateInfo vertexInput{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
     VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
     ia.topology = p.topology;
-    ia.primitiveRestartEnable = p.primitiveRestart;
+    // (Restart on a list-class pipeline needs VK_EXT_primitive_topology_list_restart; without it strips with cut indices
+    // draw the cut as a vertex, which no title seen so far relies on.)
+    ia.primitiveRestartEnable = p.primitiveRestart && (d.listRestart || (p.topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST &&
+        p.topology != VK_PRIMITIVE_TOPOLOGY_LINE_LIST && p.topology != VK_PRIMITIVE_TOPOLOGY_POINT_LIST));
     VkPipelineViewportStateCreateInfo viewport{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
     viewport.viewportCount = 1;
     viewport.scissorCount = 1;

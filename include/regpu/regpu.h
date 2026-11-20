@@ -288,6 +288,18 @@ void SetFrameLimit(uint32_t maxFps, bool vsync);
 // REGPU_LEAN_FETCH (its sampler table); others keep their samplers.
 void SetAnisotropy(int maxAnisotropy);
 
+// The GPU ReGPU renders on and its memory, for a host's logs (VK_EXT_memory_budget where the driver has it, else the
+// heap sizes as budgets and no usage). Local: the GPU's own memory (an iGPU's carve-out); shared: system memory the GPU
+// reads. False before the device exists (Start).
+struct GpuMemory
+{
+    char name[256] = {};
+    uint32_t vendorId = 0, deviceId = 0;
+    bool integrated = false;
+    uint64_t localUsage = 0, localBudget = 0, sharedUsage = 0, sharedBudget = 0;
+};
+bool GetGpuMemory(GpuMemory& out);
+
 // VR (REGPU_VR, a build with OpenXR; src/render/xr.cpp). The host poses its camera with the headset and tells ReGPU
 // which pose each game frame was rendered with; frames without one go on the virtual screen.
 namespace vr

@@ -126,6 +126,8 @@ else()
 endif()
 
 add_library(regpu STATIC ${REGPU_SOURCES})
+# The experimental direct microcode-to-SPIR-V translator (src/gpu/spirv) builds on the vendored SPIR-V headers.
+target_include_directories(regpu PRIVATE thirdparty/spirv-headers/include)
 if(REGPU_VULKAN)
     target_include_directories(regpu PRIVATE "${REGPU_VULKAN_HEADERS}" thirdparty/volk thirdparty/vma)
     target_compile_definitions(regpu PUBLIC REGPU_VULKAN=1)
@@ -184,6 +186,10 @@ target_link_libraries(regpu_texture_test PRIVATE regpu)
 add_executable(regpu_dis EXCLUDE_FROM_ALL tools/xenos_dis.cpp)
 target_include_directories(regpu_dis PRIVATE src)
 target_link_libraries(regpu_dis PRIVATE regpu)
+# The experimental direct SPIR-V translator against the corpus: coverage, spirv-val, timing against HLSL + DXC.
+add_executable(regpu_spirv_check EXCLUDE_FROM_ALL tools/spirv_check.cpp)
+target_include_directories(regpu_spirv_check PRIVATE src)
+target_link_libraries(regpu_spirv_check PRIVATE regpu)
 
 # The Vulkan backend's smoke test: device and shader compile (tests/vkprobe.cpp). Copy dxcompiler.dll beside it.
 if(REGPU_VULKAN)

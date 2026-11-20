@@ -44,10 +44,23 @@ def flatten(path):
     return ''.join(text)
 
 
+# Third-party sources rewritten where SPIR-V is stricter than DXIL (their files stay untouched), as regular expressions:
+# - SPIR-V's image offsets must be constants, and CMAA 2 passes a function argument (its value is constant only once
+#   inlined); a load's offset is just added to the coordinate.
+# - An image used with atomics needs its format declared (storage images are otherwise built without one,
+#   -fspv-use-unknown-image-format): CMAA 2's list heads are R32_UINT (renderer.cpp, PostAA).
+SPIRV_REWRITES = [
+    (r'g_inoutColorReadonly\.Load\( int3\( pixelPos, 0 \), offset \)', 'g_inoutColorReadonly.Load( int3( int2( pixelPos ) + offset, 0 ) )'),
+    (r'(RWTexture2D<uint>\s+g_workingDeferredBlendItemListHeads)', r'[[vk::image_format("r32ui")]] \1'),
+]
+
 with tempfile.TemporaryDirectory() as tmp:
     flat = os.path.join(tmp, 'flat.hlsl')
+    text = flatten(src)
+    for old, new in SPIRV_REWRITES:
+        text = re.sub(old, new, text)
     with open(flat, 'w', encoding='utf-8') as f:
-        f.write(flatten(src))
+        f.write(text)
     blobs = {}
     for entry in entries:
         spv = os.path.join(tmp, entry + '.spv')

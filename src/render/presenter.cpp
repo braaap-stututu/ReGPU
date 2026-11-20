@@ -775,6 +775,27 @@ void PresenterCountFrame()
     g_vkPresents++;
 }
 
+bool regpu::GetGpuMemory(GpuMemory& out)
+{
+    vk::Device& d = RenderVkDevice();
+    if (!d.allocator)
+        return false;
+    out = {};
+    snprintf(out.name, sizeof(out.name), "%s", d.name.c_str());
+    out.vendorId = d.props.vendorID;
+    out.deviceId = d.props.deviceID;
+    out.integrated = d.uma;
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+    vmaGetHeapBudgets(d.allocator, budgets);
+    for (uint32_t h = 0; h < d.memory.memoryHeapCount; h++)
+    {
+        const bool local = (d.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+        (local ? out.localUsage : out.sharedUsage) += budgets[h].usage;
+        (local ? out.localBudget : out.sharedBudget) += budgets[h].budget;
+    }
+    return true;
+}
+
 vk::Device& RenderVkDevice()
 {
     static vk::Device device;

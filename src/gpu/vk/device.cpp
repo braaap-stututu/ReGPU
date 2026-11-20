@@ -409,6 +409,7 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     d.hostPointerAlignment = d.externalMemoryHost ? uint32_t(hostProps.minImportedHostPointerAlignment) : 0;
     d.pushDescriptor = optional(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     d.memoryBudget = optional(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    d.listRestart = optional(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME);
     // NVIDIA's NGX (DLSS on Vulkan, dlss.cpp) needs these two where the driver has them.
     d.ngx = optional("VK_NVX_binary_import") && optional("VK_NVX_image_view_handle");
 
@@ -418,9 +419,11 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     VkPhysicalDeviceVulkan11Features have11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
     VkPhysicalDeviceVulkan12Features have12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
     VkPhysicalDeviceConditionalRenderingFeaturesEXT haveCond{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT };
+    VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT haveRestart{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT };
     have.pNext = &have11;
     have11.pNext = &have12;
     have12.pNext = &haveCond;
+    haveCond.pNext = d.listRestart ? &haveRestart : nullptr;
     vkGetPhysicalDeviceFeatures2(d.physical, &have);
     const VkPhysicalDeviceFeatures& h = have.features;
 
@@ -491,7 +494,19 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     w11.pNext = &w12;
     w12.pNext = &w13;
     w13.pNext = &robust;
-    robust.pNext = d.conditionalRendering ? &cond : nullptr;
+    // (The draws' pipelines are made for the triangle-list class and set the strip topology per draw: a strip with
+    // D3D12's strip cut needs restart enabled on a list-class pipeline.)
+    VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT listRestart{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT };
+    listRestart.primitiveTopologyListRestart = haveRestart.primitiveTopologyListRestart;
+    d.listRestart = d.listRestart && haveRestart.primitiveTopologyListRestart;
+    void** tail = &robust.pNext;
+    if (d.conditionalRendering)
+    {
+        *tail = &cond;
+        tail = &cond.pNext;
+    }
+    if (d.listRestart)
+        *tail = &listRestart;
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
