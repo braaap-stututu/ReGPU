@@ -81,6 +81,10 @@ struct Image
     ImageDesc desc{};
     VkImageAspectFlags aspects = VK_IMAGE_ASPECT_COLOR_BIT; // every aspect of the format
     ImageState state{};
+    // Kept in VK_IMAGE_LAYOUT_GENERAL for every use (the barriers change only stages and access): the renderer's
+    // multisampled colour surfaces, which AMD's drivers otherwise decompressed whole at each move out of the attachment
+    // layout, for every resolve (see renderer.cpp GetSurface).
+    bool general = false;
     explicit operator bool() const { return image != VK_NULL_HANDLE; }
     VkExtent2D Extent() const { return { desc.width, desc.height }; }
 };

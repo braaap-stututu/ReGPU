@@ -274,8 +274,18 @@ bool NoBarrierNeeded(const ImageState& from, const ImageState& to)
 }
 }
 
-void Barriers::Add(Image& image, const ImageState& to)
+// The state an image goes to: its use's, in GENERAL for an image kept there (Image::general).
+static ImageState Target(const Image& image, const ImageState& to)
 {
+    ImageState t = to;
+    if (image.general && t.layout != VK_IMAGE_LAYOUT_UNDEFINED)
+        t.layout = VK_IMAGE_LAYOUT_GENERAL;
+    return t;
+}
+
+void Barriers::Add(Image& image, const ImageState& want)
+{
+    const ImageState to = Target(image, want);
     if (NoBarrierNeeded(image.state, to))
         return;
     images.push_back(MakeBarrier(image, image.state, to, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS));
@@ -308,8 +318,9 @@ void Barriers::Record(RecordedList& list)
     hasGlobal = false;
 }
 
-void Transition(RecordedList& list, Image& image, const ImageState& to)
+void Transition(RecordedList& list, Image& image, const ImageState& want)
 {
+    const ImageState to = Target(image, want);
     if (NoBarrierNeeded(image.state, to))
         return;
     const VkImageMemoryBarrier2 b = MakeBarrier(image, image.state, to, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS);

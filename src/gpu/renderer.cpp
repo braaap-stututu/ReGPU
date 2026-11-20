@@ -2824,6 +2824,7 @@ vk::Targets SurfaceTargets(uint32_t extraCount = 0, vk::Image* const* extraColor
     vk::Targets t{};
     if (C().vkColor && *C().vkColor)
     {
+        t.generalColor = C().vkColor->general ? 1u : 0u;
         t.color[t.colorCount++] = C().vkColor->target;
         t.extent = C().vkColor->Extent();
     }
@@ -2908,6 +2909,12 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
     s.vk = vk::CreateImage(*g_r.vkd, desc);
     if (!s.vk)
         Fatal("renderer: no video memory for a %ux%u EDRAM %s surface", desc.width, desc.height, depth ? "depth" : "colour");
+    // Multisampled colour surfaces stay in GENERAL for drawing, resolving (sampled) and copying: each resolve moved the
+    // surface out of the attachment layout and back, and AMD's Vulkan drivers decompressed the whole surface each time
+    // (FM3 on a Ryzen 9800X3D's graphics at 720p 2x: ~0.84 ms a resolve, the frame 2.7x D3D12's; D3D12's driver reads
+    // the compressed samples). REGPU_VK_NO_MSAA_GENERAL=1 (start-time): the optimal layouts, as before.
+    static const bool noGeneral = getenv("REGPU_VK_NO_MSAA_GENERAL") && strcmp(getenv("REGPU_VK_NO_MSAA_GENERAL"), "0") != 0;
+    s.vk.general = !depth && desc.samples > VK_SAMPLE_COUNT_1_BIT && !noGeneral;
     CountCreate(depth ? "depth surface" : "colour surface");
     // Starts as a target, as D3D12's did (created in RENDER_TARGET / DEPTH_WRITE), in order with the recorded commands.
     vk::Transition(*C().vkList, s.vk, depth ? vk::Use::DepthTarget : vk::Use::ColorTarget);
@@ -3063,7 +3070,7 @@ void SelectSurfaces(bool force)
     {
         g_zeroedEdramBase = ~0u;
         const float zero[4]{};
-        C().vkList->ClearColor(c.vk.target, c.vk.Extent(), zero, 0, nullptr);
+        C().vkList->ClearColor(c.vk.target, c.vk.Extent(), zero, 0, nullptr, c.vk.general);
     }
     g_drawState.motionTargets = false;
 }
@@ -8657,7 +8664,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, VkF
         bars.Record(*C().vkList);
     }
     VkImageView source = surface->view;
-    VkImageLayout sourceLayout = depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkImageLayout sourceLayout = surface->state.layout; // (GENERAL for a surface kept there: Image::general)
 
     bool ms = g_msaa > 1;
     // REGPU_RESOLVE_TWO_STEP=1 (live, session 33 of the FM3 port): a multisampled colour resolve in two steps: the
@@ -8696,7 +8703,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, VkF
             r.extent.width = std::min(r.extent.width, cd.width - uint32_t(r.srcOffset.x));
             r.extent.height = std::min(r.extent.height, cd.height - uint32_t(r.srcOffset.y));
             if (r.extent.width && r.extent.height)
-                C().vkList->ResolveImage(surface->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_r.resolveScratch->image,
+                C().vkList->ResolveImage(surface->image, surface->state.layout, g_r.resolveScratch->image,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, r);
             vk::Barriers back;
             back.Add(*g_r.resolveScratch, vk::Use::Sampled);
@@ -8944,11 +8951,11 @@ bool ResolveIntoEnclosing(uint32_t base, uint32_t pitch, uint32_t declaredHeight
         vk::PassArgs args;
         if (!PassConstants(args, 0, constants, sizeof(constants)))
             break;
-        args.Image(100, C().vkColor->view);
         vk::Barriers bars;
         bars.Add(*enc.resource, vk::Use::ColorTarget);
         bars.Add(*C().vkColor, vk::Use::Sampled);
         bars.Record(*C().vkList);
+        args.Image(100, C().vkColor->view, C().vkColor->state.layout);
         const bool ms = g_msaa > 1;
         C().vkList->SetTargets(ImageTargets(*enc.resource));
         UsePass(format == VK_FORMAT_R8G8B8A8_UNORM ? (ms ? g_r.colorBlitMs8[g_msaa] : g_r.colorBlit8)
@@ -10680,6 +10687,9 @@ void Resolve()
     }
     if (!noClearExtend && !merged && surfacePitch && uint32_t(rect.right - rect.left) >= std::min<uint32_t>(surfacePitch, FrameW()) && rect.left == 0)
         clearRect.bottom = PassHeight();
+    // (REGPU_GPU_PASSES: the clears after a resolve are timed apart from the copy.)
+    if ((control >> 8) & 3)
+        PassMark("resolve clear %u%u", (control >> 8) & 1, (control >> 9) & 1);
     if ((control >> 8) & 1) // colour clear (ARGB)
     {
         const uint32_t c = gpureg::Get(RB_COLOR_CLEAR);
@@ -10699,7 +10709,7 @@ void Resolve()
                 clearRect.bottom, hostClear.left, hostClear.top, hostClear.right, hostClear.bottom, C().colorBase, gpureg::Get(RB_SURFACE_INFO), int(C().worker));
         const VkRect2D rect = ToVkRect(hostClear);
         if (C().vkColor)
-            C().vkList->ClearColor(C().vkColor->target, C().vkColor->Extent(), color, 1, &rect);
+            C().vkList->ClearColor(C().vkColor->target, C().vkColor->Extent(), color, 1, &rect, C().vkColor->general);
     }
     if ((control >> 9) & 1) // depth/stencil clear: depth 24 bits | stencil 8
     {
@@ -13179,7 +13189,7 @@ void StereoCaptureHud()
         r.srcSubresource = r.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         r.srcOffset = { host.left, host.top, 0 };
         r.extent = { w, h, 1 };
-        C().vkList->ResolveImage(color.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_hudCopy->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, r);
+        C().vkList->ResolveImage(color.image, color.state.layout, g_hudCopy->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, r);
     }
     else
     {
@@ -13187,7 +13197,7 @@ void StereoCaptureHud()
         c.srcSubresource = c.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         c.srcOffset = { host.left, host.top, 0 };
         c.extent = { w, h, 1 };
-        C().vkList->CopyImage(color.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_hudCopy->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        C().vkList->CopyImage(color.image, color.state.layout, g_hudCopy->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     }
     vk::Barriers back;
     back.Add(color, vk::Use::ColorTarget);
@@ -15307,7 +15317,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             ClearColor(lc.colorFormat, lc.colorLo, lc.colorHi, color);
             TransitionColor(vk::Use::ColorTarget);
             const VkRect2D rect = ToVkRect(rows);
-            C().vkList->ClearColor(C().vkColor->target, C().vkColor->Extent(), color, 1, &rect);
+            C().vkList->ClearColor(C().vkColor->target, C().vkColor->Extent(), color, 1, &rect, C().vkColor->general);
         }
         if (lc.depth)
         {
@@ -15367,7 +15377,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (clearBefore)
     {
         const VkRect2D r = ToVkRect(hostScissor);
-        C().vkList->ClearColor(C().vkColor->target, C().vkColor->Extent(), clearColour, 1, &r);
+        C().vkList->ClearColor(C().vkColor->target, C().vkColor->Extent(), clearColour, 1, &r, C().vkColor->general);
     }
     // The EDRAM is one memory: a depth-only draw (mode 5) writing depth and stencil FF at the colour
     // surface's own base leaves its tiles reading white as colour. FH1 starts its night light buffer
@@ -15381,7 +15391,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         {
             const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
             const VkRect2D r = ToVkRect(hostScissor);
-            C().vkList->ClearColor(C().vkColor->target, C().vkColor->Extent(), white, 1, &r);
+            C().vkList->ClearColor(C().vkColor->target, C().vkColor->Extent(), white, 1, &r, C().vkColor->general);
         }
     }
     {

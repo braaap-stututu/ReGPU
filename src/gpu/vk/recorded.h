@@ -75,10 +75,12 @@ struct Targets
     bool depthHasStencil = false;
     bool depthReadOnly = false;         // DEPTH_STENCIL_READ_ONLY_OPTIMAL instead of ATTACHMENT_OPTIMAL
     VkExtent2D extent{};                // the render area (the attachments' smallest size)
+    uint32_t generalColor = 0;          // colour attachments in GENERAL (bit per index: Image::general), not ATTACHMENT_OPTIMAL
 
     bool operator==(const Targets& o) const
     {
         if (colorCount != o.colorCount || depth != o.depth || depthHasStencil != o.depthHasStencil || depthReadOnly != o.depthReadOnly ||
+            generalColor != o.generalColor ||
             extent.width != o.extent.width || extent.height != o.extent.height)
             return false;
         for (uint32_t i = 0; i < colorCount; i++)
@@ -172,9 +174,11 @@ public:
     // Clears a colour image's rectangles (rect count 0: the whole render area). The image must be bound as target
     // `index` of the current targets (D3D12's ClearRenderTargetView on a bound RTV), or `view` with `extent` when not:
     // the replay then clears it in a render pass of its own.
-    void ClearColor(VkImageView view, VkExtent2D extent, const float c[4], uint32_t rectCount, const VkRect2D* rects)
+    // (general: the image is kept in GENERAL, Image::general.)
+    void ClearColor(VkImageView view, VkExtent2D extent, const float c[4], uint32_t rectCount, const VkRect2D* rects, bool general = false)
     {
-        struct A { VkImageView view; VkExtent2D extent; float c[4]; uint32_t n; } a{ view, extent, { c[0], c[1], c[2], c[3] }, rectCount };
+        struct A { VkImageView view; VkExtent2D extent; float c[4]; uint32_t n, general; } a{ view, extent, { c[0], c[1], c[2], c[3] }, rectCount,
+            general };
         Put(kClearColor, &a, sizeof(a), rects, sizeof(*rects) * rectCount);
     }
     void ClearDepthStencil(VkImageView view, VkExtent2D extent, bool hasStencil, VkImageAspectFlags aspects, float depth, uint8_t stencil,
@@ -425,7 +429,7 @@ private:
         {
             color[i] = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
             color[i].imageView = t.color[i];
-            color[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            color[i].imageLayout = (t.generalColor >> i) & 1 ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             color[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         }
@@ -476,7 +480,7 @@ private:
     // Clears rectangles of one attachment: inside the current rendering when it is one of the targets, else in a
     // render pass of its own.
     void ClearAttachment(VkCommandBuffer cb, VkImageView view, VkExtent2D extent, const VkClearAttachment& clear, uint32_t n, const VkRect2D* rects,
-        bool depth, bool hasStencil)
+        bool depth, bool hasStencil, bool general = false)
     {
         int bound = -1;
         if (m_targetsSet)
@@ -508,6 +512,7 @@ private:
             {
                 own.colorCount = 1;
                 own.color[0] = view;
+                own.generalColor = general ? 1u : 0u;
                 c.colorAttachment = 0;
             }
             own.extent = extent;
@@ -567,11 +572,11 @@ private:
             }
             case kClearColor:
             {
-                struct A { VkImageView view; VkExtent2D extent; float c[4]; uint32_t n; };
+                struct A { VkImageView view; VkExtent2D extent; float c[4]; uint32_t n, general; };
                 const A& c = At<A>(a);
                 VkClearAttachment clear{ VK_IMAGE_ASPECT_COLOR_BIT, 0, {} };
                 memcpy(clear.clearValue.color.float32, c.c, sizeof(c.c));
-                ClearAttachment(cb, c.view, c.extent, clear, c.n, reinterpret_cast<const VkRect2D*>(a + sizeof(A)), false, false);
+                ClearAttachment(cb, c.view, c.extent, clear, c.n, reinterpret_cast<const VkRect2D*>(a + sizeof(A)), false, false, c.general != 0);
                 break;
             }
             case kClearDepth:
