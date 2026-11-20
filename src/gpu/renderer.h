@@ -16,10 +16,10 @@ void RendererSetStereoEye(float clipX);
 // The second eye's pass runs: resolves are not written back to guest memory (the first pass did).
 void RendererSetStereoReplay(bool on);
 void RendererStereoCaptureEye(int eye, uint32_t frontBuffer);
-// Triple screen (REGPU_TRIPLE, gpu.cpp stereo::): this pass's view (turn about the eye in radians, k = the game's wide
-// projection over this screen's, P00 of this screen's projection; k 0 = off) and whether it is a side screen (no HUD);
-// the pass's front buffer into screen `slot` (0 left, 1 centre, 2 right) of the triple-wide picture.
-void RendererSetTripleView(float angle, float k, float p00, bool side);
+// Triple screen (REGPU_TRIPLE, gpu.cpp stereo::): this pass's view (regpu::triple::View's a b c d e; null = off) and
+// whether it is a side screen (no HUD); the pass's front buffer into screen `slot` (0 left, 1 centre, 2 right) of the
+// triple-wide picture.
+void RendererSetTripleView(const float* view, bool side);
 void RendererTripleCapture(int slot, uint32_t frontBuffer);
 bool TripleMode();
 // Lookahead hooks (see GpuLookahead): shader loads and draws the command processor has

@@ -431,7 +431,7 @@ bool WidePass() { return (gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF) ==
 float g_stereoClipX = 0.0f;
 bool g_stereoReplay = false; // the second eye's pass (no write-backs to guest memory)
 // Triple screen (FM3 port, session 39): the pass's view (RendererSetTripleView) and the triple-wide picture.
-float g_tripleAngle = 0.0f, g_tripleK = 0.0f, g_tripleP00 = 0.0f;
+float g_tripleView[5] = {}; // a b c d e of this pass (RendererSetTripleView), e 0 = off
 bool g_tripleSide = false;
 bool g_tripleReady = false; // all three screens captured this frame (the swap shows g_tripleImage)
 ComPtr<ID3D12Resource> g_tripleImage, g_tripleScreen[3];
@@ -13362,12 +13362,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // VR stereo: this eye's clip-space x offset for the main view's perspective geometry (hlsl.cpp; RendererSetStereoEye).
     vc->vdepth[1] = WidePass() ? g_stereoClipX : 0.0f;
     vc->vdepth[2] = vc->vdepth[3] = 0;
-    // Triple screen: the pass's turn (y), k (z, 0 = no turn: outside the main view) and the screen's P00 (w) (hlsl.cpp).
-    if (g_tripleK != 0.0f && WidePass())
+    // Triple screen: the pass's view (hlsl.cpp): vtriple = a b c d (in vjitter's place: triple mode has no motion
+    // variants), vdepth.z = e, vdepth.w = 1 (on: the main view only).
+    if (g_tripleView[4] != 0.0f && WidePass())
     {
-        vc->vdepth[1] = g_tripleAngle;
-        vc->vdepth[2] = g_tripleK;
-        vc->vdepth[3] = g_tripleP00;
+        memcpy(vc->vjitter, g_tripleView, sizeof(float) * 4);
+        vc->vdepth[2] = g_tripleView[4];
+        vc->vdepth[3] = 1.0f;
     }
     // Viewport transform in the vertex shader (see hlsl.cpp).
     vc->vscale[0] = RegFloat(PA_CL_VPORT_XSCALE);
@@ -14987,9 +14988,11 @@ bool TripleMode()
     return on;
 }
 
-void RendererSetTripleView(float angle, float k, float p00, bool side)
+void RendererSetTripleView(const float* view, bool side)
 {
-    g_tripleAngle = angle, g_tripleK = k, g_tripleP00 = p00, g_tripleSide = side;
+    for (int i = 0; i < 5; i++)
+        g_tripleView[i] = view ? view[i] : 0.0f;
+    g_tripleSide = side;
 }
 
 // A pass's front buffer, graded as the presenter grades, into screen `slot` of the triple-wide picture (COPY_SOURCE

@@ -675,10 +675,11 @@ bool Mode()
     }();
     return on;
 }
-// Triple screen (regpu::triple::SubmitFrame): the newest frame's fields of view and turn, and when they came.
-std::atomic<float> g_tripleGameFov{ 0 }, g_tripleScreenFov{ 0 }, g_tripleAngleIn{ 0 };
-std::atomic<int64_t> g_tripleAt{ 0 };
-float g_tripleK = 0, g_tripleP00 = 0, g_tripleTurn = 0; // this frame's (BeforeDraw)
+// Triple screen (regpu::triple::SubmitViews): the newest views and when they came; this frame's (BeforeDraw).
+std::mutex g_tripleMutex;
+regpu::triple::View g_tripleIn[3];
+int64_t g_tripleAt = 0; // (g_tripleMutex)
+float g_tripleViews[3][5] = {};
 bool g_checked = false; // this frame's first main-view draw seen (and the frame's choice made)
 bool g_armed = false;   // recording this frame for the second eye
 float g_clip = 0;       // P00 * half the eye distance: the left eye's clip x offset (the right eye's negated)
@@ -710,23 +711,30 @@ void BeforeDraw()
     {
         // A frame whose camera reported its fields of view in the last 100 ms (else drawn once, untouched).
         const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
-        const float gameFov = g_tripleGameFov.load(), screenFov = g_tripleScreenFov.load();
-        if (now - g_tripleAt.load() > 100 || gameFov <= 0.1f || gameFov >= 3.1f || screenFov <= 0.05f || screenFov > gameFov)
         {
-            RendererSetTripleView(0, 0, 0, false);
-            return;
+            std::lock_guard lock(g_tripleMutex);
+            if (now - g_tripleAt > 100 || g_tripleIn[1].e == 0.0f)
+            {
+                RendererSetTripleView(nullptr, false);
+                return;
+            }
+            // REGPU_TRIPLE_FLIP: a title whose clip x is mirrored (FM3 draws its scene turned 180 degrees): the views
+            // taken in the mirrored convention (b and c change sign).
+            static LiveSwitch flip("REGPU_TRIPLE_FLIP");
+            const float f = flip ? -1.0f : 1.0f;
+            for (int i = 0; i < 3; i++)
+            {
+                const regpu::triple::View& v = g_tripleIn[i];
+                const float out[5] = { v.a, v.b * f, v.c * f, v.d, v.e };
+                memcpy(g_tripleViews[i], out, sizeof(out));
+            }
         }
-        static LiveSwitch flip("REGPU_TRIPLE_FLIP");
-        const float ts = tanf(screenFov * 0.5f);
-        g_tripleK = tanf(gameFov * 0.5f) / ts;
-        g_tripleP00 = 1.0f / (ts * (16.0f / 9.0f));
-        g_tripleTurn = g_tripleAngleIn.load() * (flip ? -1.0f : 1.0f);
         g_startFile = work::g_file;
         for (int t = 0; t < 2; t++)
             g_startShader[t] = g_shader[t], g_startShaderAddress[t] = g_shaderAddress[t];
         g_log.clear();
         g_armed = true;
-        RendererSetTripleView(0, g_tripleK, g_tripleP00, false); // the game's own pass: the centre screen
+        RendererSetTripleView(g_tripleViews[1], false); // the game's own pass: the centre screen
         return;
     }
     float p00 = 0, half = 0;
@@ -804,17 +812,16 @@ void TripleAtSwap(uint32_t frontBuffer)
     if (!centreOnly)
         for (int side : { 0, 2 })
         {
-            RendererSetTripleView(side == 0 ? -g_tripleTurn : g_tripleTurn, g_tripleK, g_tripleP00, true);
+            RendererSetTripleView(g_tripleViews[side], true);
             Replay();
             RendererTripleCapture(side, frontBuffer);
         }
-    RendererSetTripleView(0, 0, 0, false);
+    RendererSetTripleView(nullptr, false);
     memcpy(work::g_file.data(), g_endFile.data(), g_endFile.size());
     g_frames++;
     g_words += g_log.size();
     if (g_frames == 1 || g_frames % 3600 == 0)
-        Log("triple: frame %llu: %zu KB of records drawn again for each side screen (k %.3f, turn %.1f deg)", (unsigned long long)g_frames,
-            g_log.size() * 4 / 1024, g_tripleK, g_tripleTurn * 57.2958f);
+        Log("triple: frame %llu: %zu KB of records drawn again for each side screen", (unsigned long long)g_frames, g_log.size() * 4 / 1024);
 }
 
 // At the swap, before the frame is presented: the second eye.
@@ -826,7 +833,7 @@ void AtSwap(uint32_t frontBuffer)
     if (!armed)
     {
         RendererSetStereoEye(0);
-        RendererSetTripleView(0, 0, 0, false);
+        RendererSetTripleView(nullptr, false);
         return;
     }
     if (TripleMode())
@@ -2187,11 +2194,11 @@ void PaceSwap(uint64_t frame)
 // (For the presenter's pacing, render/presenter.cpp.)
 uint32_t RegpuFrameCap() { return FrameCap(); }
 
-void regpu::triple::SubmitFrame(float gameFovY, float screenFovY, float angle)
+void regpu::triple::SubmitViews(const View (&views)[3])
 {
-    stereo::g_tripleGameFov = gameFovY;
-    stereo::g_tripleScreenFov = screenFovY;
-    stereo::g_tripleAngleIn = angle;
+    std::lock_guard lock(stereo::g_tripleMutex);
+    for (int i = 0; i < 3; i++)
+        stereo::g_tripleIn[i] = views[i];
     stereo::g_tripleAt = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
 }
 
