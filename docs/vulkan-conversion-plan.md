@@ -185,8 +185,12 @@ measurements are FM2's, at 1080p. FM2's environment variable names are `FM2_*`; 
   lock (`Device::queueLock`), where a D3D12 queue was free-threaded.
 - **Queries:** `RecordedList` begins and ends occlusion queries outside rendering, so a query can span target changes.
   That costs a render pass break per query; measure it once the game runs.
-- **Validation layer:** not installed on this machine (it comes with the LunarG Vulkan SDK). Nothing has run under it
-  yet.
+- **Validation layer:** the LunarG Vulkan SDK 1.4.363.1 is installed on the user's PC.
+  - `REGPU_VK_VALIDATION=1` turns on the layer, `2` adds synchronization validation. Messages go to `regpu.log`.
+  - Both tests run clean at both levels.
+- **Barriers into attachment layouts:** render passes always load and store their targets, so a barrier into an
+  attachment layout must cover reads as well as writes. Use `vk::kColorTargetAccess` and `vk::kDepthTargetAccess`.
+  Synchronization validation caught this on its first run.
 
 **Step 4, resources:**
 - Committed and placed resources, and the texture heaps, become VMA allocations.
