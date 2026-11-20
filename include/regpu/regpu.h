@@ -25,7 +25,8 @@ struct Config
     uint32_t msaa = 1;                   // samples per pixel: 1 (off), 2, 4 or 8
     // Upscaling: the 3D scene renders smaller and is upscaled before post-processing and the
     // HUD, which stay at full resolution. Fsr3 and Dlss need REGPU_FSR3 / REGPU_DLSS builds.
-    enum class Upscaler : uint32_t { Off, Fsr1, Fsr3, Dlss, Fsr4 }; // Fsr4: FSR 4 where the GPU offers it (RDNA 4), else FSR 3
+    // Fsr4: FSR 4 where the GPU offers it (RDNA 4), else FSR 3. Xess: Intel XeSS (libxess.dll beside the exe), else FSR 1.
+    enum class Upscaler : uint32_t { Off, Fsr1, Fsr3, Dlss, Fsr4, Xess };
     Upscaler upscaler = Upscaler::Off;
     uint32_t quality = 1;   // 0 native (anti-aliasing only), 1 quality, 2 balanced, 3 performance, 4 ultra performance
     float sharpness = 0.5f; // 0-1
