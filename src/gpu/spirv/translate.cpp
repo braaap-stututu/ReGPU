@@ -598,8 +598,23 @@ struct Translator
                     uint32_t uu = SelF(UBit(info, 18), b.Ext(tF, GLSLstd450FClamp, { u, hx, FSub(F(1), hx) }), u);
                     uint32_t vv = SelF(UBit(info, 19), b.Ext(tF, GLSLstd450FClamp, { v, hy, FSub(F(1), hy) }), v);
                     const uint32_t sub = FGt(Comp(tb, 2), F(0));
-                    uu = SelF(sub, FMulS(uu, Comp(tb, 2)), uu);
-                    vv = SelF(sub, FMulS(vv, Comp(tb, 3)), vv);
+                    if (options.fetchBranches)
+                    {
+                        const uint32_t su = b.Variable(pFnF), sv = b.Variable(pFnF);
+                        Store(su, uu);
+                        Store(sv, vv);
+                        b.If(sub, [&] {
+                            Store(su, FMulS(Load(tF, su), Comp(tb, 2)));
+                            Store(sv, FMulS(Load(tF, sv), Comp(tb, 3)));
+                        }, {}, spv::SelectionControlDontFlattenMask);
+                        uu = Load(tF, su);
+                        vv = Load(tF, sv);
+                    }
+                    else
+                    {
+                        uu = SelF(sub, FMulS(uu, Comp(tb, 2)), uu);
+                        vv = SelF(sub, FMulS(vv, Comp(tb, 3)), vv);
+                    }
                     // FetchMode: the constant's mode, its filter replaced by the instruction's.
                     uint32_t mode = UBits(info, 0, 3);
                     if (filt == 0 || filt == 1)
@@ -638,24 +653,34 @@ struct Translator
                 });
             });
         });
-        // TFetch: the 16-bit fixed conversion (not of the border colour), gamma, exponent, the constant's swizzle.
-        uint32_t t = Load(tV4, result);
-        t = b.Op(spv::OpSelect, tV4, { Splat4B(Load(tB, border)), t, Fixed16(t, info) });
+        // TFetch: the 16-bit fixed conversion (not of the border colour), gamma, exponent, the constant's swizzle. Each
+        // behind a branch on its (uniform) condition, as the HLSL is: computed and selected, every step's values stayed
+        // live and the pixel shaders took ~20% more vector registers (RDNA2's occupancy, the 9800X3D's graphics).
+        b.If(And(UBit(info, 6), Not(Load(tB, border))), [&] { Store(result, Fixed16(Load(tV4, result), info)); });
         const uint32_t gamma = UBits(info, 24, 15);
-        uint32_t c[4];
-        for (uint32_t i = 0; i < 4; i++)
-            c[i] = SelF(UBit(gamma, i), PwlGammaToLinear(Comp(t, i)), Comp(t, i));
-        t = Vec4(c[0], c[1], c[2], c[3]);
+        b.If(Bin(spv::OpINotEqual, tB, gamma, U(0)), [&] {
+            const uint32_t t = Load(tV4, result);
+            uint32_t c[4];
+            for (uint32_t i = 0; i < 4; i++)
+                c[i] = SelF(UBit(gamma, i), PwlGammaToLinear(Comp(t, i)), Comp(t, i));
+            Store(result, Vec4(c[0], c[1], c[2], c[3]));
+        });
         const uint32_t expAdjust = Bin(spv::OpShiftRightArithmetic, tI, b.Op(spv::OpBitcast, tI, { Bin(spv::OpShiftLeftLogical, tU, info, U(18)) }), I(26));
-        t = b.Op(spv::OpVectorTimesScalar, tV4, { t, b.Ext(tF, GLSLstd450Exp2, { b.Op(spv::OpConvertSToF, tF, { expAdjust }) }) });
-        for (uint32_t i = 0; i < 4; i++)
-        {
-            const uint32_t sel = UBits(w, 8 + 3 * i, 7);
-            const uint32_t picked = b.Op(spv::OpVectorExtractDynamic, tF, { t, b.Ext(tU, GLSLstd450UMin, { sel, U(3) }) });
-            c[i] = SelF(Bin(spv::OpULessThan, tB, sel, U(4)), picked, SelF(UEq(sel, 5), F(1), F(0)));
-        }
-        const uint32_t swizzled = Vec4(c[0], c[1], c[2], c[3]);
-        return b.Op(spv::OpSelect, tV4, { Splat4B(UBit(w, 31)), swizzled, t });
+        b.If(Bin(spv::OpINotEqual, tB, expAdjust, I(0)), [&] {
+            Store(result, b.Op(spv::OpVectorTimesScalar, tV4, { Load(tV4, result), b.Ext(tF, GLSLstd450Exp2, { b.Op(spv::OpConvertSToF, tF, { expAdjust }) }) }));
+        });
+        b.If(UBit(w, 31), [&] {
+            const uint32_t t = Load(tV4, result);
+            uint32_t c[4];
+            for (uint32_t i = 0; i < 4; i++)
+            {
+                const uint32_t sel = UBits(w, 8 + 3 * i, 7);
+                const uint32_t picked = b.Op(spv::OpVectorExtractDynamic, tF, { t, b.Ext(tU, GLSLstd450UMin, { sel, U(3) }) });
+                c[i] = SelF(Bin(spv::OpULessThan, tB, sel, U(4)), picked, SelF(UEq(sel, 5), F(1), F(0)));
+            }
+            Store(result, Vec4(c[0], c[1], c[2], c[3]));
+        });
+        return Load(tV4, result);
     }
 
     // FetchVariant's TFetchPlain: the constant's sampler (its filter replaced by the instruction's), the coordinates and

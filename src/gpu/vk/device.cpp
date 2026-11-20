@@ -413,6 +413,8 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     const bool derivativesKhr = optional(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     const bool derivativesNv = !derivativesKhr && optional(VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     d.mutableDescriptors = optional(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+    // (A debugging aid: drivers may keep more about each pipeline with it.)
+    d.shaderInfo = getenv("REGPU_SHADER_STATS") && optional(VK_AMD_SHADER_INFO_EXTENSION_NAME);
     // NVIDIA's NGX (DLSS on Vulkan, dlss.cpp) needs these two where the driver has them.
     d.ngx = optional("VK_NVX_binary_import") && optional("VK_NVX_image_view_handle");
 

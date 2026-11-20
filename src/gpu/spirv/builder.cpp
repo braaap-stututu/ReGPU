@@ -267,12 +267,12 @@ void Builder::Kill()
     terminated_ = true;
 }
 
-void Builder::If(uint32_t cond, const std::function<void()>& then, const std::function<void()>& otherwise)
+void Builder::If(uint32_t cond, const std::function<void()>& then, const std::function<void()>& otherwise, spv::SelectionControlMask control)
 {
     if (terminated_)
         Label(Id());
     const uint32_t thenLabel = Id(), merge = Id(), elseLabel = otherwise ? Id() : merge;
-    Emit(fnBody_, spv::OpSelectionMerge, { merge, uint32_t(spv::SelectionControlMaskNone) });
+    Emit(fnBody_, spv::OpSelectionMerge, { merge, uint32_t(control) });
     Emit(fnBody_, spv::OpBranchConditional, { cond, thenLabel, elseLabel });
     terminated_ = true;
     Label(thenLabel);

@@ -6006,7 +6006,10 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
         const auto start = std::chrono::steady_clock::now();
         std::vector<uint32_t> words;
         std::string why;
-        if (TranslateSpirv(parsed, cs.info, words, why))
+        bool DirectFetchBranches();
+        SpirvOptions options;
+        options.fetchBranches = DirectFetchBranches();
+        if (TranslateSpirv(parsed, cs.info, words, why, options))
         {
             auto code = std::make_shared<SpirvCode>();
             code->words = std::move(words);
@@ -6203,6 +6206,17 @@ std::string NoKillVariant(const std::string& hlsl)
 
 // A direct shader's variant (REGPU_SPIRV_DIRECT): translated again from the microcode with the variant's options, as
 // the HLSL path edits its text (~1 ms, so here, not on a compile worker). False: the variant takes the HLSL path.
+// REGPU_SPIRV_FETCH_BRANCHES=0|1 (start-time): SpirvOptions::fetchBranches; unset: on for integrated GPUs (whose vector
+// registers the direct shaders' batched samples cost occupancy), off for discrete ones.
+bool DirectFetchBranches()
+{
+    static const bool on = [] {
+        if (const char* v = getenv("REGPU_SPIRV_FETCH_BRANCHES"); v && *v)
+            return strcmp(v, "0") != 0;
+        return g_r.vkd && g_r.vkd->uma;
+    }();
+    return on;
+}
 bool DirectVariant(const CompiledShader& base, const SpirvOptions& options, CompiledShader& cs, uint64_t seed)
 {
     if (!base.direct || base.ucodeBE.empty())
@@ -6210,7 +6224,9 @@ bool DirectVariant(const CompiledShader& base, const SpirvOptions& options, Comp
     const ucode::Shader parsed = ucode::Parse(base.ucodeBE.data(), uint32_t(base.ucodeBE.size()), true);
     std::vector<uint32_t> words;
     std::string why;
-    if (!TranslateSpirv(parsed, base.info, words, why, options))
+    SpirvOptions o = options;
+    o.fetchBranches = DirectFetchBranches();
+    if (!TranslateSpirv(parsed, base.info, words, why, o))
     {
         LOG_ONCE("spirv direct: a variant of ps %016llx takes the HLSL path: %s", (unsigned long long)base.hash, why.c_str());
         return false;

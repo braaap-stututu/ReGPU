@@ -76,7 +76,8 @@ public:
     void Kill(); // OpKill (fragment)
     void BranchConditional(uint32_t cond, uint32_t t, uint32_t f);
     // if (cond) then() [else otherwise()]: a structured selection; the bodies may nest more.
-    void If(uint32_t cond, const std::function<void()>& then, const std::function<void()>& otherwise = {});
+    void If(uint32_t cond, const std::function<void()>& then, const std::function<void()>& otherwise = {},
+        spv::SelectionControlMask control = spv::SelectionControlMaskNone);
 
     std::vector<uint32_t> Finish();
 

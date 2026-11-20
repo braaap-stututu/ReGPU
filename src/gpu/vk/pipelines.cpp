@@ -1,5 +1,10 @@
 #include "gpu/vk/pipelines.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
 #include "log.h"
 
 namespace vk
@@ -132,6 +137,46 @@ VkPipeline CreateGraphicsPipeline(Device& d, const PipelineDesc& p, const char* 
     }
     if (name)
         SetName(d, VK_OBJECT_TYPE_PIPELINE, uint64_t(pipeline), name);
+    // REGPU_SHADER_STATS=1 (AMD, VK_AMD_shader_info): each stage's registers, scratch and code size, to compare shader
+    // translations (gpu/spirv against HLSL): "shader stats: <name> vs vgpr V sgpr S scratch B isa N | ps ...".
+    if (d.shaderInfo && vkGetShaderInfoAMD)
+    {
+        std::string line;
+        for (const VkShaderStageFlagBits stage : { VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT })
+        {
+            VkShaderStatisticsInfoAMD st{};
+            size_t size = sizeof(st);
+            if (vkGetShaderInfoAMD(d.device, pipeline, stage, VK_SHADER_INFO_TYPE_STATISTICS_AMD, &size, &st) != VK_SUCCESS)
+                continue;
+            size_t isa = 0;
+            vkGetShaderInfoAMD(d.device, pipeline, stage, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &isa, nullptr);
+            char part[160];
+            snprintf(part, sizeof(part), "%s%s vgpr %u sgpr %u scratch %zu isa %zu", line.empty() ? "" : " | ", stage == VK_SHADER_STAGE_VERTEX_BIT ? "vs" : "ps",
+                st.resourceUsage.numUsedVgprs, st.resourceUsage.numUsedSgprs, st.resourceUsage.scratchMemUsageInBytes, isa);
+            line += part;
+        }
+        Log("shader stats: %s %s", name ? name : "?", line.c_str());
+        // REGPU_SHADER_ISA=<part of a pipeline name>: its pixel shader's disassembly to out/isa/<name>.txt.
+        static const char* isaWant = getenv("REGPU_SHADER_ISA");
+        if (isaWant && name && strstr(name, isaWant))
+        {
+            size_t size = 0;
+            if (vkGetShaderInfoAMD(d.device, pipeline, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &size, nullptr) == VK_SUCCESS && size)
+            {
+                std::string text(size, ' ');
+                vkGetShaderInfoAMD(d.device, pipeline, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &size, text.data());
+                std::string file = std::string("out/isa_") + name + ".txt";
+                for (char& ch : file)
+                    if (ch == '/')
+                        ch = '_';
+                if (FILE* f = fopen(file.c_str(), "wb"))
+                {
+                    fwrite(text.data(), 1, strlen(text.c_str()), f);
+                    fclose(f);
+                }
+            }
+        }
+    }
     return pipeline;
 }
 

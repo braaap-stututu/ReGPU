@@ -33,6 +33,10 @@ struct SpirvOptions
     bool noAlphaTest = false;
     uint32_t plainFetchMask = 0;
     std::vector<SpirvFetchSpec> specs;
+    // A 2D fetch's sub-image scale (tbias.z) behind a branch, as the HLSL has it: each fetch its own block, so the driver
+    // doesn't issue a shader's samples together (faster where vector registers are plenty: the RX 7900 XTX's 4K race
+    // +4%; on RDNA2 graphics their registers cost occupancy: the 9800X3D's ~4% slower). The renderer's choice per GPU.
+    bool fetchBranches = false;
 };
 
 // hlslInfo: the HLSL path's result for the same shader (TranslateShader, after the renderer's PackConstants): its
