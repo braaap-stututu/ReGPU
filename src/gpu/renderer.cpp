@@ -58,6 +58,12 @@
 #include "gpu/shader_scan.h"
 #include "gpu/resolve_pack.h"
 
+// REGPU_DXC (dxc.cpp, global): DXIL from DXC instead of FXC's DXBC, cached apart (.dxil).
+bool DxcEnabled();
+bool DxcFor(bool pixel); // (both stages or neither: D3D12 refuses mixed DXBC/DXIL pipelines)
+HRESULT DxcCompileShader(const std::string& hlsl, bool pixel, ID3DBlob** code, std::string* errors);
+std::string DxcCacheTag(); // "-<hash of REGPU_DXC_ARGS>" or ""
+
 using Microsoft::WRL::ComPtr;
 
 
@@ -4167,10 +4173,13 @@ uint32_t g_drawnPipelines = 0, g_drawnUnseeded = 0, g_drawnUnprepared = 0;
 // session keeps the bytecode its pipelines were built from.
 const bool g_optimizeShaders = getenv("REGPU_OPTIMIZE_SHADERS") != nullptr;
 
-std::filesystem::path ShaderCachePath(uint64_t key, bool optimized = false)
+std::filesystem::path ShaderCachePath(uint64_t key, bool optimized, bool pixel)
 {
-    char name[40];
-    snprintf(name, sizeof(name), optimized ? "%016llx.o.dxbc" : "%016llx.dxbc", (unsigned long long)key);
+    char name[48];
+    if (DxcFor(pixel))
+        snprintf(name, sizeof(name), "%016llx%s.dxil", (unsigned long long)key, DxcCacheTag().c_str());
+    else
+        snprintf(name, sizeof(name), optimized ? "%016llx.o.dxbc" : "%016llx.dxbc", (unsigned long long)key);
     return RegpuUserDir() / "shadercache" / name;
 }
 
@@ -4226,7 +4235,7 @@ struct ShaderOptimizer
                     &code, &errors)))
                 continue; // the unoptimised build stays
             // Written under a temporary name: a run that reads it never sees half a file.
-            const auto path = ShaderCachePath(job.key, true);
+            const auto path = ShaderCachePath(job.key, true, job.pixel);
             auto tmp = path;
             tmp += ".tmp";
             std::ofstream(tmp, std::ios::binary).write(static_cast<const char*>(code->GetBufferPointer()), std::streamsize(code->GetBufferSize()));
@@ -4244,9 +4253,9 @@ bool LoadCachedBytecode(CompiledShader& cs)
 {
     for (const bool optimized : { true, false })
     {
-        if (optimized && !g_optimizeShaders)
+        if (optimized && (!g_optimizeShaders || DxcFor(cs.pixel))) // (DXC: one build, already optimised)
             continue;
-        std::ifstream in{ ShaderCachePath(cs.cacheKey, optimized), std::ios::binary | std::ios::ate };
+        std::ifstream in{ ShaderCachePath(cs.cacheKey, optimized, cs.pixel), std::ios::binary | std::ios::ate };
         if (!in)
             continue;
         const auto size = size_t(in.tellg());
@@ -4254,7 +4263,7 @@ bool LoadCachedBytecode(CompiledShader& cs)
             continue;
         in.seekg(0);
         in.read(static_cast<char*>(cs.code->GetBufferPointer()), std::streamsize(size));
-        if (!optimized && g_optimizeShaders)
+        if (!optimized && g_optimizeShaders && !DxcFor(cs.pixel))
             g_optimizer.Push(cs.cacheKey, cs.pixel, cs.info.hlsl);
         return true;
     }
@@ -4369,22 +4378,24 @@ struct ShaderCompiler
         // The translated source picks its sampling form per stage (see hlsl.cpp: a vertex
         // shader cannot sample with an implicit LOD).
         const D3D_SHADER_MACRO vertexStage[] = { { "REGPU_VERTEX_STAGE", "1" }, { nullptr, nullptr } };
-        const HRESULT hr = D3DCompile(cs.info.hlsl.data(), cs.info.hlsl.size(), nullptr, cs.pixel ? nullptr : vertexStage, nullptr, "main",
-            cs.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &cs.code, &errors);
+        std::string dxcErrors;
+        const HRESULT hr = DxcFor(cs.pixel) ? DxcCompileShader(cs.info.hlsl, cs.pixel, &cs.code, &dxcErrors)
+            : D3DCompile(cs.info.hlsl.data(), cs.info.hlsl.size(), nullptr, cs.pixel ? nullptr : vertexStage, nullptr, "main",
+                  cs.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &cs.code, &errors);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         if (FAILED(hr))
         {
             Log("renderer: %s %016llx failed to compile:\n%s", cs.pixel ? "ps" : "vs", (unsigned long long)cs.hash,
-                errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+                !dxcErrors.empty() ? dxcErrors.c_str() : errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
             cs.state.store(CompiledShader::Failed, std::memory_order_release);
             return;
         }
         g_stats.shadersBuilt++;
         if (ms > 200)
             Log("renderer: %s %016llx compiled in %.0f ms (background)", cs.pixel ? "ps" : "vs", (unsigned long long)cs.hash, ms);
-        std::ofstream(ShaderCachePath(cs.cacheKey), std::ios::binary)
+        std::ofstream(ShaderCachePath(cs.cacheKey, false, cs.pixel), std::ios::binary)
             .write(static_cast<const char*>(cs.code->GetBufferPointer()), std::streamsize(cs.code->GetBufferSize()));
-        if (g_optimizeShaders)
+        if (g_optimizeShaders && !DxcFor(cs.pixel))
             g_optimizer.Push(cs.cacheKey, cs.pixel, cs.info.hlsl);
         cs.state.store(CompiledShader::Ready, std::memory_order_release);
     }
@@ -5352,6 +5363,9 @@ struct PipelineLibrary
                 path = RegpuUserDir() / name;
             }
         }
+        // DXIL pipelines in their own library (REGPU_DXC): pipelines-dxil.bin, pipelines-dxil-<vendor>-<device>.bin.
+        if (DxcEnabled())
+            path = RegpuUserDir() / ("pipelines-dxil" + DxcCacheTag() + path.filename().string().substr(9));
         if (std::ifstream in{ Path(), std::ios::binary | std::ios::ate })
         {
             loaded.resize(size_t(in.tellg()));
