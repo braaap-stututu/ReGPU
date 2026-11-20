@@ -106,7 +106,7 @@ Fsr3Context* ContextFor(ID3D12Device* device, const DlssSetup& setup)
     {
         static bool logged = false;
         if (!logged)
-            Log("fsr: FSR 4 is not offered on this GPU (RDNA 4 / RX 9000 series): FSR 3 instead");
+            Log("fsr: FSR 4 is not offered on this GPU by its driver (RDNA 4; RDNA 3 with recent drivers, INT8): FSR 3 instead");
         logged = true;
         version = g_fsr3.fsr3Version;
         versionName = g_fsr3.fsr3Name.c_str();
