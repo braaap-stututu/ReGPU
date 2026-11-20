@@ -7824,6 +7824,8 @@ void UmaReady(ID3D12Resource* r)
     C().list->ResourceBarrier(1, &b);
 }
 
+namespace texjobs { void Copy(const TextureFetch& fetch, uint8_t* dst, uint32_t rowPitch); } // (below, by SubmitLists)
+
 ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format, bool& native)
 {
     TextureScope textureScope;
@@ -8030,7 +8032,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
                 NoteTextureFailure("upload ring full (compressed)", fetch);
                 return nullptr;
             }
-            CopyTextureBlocks(levels[l], Frame().ringCpu + offset, rowPitch);
+            texjobs::Copy(levels[l], Frame().ringCpu + offset, rowPitch);
             D3D12_TEXTURE_COPY_LOCATION dst{};
             dst.pResource = cached.resource.Get();
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -12347,6 +12349,75 @@ void ListPrologue(RecordedList& list)
     list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 }
 
+// Block-compressed texture levels copied into the upload ring on helper threads (PGR3 port, session 5): a track
+// streaming in 50-150 new DXT textures in one frame untiled and byte-swapped them one after another on the draw thread
+// (1-2.5 ms: most of the 5-8 ms frames left in PGR3's races). The copy command is recorded at once and the helpers
+// write the ring meanwhile; every submission waits for them first (SubmitLists), as the GPU reads the ring only when
+// the list runs. Same bytes. REGPU_SYNC_TEXTURE_COPIES=1 (live): on the draw thread, as before.
+namespace texjobs
+{
+struct Job
+{
+    TextureFetch fetch;
+    uint8_t* dst;
+    uint32_t rowPitch;
+};
+std::mutex g_mutex;
+std::condition_variable g_wake, g_done;
+std::deque<Job> g_queue;
+uint32_t g_pending = 0; // queued or running (under g_mutex)
+bool g_started = false;
+
+bool RunOne(std::unique_lock<std::mutex>& lock)
+{
+    if (g_queue.empty())
+        return false;
+    const Job job = g_queue.front();
+    g_queue.pop_front();
+    lock.unlock();
+    CopyTextureBlocks(job.fetch, job.dst, job.rowPitch);
+    lock.lock();
+    if (--g_pending == 0)
+        g_done.notify_all();
+    return true;
+}
+void Copy(const TextureFetch& fetch, uint8_t* dst, uint32_t rowPitch)
+{
+    static LiveSwitch sync("REGPU_SYNC_TEXTURE_COPIES");
+    if (sync)
+    {
+        CopyTextureBlocks(fetch, dst, rowPitch);
+        return;
+    }
+    std::lock_guard lock(g_mutex);
+    if (!g_started)
+    {
+        g_started = true;
+        for (int i = 0; i < 3; i++)
+            std::thread([] {
+                SetThreadDescription(GetCurrentThread(), L"gpu texture copier");
+                std::unique_lock lock(g_mutex);
+                for (;;)
+                {
+                    g_wake.wait(lock, [] { return !g_queue.empty(); });
+                    RunOne(lock);
+                }
+            }).detach();
+    }
+    g_queue.push_back({ fetch, dst, rowPitch });
+    g_pending++;
+    g_wake.notify_one();
+}
+// Before a submission: the queued copies done (the caller takes some itself).
+void WaitAll()
+{
+    std::unique_lock lock(g_mutex);
+    while (g_pending)
+        if (!RunOne(lock))
+            g_done.wait(lock, [] { return g_pending == 0 || !g_queue.empty(); });
+}
+} // namespace texjobs
+
 // Command lists closed but not yet submitted, in order. Parallel segments end the main list and add
 // their pieces several dozen times a frame; submitted one segment at a time, each submission left the
 // GPU idle a moment (FM2: GPU time per frame 5.0 -> 6.5 ms with 3 draw workers). They are queued here
@@ -12358,6 +12429,7 @@ std::vector<ID3D12CommandList*> g_pendingLists;
 // Submits the queued lists, then these.
 void SubmitLists(UINT n, ID3D12CommandList* const* lists)
 {
+    texjobs::WaitAll(); // (texture levels still being copied into the ring)
     std::lock_guard lock(g_pendingMutex);
     g_pendingLists.insert(g_pendingLists.end(), lists, lists + n);
     if (!g_pendingLists.empty())
