@@ -2962,6 +2962,8 @@ void BeginFrameIfNeeded()
         }
         g_occlusionPending[frameIndex].clear();
     }
+    void HyperCullCollect(UINT frameIndex);
+    HyperCullCollect(frameIndex);
     if ((perf || PerfLiteOn()) && !g_timestamps)
     {
         D3D12_QUERY_HEAP_DESC qd{};
@@ -5277,8 +5279,33 @@ std::string SpecVariant(const std::string& hlsl, uint32_t id)
             return {};
         spec = it->second;
     }
+    // Hyper tail specialisation (REGPU_HYPER_TAILSPEC; from the FM2 port: +6.5% on an HD 630): entries with slot 0x100+
+    // carry this draw's pinfo words and colour ceiling, written into the shader as literals (alpha test function,
+    // generated-parameter register, the flag bits, exponent bias, 7e3 ceiling): the same values the draw uploads.
+    std::vector<std::pair<std::string, std::string>> tail;
+    for (const FetchSpec& t : spec)
+    {
+        if (t.slot == 0x100)
+        {
+            tail.emplace_back("pinfo.x", std::to_string(t.info) + "u");
+            tail.emplace_back("pinfo.y", std::to_string(t.w) + "u");
+        }
+        else if (t.slot == 0x101)
+        {
+            tail.emplace_back("pinfo.z", std::to_string(t.info) + "u");
+            tail.emplace_back("pinfo.w", std::to_string(t.w) + "u");
+        }
+        else if (t.slot == 0x102)
+        {
+            float f;
+            memcpy(&f, &t.info, 4);
+            char b[32];
+            snprintf(b, sizeof(b), "asfloat(0x%08Xu)", t.info);
+            tail.emplace_back("pinfo2.w", b);
+        }
+    }
     const std::string& fn = SpecializedFetchFunction();
-    if (fn.empty())
+    if (fn.empty() && tail.empty())
         return {};
     std::string out;
     out.reserve(hlsl.size() + fn.size() + 1024);
@@ -5375,8 +5402,26 @@ std::string SpecVariant(const std::string& hlsl, uint32_t id)
         full.append(out, pos, std::string::npos);
         out = std::move(full);
     }
+    for (const auto& [from, to] : tail)
+    {
+        const size_t bodyAt = out.find(" main(");
+        for (size_t at = out.find(from, bodyAt == std::string::npos ? 0 : bodyAt); at != std::string::npos; at = out.find(from, at + to.size()))
+        {
+            // Whole names only (pinfo.x, not pinfo.xy).
+            const char next = at + from.size() < out.size() ? out[at + from.size()] : ' ';
+            if (isalnum(uint8_t(next)) || next == '_' || (at && (isalnum(uint8_t(out[at - 1])) || out[at - 1] == '_')))
+            {
+                at += 1;
+                continue;
+            }
+            out.replace(at, from.size(), to);
+            replaced++;
+        }
+    }
     if (!replaced)
         return {};
+    if (fn.empty() || out.find("TFetch2DK(") == std::string::npos && out.find("TFetchK(") == std::string::npos)
+        return out;
     // The function goes before the entry point, above any attribute line (as FetchVariant's helper).
     size_t mainAt = out.find("float4 main(");
     if (mainAt == std::string::npos)
@@ -5400,7 +5445,8 @@ const CompiledShader* FetchVariantOf(const CompiledShader& base, uint32_t mask)
     std::lock_guard lock(g_fetchVariantMutex);
     if (auto it = g_fetchShaders.find(id); it != g_fetchShaders.end())
         return it->second.get();
-    if (g_fetchVariantCount[base.cacheKey] >= ((mask >> 31) ? 64u : 16u)) // (specialisations: one per material's textures)
+    static const bool tailSpec = getenv("REGPU_HYPER_TAILSPEC") && atoi(getenv("REGPU_HYPER_TAILSPEC")) != 0;
+    if (g_fetchVariantCount[base.cacheKey] >= ((mask >> 31) ? (tailSpec ? 128u : 64u) : 16u)) // (specialisations: one per material's textures)
         return nullptr;
     auto cs = std::make_unique<CompiledShader>();
     cs->hash = base.hash;
@@ -6070,6 +6116,7 @@ bool PlainRectMustDraw()
 // report #14); these wait for their pipeline instead, a one-off hitch on first use.
 // REGPU_SKIP_SCREEN_PASSES=1: skippable like the rest, as before.
 thread_local bool g_screenPassDraw = false;
+thread_local bool g_hyperProbe = false; // Hyper culling's probe draw (HyperCull, GetPipeline)
 bool ScreenPassMustDraw()
 {
     static LiveSwitch skipScreenPasses("REGPU_SKIP_SCREEN_PASSES");
@@ -6099,6 +6146,7 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
     return !opaque || GameSettled();
 }
 
+extern thread_local bool g_hyperProbe;
 ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false, bool stripCut = false,
     bool coverage = false, bool noKill = false, uint32_t fetchMask = 0)
 {
@@ -6106,6 +6154,13 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     if (noKill)
         key.flags |= 0x400; // the pixel shader's variant without the alpha test (NoKillShader)
     key.fetchMask = fetchMask; // its plain-fetch variant (FetchShader)
+    if (g_hyperProbe)
+    {
+        // Hyper culling's probe: depth-tested as the draw, but writes no depth, stencil or colour.
+        key.depth &= ~4u;
+        key.stencilMaskMode &= ~(0xFFu << 16 | 0xFu << 24);
+        key.flags |= 0x1000;
+    }
     if (coverage)
     {
         // An occlusion query's coverage draw: the depth test always passes, nothing is written.
@@ -6679,7 +6734,16 @@ const ResolvedTexture* ResolvedFor(const TextureFetch& fetch)
     const char* name = TextureFormatName(fetch.Format());
     if (name && (strncmp(name, "DXT", 3) == 0 || strncmp(name, "DXN", 3) == 0 || strncmp(name, "CTX", 3) == 0))
         return nullptr;
-    return ResolveCurrent(fetch.Address());
+    const ResolvedTexture* r = ResolveCurrent(fetch.Address());
+    // Hyper (REGPU_HYPER_RESOLVE_BY_SIZE=1, from the FM2 port; it took the flicker out of frozen shadow maps there):
+    // when the current image at this base has another size than the fetch asks for and a kept image at the same
+    // base has exactly that size, the fetch reads that one.
+    static const bool bySize = getenv("REGPU_HYPER_RESOLVE_BY_SIZE") && atoi(getenv("REGPU_HYPER_RESOLVE_BY_SIZE")) != 0;
+    if (bySize && r && (r->width != fetch.Width() || r->height != fetch.Height()))
+        for (const ResolvedTexture& spare : r->spares)
+            if (spare.resource && spare.width == fetch.Width() && spare.height == fetch.Height())
+                return &spare;
+    return r;
 }
 
 // The guest bytes a texture check hashes, and how densely.
@@ -12734,25 +12798,54 @@ struct Pass
     uint64_t last = ~0ull;
     uint32_t streak = 0;
     bool geometryNow = false, geometryBefore = false; // depth-tested colour draws this and last frame
+    bool flatNow = false, flatBefore = false;         // draws without the depth test (screen quads: exposure, blur)
+    bool logged = false;
 };
 std::mutex g_mutex;
 std::unordered_map<uint64_t, Pass> g_passes;
 
+// Hyper (from the FM2 port's hyper-prototype): REGPU_HYPER_FREEZE=<frames> lets a pass draw normally for that many
+// frames in a row, then freezes it, redrawn every REGPU_HYPER_FREEZE_REFRESH=<n>-th frame (0: never; odd n keeps
+// double-buffered views alternating); REGPU_HYPER_FREEZE_SHADOWS=1 freezes depth-only helper passes (shadow maps)
+// too. The old REGPU_FREEZE_HELPERS=<n> is the same with a warm-up of n + 2 frames and a refresh of n.
+uint32_t Warmup()
+{
+    static const uint32_t n = [] {
+        if (const char* v = getenv("REGPU_HYPER_FREEZE"); v && atoi(v) > 0)
+            return uint32_t(atoi(v));
+        const char* old = getenv("REGPU_FREEZE_HELPERS");
+        const uint32_t e = old ? std::clamp<uint32_t>(uint32_t(atoi(old)), 0, 8) : 0;
+        return e >= 2 ? e + 2 : 0u;
+    }();
+    return n;
+}
+
+uint32_t Refresh()
+{
+    static const uint32_t n = [] {
+        if (const char* v = getenv("REGPU_HYPER_FREEZE"); v && atoi(v) > 0)
+            return getenv("REGPU_HYPER_FREEZE_REFRESH") ? uint32_t(std::max(0, atoi(getenv("REGPU_HYPER_FREEZE_REFRESH")))) : 0u;
+        return std::clamp<uint32_t>(uint32_t(atoi(getenv("REGPU_FREEZE_HELPERS"))), 0, 8);
+    }();
+    return n;
+}
+
 uint32_t Every()
 {
-    static const uint32_t n = getenv("REGPU_FREEZE_HELPERS") ? std::clamp<uint32_t>(uint32_t(atoi(getenv("REGPU_FREEZE_HELPERS"))), 0, 8) : 0;
-    return n >= 2 ? n : 0;
+    return Warmup();
 }
 
 // For a draw or resolve of the current pass: true when it is skipped this frame.
-bool Skip(bool resolve)
+bool Skip(bool resolve, uint32_t initiator)
 {
-    const uint32_t every = Every();
     static LiveSwitch off("REGPU_NO_FREEZE_HELPERS");
-    if (!every || off || !HelperPass())
+    if (!Warmup() || off || !HelperPass())
         return false;
+    static const bool shadows = getenv("REGPU_HYPER_FREEZE_SHADOWS") && atoi(getenv("REGPU_HYPER_FREEZE_SHADOWS")) != 0;
+    const uint32_t mode = gpureg::Get(RB_MODECONTROL) & 7;
     const uint32_t colorFormat = (gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF;
-    if (!(colorFormat <= 3 || colorFormat == 10 || colorFormat == 12))
+    const bool depthPass = mode == 5;
+    if (depthPass ? !shadows : !(colorFormat <= 3 || colorFormat == 10 || colorFormat == 12))
         return false;
     uint64_t key = 0xCBF29CE484222325ull;
     for (uint32_t v : { gpureg::Get(RB_SURFACE_INFO), gpureg::Get(RB_COLOR_INFO), gpureg::Get(RB_DEPTH_INFO), gpureg::Get(PA_SC_WINDOW_OFFSET) })
@@ -12764,14 +12857,30 @@ bool Skip(bool resolve)
     const uint64_t frame = g_r.frame;
     if (p.last != frame)
     {
-        p.streak = p.last + 1 == frame ? p.streak + 1 : 1;
-        p.geometryBefore = p.last + 1 == frame && p.geometryNow;
-        p.geometryNow = false;
+        p.streak = p.last + 1 == frame ? p.streak + 1 : (p.streak > Warmup() && p.last + 1 < frame && Refresh() && frame - p.last <= Refresh() ? p.streak : 1);
+        p.geometryBefore = p.last + 1 == frame ? p.geometryNow : p.geometryBefore;
+        p.flatBefore = p.last + 1 == frame ? p.flatNow : p.flatBefore;
+        p.geometryNow = p.flatNow = false;
         p.last = frame;
     }
-    if (!resolve && (gpureg::Get(RB_MODECONTROL) & 7) == 4 && (gpureg::Get(RB_DEPTHCONTROL) >> 1) & 1)
-        p.geometryNow = true;
-    return p.streak > every + 2 && p.geometryBefore && frame % every != 0;
+    if (!resolve && (mode == 4 || mode == 5))
+    {
+        // 3D geometry: depth-tested with a real compare, not a screen pass (rectangle list, six vertices or fewer).
+        const uint32_t dc = gpureg::Get(RB_DEPTHCONTROL);
+        const bool screen = (initiator & 0x3F) == 8 || (initiator >> 16) <= 6;
+        ((dc >> 1) & 1 && ((dc >> 4) & 7) != 7 && !screen ? p.geometryNow : p.flatNow) = true;
+    }
+    const uint32_t refresh = Refresh();
+    // Only a pass of 3D geometry alone (FM3 session 43: its exposure/luminance quads share a helper surface layout,
+    // and freezing them washed the whole picture out yellow). A pass with any screen quad is never frozen.
+    const bool frozen = p.streak > Warmup() && p.geometryBefore && !p.flatBefore && !p.flatNow;
+    if (frozen && !p.logged)
+    {
+        p.logged = true;
+        Log("freeze helpers: pass frozen (surface %08X colour %08X depth %08X window %08X, mode %u)", gpureg::Get(RB_SURFACE_INFO),
+            gpureg::Get(RB_COLOR_INFO), gpureg::Get(RB_DEPTH_INFO), gpureg::Get(PA_SC_WINDOW_OFFSET), mode);
+    }
+    return frozen && !(refresh && frame % refresh == 0);
 }
 } // namespace FreezeHelpers
 
@@ -12988,6 +13097,177 @@ void EndFrame()
 }
 } // namespace DrawCull
 
+// Hyper draw culling (from the FM2 port's hyper-prototype, measured there on an HD 630 and a Vega laptop): an
+// occlusion query counts the samples each eligible draw produced; a draw that produced REGPU_HYPER_CULL_PIXELS=<n>
+// pixels or fewer the last time it was measured is skipped before its pipeline, constants and textures are looked
+// up, so a culled draw costs no CPU either. Every REGPU_HYPER_CULL_RETEST (4)-th frame it is measured again: with
+// REGPU_HYPER_CULL_PROBE=1 by a probe draw that writes no colour, depth or stencil (nothing reaches the screen, so a
+// culled draw does not blink in), else drawn. REGPU_HYPER_CULL_HYST=<percent>: a culled draw stays culled until it
+// covers more than the threshold times percent/100. REGPU_HYPER_CULL_PIN (on; 0 off): a draw that comes back from
+// being culled twice within 64 frames is never culled again (a probe without depth writes can count layers that
+// hide each other). Eligible: depth-tested draws outside the title's own occlusion queries, on the frame's list, in
+// wide colour passes (REGPU_HYPER_CULL_PASSES=1: every colour and depth pass), opaque depth-writing ones only unless
+// REGPU_HYPER_CULL_ALL=1. Counts are read when the frame's slot comes round again (2-3 frames late).
+namespace HyperCull
+{
+constexpr UINT kPerFrame = 4096;
+struct State
+{
+    uint64_t samples = ~0ull;
+    bool culled = false, pinned = false;
+    uint8_t flips = 0;
+    uint64_t lastUncull = 0, lastSeen = 0;
+};
+std::unordered_map<uint64_t, State> g_states;
+std::unordered_map<uint64_t, uint32_t> g_occurrence;
+uint64_t g_occurrenceFrame = ~0ull;
+ComPtr<ID3D12QueryHeap> g_heap;
+ComPtr<ID3D12Resource> g_readback;
+struct Pending
+{
+    uint64_t key;
+    UINT index;
+};
+std::vector<Pending> g_pending[kFrames];
+UINT g_used[kFrames] = {};
+uint64_t g_drawn = 0, g_skipped = 0, g_logFrame = 0, g_pinned = 0;
+bool g_failed = false;
+thread_local uint64_t t_key = 0; // the current draw's key (Decide), for Begin
+
+int Threshold()
+{
+    static const int n = getenv("REGPU_HYPER_CULL_PIXELS") && *getenv("REGPU_HYPER_CULL_PIXELS") ? atoi(getenv("REGPU_HYPER_CULL_PIXELS")) : -1;
+    return n;
+}
+uint32_t Retest()
+{
+    static const uint32_t n = getenv("REGPU_HYPER_CULL_RETEST") ? uint32_t(std::max(1, atoi(getenv("REGPU_HYPER_CULL_RETEST")))) : 4;
+    return n;
+}
+bool On(const char* name, bool fallback)
+{
+    const char* v = getenv(name);
+    return v && *v ? atoi(v) != 0 : fallback;
+}
+
+// The finished frame in this slot: its counts update the states.
+void Collect(UINT frameIndex)
+{
+    if (g_pending[frameIndex].empty() || !g_readback)
+    {
+        g_used[frameIndex] = 0;
+        return;
+    }
+    uint64_t* counts = nullptr;
+    const D3D12_RANGE range{ size_t(frameIndex) * kPerFrame * 8, size_t(frameIndex + 1) * kPerFrame * 8 };
+    if (SUCCEEDED(g_readback->Map(0, &range, reinterpret_cast<void**>(&counts))))
+    {
+        // Summed over every occurrence of the draw in that frame: culled only if all of them were tiny.
+        std::unordered_map<uint64_t, uint64_t> sums;
+        for (const Pending& p : g_pending[frameIndex])
+            sums[p.key] += counts[p.index];
+        for (const auto& [key, samples] : sums)
+            g_states[key].samples = samples;
+        const D3D12_RANGE none{ 0, 0 };
+        g_readback->Unmap(0, &none);
+    }
+    g_pending[frameIndex].clear();
+    g_used[frameIndex] = 0;
+    if (g_states.size() > 65536)
+        for (auto it = g_states.begin(); it != g_states.end();)
+            it = it->second.lastSeen + 600 < g_r.frame ? g_states.erase(it) : std::next(it);
+}
+
+// The draw's decision: 0 draw (measured when a query is free), 1 skip, 2 probe (measure without writing).
+int Decide(uint64_t key, double samplesPerPixel)
+{
+    if (g_occurrenceFrame != g_r.frame)
+    {
+        g_occurrenceFrame = g_r.frame;
+        g_occurrence.clear();
+        if (g_r.frame >= g_logFrame + 600)
+        {
+            g_logFrame = g_r.frame;
+            if (g_drawn + g_skipped)
+                Log("hyper cull: %llu drawn, %llu skipped (%.1f%%), %llu draws pinned", (unsigned long long)g_drawn, (unsigned long long)g_skipped,
+                    100.0 * double(g_skipped) / double(g_drawn + g_skipped), (unsigned long long)g_pinned);
+        }
+    }
+    key = (key ^ g_occurrence[key]++) * 0x100000001B3ull;
+    State& st = g_states[key];
+    st.lastSeen = g_r.frame;
+    const bool retest = (g_r.frame + (key & 0xFF)) % Retest() == 0;
+    static const int hyst = getenv("REGPU_HYPER_CULL_HYST") ? std::max(100, atoi(getenv("REGPU_HYPER_CULL_HYST"))) : 100;
+    if (st.samples != ~0ull)
+    {
+        const double limit = double(Threshold()) * samplesPerPixel * (st.culled ? hyst / 100.0 : 1.0);
+        bool now = double(st.samples) <= limit;
+        static const bool pin = On("REGPU_HYPER_CULL_PIN", true);
+        if (pin && st.pinned)
+            now = false;
+        else if (pin && st.culled && !now)
+        {
+            st.flips = g_r.frame - st.lastUncull < 64 ? uint8_t(st.flips + 1) : uint8_t(1);
+            st.lastUncull = g_r.frame;
+            if (st.flips >= 2)
+            {
+                st.pinned = true;
+                g_pinned++;
+            }
+        }
+        st.culled = now;
+    }
+    t_key = key;
+    if (st.culled && !retest)
+    {
+        g_skipped++;
+        return 1;
+    }
+    static const bool probe = On("REGPU_HYPER_CULL_PROBE", false);
+    g_drawn++;
+    return probe && st.culled && retest ? 2 : 0;
+}
+
+// Before the draw call: a query around it, when one is free.
+UINT Begin()
+{
+    if (g_failed)
+        return ~0u;
+    if (!g_heap)
+    {
+        g_failed = true;
+        D3D12_QUERY_HEAP_DESC qd{};
+        qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+        qd.Count = kPerFrame * kFrames;
+        if (FAILED(g_r.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_heap))))
+            return ~0u;
+        g_readback = CreateBuffer(8ull * kPerFrame * kFrames, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!g_readback)
+            return ~0u;
+        g_failed = false;
+        Log("hyper cull: on, draws of %d pixels or fewer skipped (probe %s, hysteresis %s%%, pin %s)", Threshold(),
+            On("REGPU_HYPER_CULL_PROBE", false) ? "on" : "off", getenv("REGPU_HYPER_CULL_HYST") ? getenv("REGPU_HYPER_CULL_HYST") : "100",
+            On("REGPU_HYPER_CULL_PIN", true) ? "on" : "off");
+    }
+    const UINT slot = UINT(&Frame() - g_r.frames);
+    if (g_used[slot] >= kPerFrame)
+        return ~0u;
+    const UINT q = slot * kPerFrame + g_used[slot]++;
+    g_pending[slot].push_back({ t_key, q });
+    C().list->BeginQuery(g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, q);
+    return q;
+}
+
+// At the frame's end, on the frame's list: this frame's counts into the readback buffer.
+void EndFrame()
+{
+    const UINT slot = UINT(&Frame() - g_r.frames);
+    if (g_heap && g_readback && g_used[slot])
+        C().list->ResolveQueryData(g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, slot * kPerFrame, g_used[slot], g_readback.Get(), UINT64(slot) * kPerFrame * 8);
+}
+} // namespace HyperCull
+void HyperCullCollect(UINT frameIndex) { HyperCull::Collect(frameIndex); }
+
 void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
     // (PassScales: asks in this draw after the first skip the register reads; 0 again when the draw returns.)
@@ -13019,7 +13299,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (!g_r.ok)
         Init();
     const uint32_t edramMode = gpureg::Get(RB_MODECONTROL) & 7;
-    if (FreezeHelpers::Every() && FreezeHelpers::Skip(edramMode == 6))
+    if (FreezeHelpers::Every() && FreezeHelpers::Skip(edramMode == 6, initiator))
     {
         g_r.skippedThisFrame++;
         return;
@@ -13244,10 +13524,56 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     BeginFrameIfNeeded();
     SelectSurfaces(false);
+    // Hyper draw culling (HyperCull), decided after the surfaces are selected and before the pipeline lookup,
+    // constants and textures, so a culled draw costs none of that CPU work.
+    bool hyperCullMeasure = false;
+    struct ProbeReset
+    {
+        ~ProbeReset() { g_hyperProbe = false; }
+    } probeReset;
+    g_hyperProbe = false;
+    if (HyperCull::Threshold() >= 0 && !C().worker && !g_occlusionOpen && !g_screenPassDraw)
+    {
+        static const bool cullPasses = HyperCull::On("REGPU_HYPER_CULL_PASSES", false);
+        static const bool cullAll = HyperCull::On("REGPU_HYPER_CULL_ALL", false);
+        static LiveSwitch noHyperCull("REGPU_NO_HYPER_CULL");
+        const uint32_t dc = gpureg::Get(RB_DEPTHCONTROL), bc = gpureg::Get(RB_BLENDCONTROL0);
+        const bool opaque = (dc & 4) && (bc & 31) == 1 && ((bc >> 8) & 31) == 0 && ((bc >> 5) & 7) == 0;
+        // Only draws that depth-test with a real compare and write depth (3D meshes, also blended ones that write depth
+        // with CULL_ALL): a HUD's glyphs and menus redraw shared buffers with other contents every frame, and culling
+        // them dropped FM3's HUD text (session 43).
+        if (!noHyperCull && (cullPasses ? (edramMode == 4 || edramMode == 5) : (edramMode == 4 && WidePass())) && (dc & 2) && (dc & 4) &&
+            ((dc >> 4) & 7) != 7 && !(dc & 1) && (cullAll || opaque))
+        {
+            uint64_t key = 0xCBF29CE484222325ull;
+            for (uint64_t v : { C().vsHash, C().psHash, uint64_t(initiator), uint64_t(dmaBase), uint64_t(dmaSize), uint64_t(gpureg::Get(gpureg::FetchConstants)),
+                     uint64_t(gpureg::Get(gpureg::FetchConstants + 2)), uint64_t(cullPasses ? gpureg::Get(RB_SURFACE_INFO) : 0u), uint64_t(edramMode) })
+                key = (key ^ v) * 0x100000001B3ull;
+            const int d = HyperCull::Decide(key, double(g_msaa) * ScaleX() * ScaleY());
+            // REGPU_TRACE_HYPER_CULL=1 (live): each culled draw once (shaders, depth control, vertex count, its surface).
+            if (static LiveSwitch traceCull("REGPU_TRACE_HYPER_CULL"); traceCull && d == 1)
+            {
+                static std::mutex m;
+                static std::set<uint64_t> seen;
+                std::lock_guard lock(m);
+                if (seen.size() < 400 && seen.insert(C().vsHash * 31 ^ C().psHash).second)
+                    Log("hyper cull: culled vs %016llx ps %016llx depth %08X verts %u surface %08X colour %08X blend %08X samples %llu",
+                        (unsigned long long)C().vsHash, (unsigned long long)C().psHash, dc, initiator >> 16, gpureg::Get(RB_SURFACE_INFO),
+                        gpureg::Get(RB_COLOR_INFO), bc, (unsigned long long)HyperCull::g_states[HyperCull::t_key].samples);
+            }
+            if (d == 1)
+            {
+                g_r.skippedThisFrame++;
+                return;
+            }
+            hyperCullMeasure = true;
+            g_hyperProbe = d == 2;
+        }
+    }
     // Temporal upscaling: the main view's draws in the scene also write motion vectors (their
     // shaders' motion variants, once compiled; until then the draw has no motion).
     const bool cullable = (initiator & 0x3F) != 8 && (initiator & 0x3F) != 1;
-    const bool wantMotion = g_temporal && g_scenePhase && edramMode == 4 && WidePass();
+    const bool wantMotion = g_temporal && g_scenePhase && edramMode == 4 && WidePass() && !g_hyperProbe;
     g_plainRectDraw = (initiator & 0x3F) == 8 && !ps.info.usedTextureSlots && !vs.info.usedTextureSlots;
     const CompiledShader* mvs = wantMotion ? MotionShader(vs) : nullptr;
     const CompiledShader* mps = wantMotion ? MotionShader(ps) : nullptr;
@@ -14253,7 +14579,21 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 if ((ti[3] & 0xFFu) == 1 || (!noFullSlots && ((ti[3] & 0xFFu) == 2 || (ti[3] & 0xFFu) == 3)))
                     spec[n++] = { slot, ti[0], ti[3] };
             }
-            plain = n ? RegisterSpec(spec, n) : 0u;
+            // Hyper (REGPU_HYPER_TAILSPEC=1): the export tail's words as literals too (SpecVariant's slots 0x100-0x102).
+            static const bool tailSpec = getenv("REGPU_HYPER_TAILSPEC") && atoi(getenv("REGPU_HYPER_TAILSPEC")) != 0;
+            FetchSpec all[35];
+            if (tailSpec && !IsPsEditAlias(C().psHash))
+            {
+                std::copy(spec, spec + n, all);
+                uint32_t ceil;
+                memcpy(&ceil, &pc->info2[3], 4);
+                all[n] = { 0x100, pc->info[0], pc->info[1] };
+                all[n + 1] = { 0x101, pc->info[2], pc->info[3] };
+                all[n + 2] = { 0x102, ceil, 0 };
+                plain = RegisterSpec(all, n + 3);
+            }
+            else
+                plain = n ? RegisterSpec(spec, n) : 0u;
         }
         if (plain)
             if (const CompiledShader* f = FetchShader(*psUsed, plain))
@@ -14853,7 +15193,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             g_occlusionCurrent.main.push_back(g_occlusionIndex);
             C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
         }
+        const UINT hyperQuery = hyperCullMeasure && !coveragePso && cull.mode == 0 ? HyperCull::Begin() : ~0u;
         issue();
+        if (hyperQuery != ~0u)
+            C().list->EndQuery(HyperCull::g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, hyperQuery);
         if (cull.mode == 1)
             C().list->EndQuery(DrawCull::g_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, cull.query);
         else if (cull.mode == 2)
@@ -16190,6 +16533,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     FlushIndexCopies(); // this frame's index uploads into the arena, after its draws
     FlushVertexCopies(); // and the vertex arena's
     DrawCull::EndFrame(); // this frame's culling counts into next frame's predicates
+    HyperCull::EndFrame(); // and Hyper culling's counts into its readback
     if (g_gpuPasses && g_passQueries && !g_passMarks[UINT(&Frame() - g_r.frames)].empty())
     {
         const UINT frameIndex = UINT(&Frame() - g_r.frames);
