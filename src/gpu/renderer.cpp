@@ -1199,6 +1199,10 @@ struct DrawContext
 {
     RecordedList* list = nullptr;
     vk::RecordedList* vkList = nullptr; // Vulkan: replaces list
+    // Vulkan: the bound surfaces (replace color, depth, rtv, dsv and colorState: an image carries its own state). Draw
+    // workers leave them as targets and don't transition them.
+    vk::Image* vkColor = nullptr;
+    vk::Image* vkDepth = nullptr;
     uint32_t colorBase = ~0u, depthBase = ~0u;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{}, dsv{};
     // The bound surfaces.
@@ -3163,6 +3167,34 @@ void ApplyMsaa()
 }
 
 void TransitionColor(D3D12_RESOURCE_STATES to);
+// The bound colour surface to a Vulkan use (D3D12's TransitionColor with a state; workers never call it).
+void TransitionColor(vk::Use to)
+{
+    if (C().vkColor && *C().vkColor)
+        vk::Transition(*C().vkList, *C().vkColor, to);
+}
+// The bound surfaces as the render targets (D3D12's OMSetRenderTargets(1, &C().rtv, FALSE, &C().dsv)). extraColor: the
+// motion-vector pipelines' extra targets (1 and 2), or none.
+vk::Targets SurfaceTargets(uint32_t extraCount = 0, vk::Image* const* extraColor = nullptr)
+{
+    vk::Targets t{};
+    if (C().vkColor && *C().vkColor)
+    {
+        t.color[t.colorCount++] = C().vkColor->target;
+        t.extent = C().vkColor->Extent();
+    }
+    for (uint32_t i = 0; i < extraCount; i++)
+        if (extraColor[i] && *extraColor[i])
+            t.color[t.colorCount++] = extraColor[i]->target;
+    if (C().vkDepth && *C().vkDepth)
+    {
+        t.depth = C().vkDepth->target;
+        t.depthHasStencil = true;
+        const VkExtent2D e = C().vkDepth->Extent();
+        t.extent = t.colorCount ? VkExtent2D{ std::min(t.extent.width, e.width), std::min(t.extent.height, e.height) } : e;
+    }
+    return t;
+}
 
 // Destroys a Vulkan image once the GPU has finished the current frame (D3D12: Frame().garbage.push_back).
 void ReleaseWithFrame(vk::Image& image)
@@ -3371,27 +3403,27 @@ void SelectSurfaces(bool force)
                    depthBase = gpureg::Get(RB_DEPTH_INFO) & 0xFFF;
     if (!force && colorBase == C().colorBase && depthBase == C().depthBase)
         return;
-    if (C().colorBase != ~0u && !C().worker) // (workers leave surfaces as render targets)
-        if (auto it = g_r.colorSurfaces.find(C().colorBase); it != g_r.colorSurfaces.end()) // (not a new empty one)
-            it->second.state = C().colorState;
     Renderer::Surface& c = GetSurface(false, colorBase);
     Renderer::Surface& z = GetSurface(true, depthBase);
-    C().color = c.resource;
-    C().colorState = c.state;
-    C().rtv = c.view;
-    C().depth = z.resource;
-    C().dsv = z.view;
+    C().vkColor = &c.vk;
+    C().vkDepth = &z.vk;
     C().colorBase = colorBase;
     C().depthBase = depthBase;
     PassMark("pass colour %03X depth %03X", colorBase, depthBase);
-    TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (!C().worker)
+    {
+        vk::Barriers barriers;
+        barriers.Add(c.vk, vk::Use::ColorTarget);
+        barriers.Add(z.vk, vk::Use::DepthTarget);
+        barriers.Record(*C().vkList);
+    }
+    C().vkList->SetTargets(SurfaceTargets());
     if (g_zeroedEdramBase == (colorBase & 0xFFF)) // a depth clear zeroed these tiles (see the resolve)
     {
         g_zeroedEdramBase = ~0u;
         const float zero[4]{};
-        C().list->ClearRenderTargetView(C().rtv, zero, 0, nullptr);
+        C().vkList->ClearColor(c.vk.target, c.vk.Extent(), zero, 0, nullptr);
     }
-    C().list->OMSetRenderTargets(1, &C().rtv, FALSE, &C().dsv);
     g_drawState.motionTargets = false;
 }
 
@@ -3423,7 +3455,7 @@ void PropagateDepthClear(uint32_t first, uint32_t end, uint32_t value)
     {
         std::lock_guard surfaceLock(g_surfaceMutex);
         for (auto& [base, surface] : g_r.depthSurfaces)
-            if (base != C().depthBase && base < end && surface.resource)
+            if (base != C().depthBase && base < end && surface.vk)
                 targets.push_back({ base, &surface });
     }
     for (const auto& [base, surface] : targets)
@@ -3465,8 +3497,12 @@ void PropagateDepthClear(uint32_t first, uint32_t end, uint32_t value)
         }
         if (!hostCount)
             continue;
-        C().list->ClearDepthStencilView(surface->view, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-            DepthClearValue(value >> 8, (layout >> 16) & 1), UINT8(value & 0xFF), hostCount, host);
+        VkRect2D rects[3];
+        for (UINT i = 0; i < hostCount; i++)
+            rects[i] = { { int32_t(host[i].left), int32_t(host[i].top) }, { uint32_t(host[i].right - host[i].left), uint32_t(host[i].bottom - host[i].top) } };
+        vk::Transition(*C().vkList, surface->vk, vk::Use::DepthTarget);
+        C().vkList->ClearDepthStencil(surface->vk.target, surface->vk.Extent(), true, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+            DepthClearValue(value >> 8, (layout >> 16) & 1), uint8_t(value & 0xFF), hostCount, rects);
         static LiveSwitch trace("REGPU_TRACE_CLEARS");
         if (trace)
             Log("resolve clear: depth %08X also clears depth surface %03X (pitch %u, msaa %u): tiles %u-%u, %u rect(s)", value, base, pitch, msaa,
