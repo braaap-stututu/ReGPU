@@ -168,9 +168,9 @@ measurements are FM2's, at 1080p. FM2's environment variable names are `FM2_*`; 
 | 1 | Vendored Vulkan-Headers 1.4.369, volk (the loader) and VMA. Vulkan is always built. | Done, `2ec5f4b` |
 | 2 | **Device** (`src/gpu/vk/device.{h,cpp}`) | Done, `266fac0` |
 | 3 | **`RecordedList` with Vulkan operations** (`src/gpu/vk/recorded.h`, test `regpu_vkrecord`) | Done, `8d57e6b` |
-| 4 | **Resources** | Next |
-| 5 | **Pipelines and shaders** | |
-| 6 | **The renderer, function by function** | |
+| 4 | **Resources** (`src/gpu/vk/resources.*`, `bindings.*`; tests `regpu_vkresources`, `regpu_vkdraw`) | Done, `b0eaaee`, `09f9dc5` |
+| 5 | **Pipelines and shaders** (`src/gpu/vk/pipelines.*`; the translated-shader layout tested by `regpu_vkdraw`) | Building blocks done, `09f9dc5`; `PipelineKey` to `VkPipeline` goes with step 6 |
+| 6 | **The renderer, function by function** | Next |
 | 7 | **First boot**, only once the user agrees, then slice-by-slice comparison with `d3d12-reference` (phase 2 below) | |
 
 **Step 2, the device:**
@@ -198,6 +198,25 @@ measurements are FM2's, at 1080p. FM2's environment variable names are `FM2_*`; 
 - **Barriers into attachment layouts:** render passes always load and store their targets, so a barrier into an
   attachment layout must cover reads as well as writes. Use `vk::kColorTargetAccess` and `vk::kDepthTargetAccess`.
   Synchronization validation caught this on its first run.
+
+**Steps 4 and 5, what to know:**
+- **Five GPU tests** (`regpu_vkprobe`, `vkrecord`, `vkresources`, `vkdraw`, with `regpu_linkcheck`). Run them with
+  `REGPU_VK_VALIDATION=2`; every one must stay clean.
+- **Image state:** `vk::Image::state` replaces D3D12's resource states. Use `vk::Transition` / `vk::Barriers` with
+  `vk::Use`; a read after a read records nothing.
+- **Deferred destruction:** `vk::Graveyard` replaces `FrameResources::garbage`.
+- **`vk::DrawBindings`:** `set0` is per frame slot and sampler bank, with dynamic offsets for b0/b1/b2. Sets 1-3 are
+  bindless, bound once per command buffer.
+  - `BindlessIndexLocked` becomes `vk::WriteTexture` with a view that carries the swizzle: BC4 is `rrrr`, and R8 is
+    `rrr1`.
+- **Shaders:** `vk::AdaptHlsl` (in `vk_shader.h`) plus `vk::CompileHlsl` make SPIR-V. The PS constants are `pc[]` in
+  the preamble.
+- **Name clash:** the parts bin's `vk_context.h` also defines `vk::Image`. Code using the new layer must not include
+  `vk_context.h` / `vk_shaders.h`.
+- **The coexistence rule for step 6:**
+  - Add the Vulkan member next to the D3D12 one in `Renderer`, and convert functions to it.
+  - Delete a D3D12 member once nothing uses it.
+  - Every commit builds.
 
 **Step 4, resources:**
 - Committed and placed resources, and the texture heaps, become VMA allocations.
