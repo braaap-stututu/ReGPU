@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <string>
 #include <vector>
 
 #include <d3d12.h>
@@ -130,7 +131,62 @@ void EnsureDevice()
             Log("presenter: device-removed breadcrumbs and page-fault reporting on (REGPU_DRED)");
         }
     }
-    Check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device)), "D3D12CreateDevice");
+    // REGPU_ADAPTER (FM3 port, session 33; the FM3 launcher's "Graphics card"): the GPU to render on, as a part of its
+    // name ("7900", "Radeon(TM) Graphics"; case-insensitive, the first match), an adapter index ("1"), or "high" /
+    // "low" (Windows' high-performance / power-saving GPU). Empty or no match: Windows' default adapter as before.
+    ComPtr<IDXGIAdapter1> chosen;
+    if (const char* want = getenv("REGPU_ADAPTER"); want && *want)
+    {
+        ComPtr<IDXGIFactory6> factory;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+        {
+            std::string w = want;
+            std::transform(w.begin(), w.end(), w.begin(), [](unsigned char c) { return char(tolower(c)); });
+            if (w == "high" || w == "low")
+                factory->EnumAdapterByGpuPreference(0, w == "high" ? DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE : DXGI_GPU_PREFERENCE_MINIMUM_POWER,
+                    IID_PPV_ARGS(&chosen));
+            else if (w.find_first_not_of("0123456789") == std::string::npos)
+                factory->EnumAdapters1(UINT(atoi(want)), &chosen);
+            else
+            {
+                ComPtr<IDXGIAdapter1> a;
+                for (UINT i = 0; !chosen && factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++)
+                {
+                    DXGI_ADAPTER_DESC1 d{};
+                    a->GetDesc1(&d);
+                    char name[128] = {};
+                    WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+                    std::string n = name;
+                    std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return char(tolower(c)); });
+                    if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && n.find(w) != std::string::npos)
+                        chosen = a;
+                }
+            }
+        }
+        if (!chosen)
+            Log("presenter: REGPU_ADAPTER=%s matches no graphics card: using the default one", want);
+    }
+    if (chosen && FAILED(D3D12CreateDevice(chosen.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device))))
+    {
+        Log("presenter: REGPU_ADAPTER=%s: that graphics card can't run D3D12 feature level 12_0: using the default one", getenv("REGPU_ADAPTER"));
+        chosen.Reset();
+    }
+    if (!g_device)
+        Check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device)), "D3D12CreateDevice");
+    {
+        // Which card it is (by the device's LUID), for the log and bug reports.
+        ComPtr<IDXGIFactory4> factory;
+        ComPtr<IDXGIAdapter1> a;
+        DXGI_ADAPTER_DESC1 d{};
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapterByLuid(g_device->GetAdapterLuid(), IID_PPV_ARGS(&a))) &&
+            SUCCEEDED(a->GetDesc1(&d)))
+        {
+            char name[128] = {};
+            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+            Log("presenter: rendering on %s (%04X:%04X, %llu MB of its own memory)%s", name, d.VendorId, d.DeviceId,
+                (unsigned long long)(d.DedicatedVideoMemory >> 20), chosen ? " (REGPU_ADAPTER)" : "");
+        }
+    }
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     Check(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_queue)), "CreateCommandQueue");

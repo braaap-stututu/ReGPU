@@ -5170,21 +5170,41 @@ struct PipelineLibrary
     ComPtr<ID3D12PipelineLibrary> fresh;
     std::atomic<size_t> freshCount{ 0 };
 
-    static std::filesystem::path Path() { return RegpuUserDir() / "pipelines.bin"; }
+    // pipelines.bin on Windows' default GPU; another one (REGPU_ADAPTER: a laptop's or a processor's built-in GPU) has
+    // its own pipelines-<vendor>-<device>.bin (FM3 port, session 33): the drivers reject each other's library, and the
+    // one run last overwrote the other's (the RX 7900 XTX's 426 MB library was lost to one iGPU test boot).
+    std::filesystem::path path = RegpuUserDir() / "pipelines.bin";
+    std::filesystem::path Path() const { return path; }
 
     void Init(ID3D12Device* device)
     {
         ComPtr<ID3D12Device1> d1;
         if (FAILED(device->QueryInterface(IID_PPV_ARGS(&d1))))
             return;
+        {
+            ComPtr<IDXGIFactory4> factory;
+            ComPtr<IDXGIAdapter1> first, mine;
+            DXGI_ADAPTER_DESC1 a{}, m{};
+            const LUID luid = device->GetAdapterLuid();
+            if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapters1(0, &first)) && SUCCEEDED(first->GetDesc1(&a)) &&
+                (a.AdapterLuid.LowPart != luid.LowPart || a.AdapterLuid.HighPart != luid.HighPart) &&
+                SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&mine))) && SUCCEEDED(mine->GetDesc1(&m)))
+            {
+                char name[48];
+                snprintf(name, sizeof(name), "pipelines-%04X-%04X.bin", m.VendorId, m.DeviceId);
+                path = RegpuUserDir() / name;
+            }
+        }
         if (std::ifstream in{ Path(), std::ios::binary | std::ios::ate })
         {
             loaded.resize(size_t(in.tellg()));
             in.seekg(0);
             in.read(loaded.data(), std::streamsize(loaded.size()));
         }
-        if (FAILED(d1->CreatePipelineLibrary(loaded.data(), loaded.size(), IID_PPV_ARGS(&library))))
+        if (const HRESULT hr = d1->CreatePipelineLibrary(loaded.data(), loaded.size(), IID_PPV_ARGS(&library)); FAILED(hr))
         {
+            if (!loaded.empty())
+                Log("renderer: %s (%zu bytes) not usable (%08lX): starting a new one", Path().filename().string().c_str(), loaded.size(), (unsigned long)hr);
             loaded.clear();
             if (FAILED(d1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&library))))
                 library.Reset();
