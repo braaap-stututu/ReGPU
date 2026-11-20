@@ -145,6 +145,58 @@ measurements are FM2's, at 1080p. FM2's environment variable names are `FM2_*`; 
   - Binding them once per command buffer and set 0 per draw is a small, safe saving.
   - This should be the rule from the start of phase 2.
 
+## How the core is converted (decided 20 Nov 2026)
+
+**The whole core moves in one block.** The user chose this over a temporary D3D12-to-Vulkan bridge.
+- Draws, EDRAM, resolves and textures all share one command stream, so they cannot move one at a time.
+- FM3 does not render on the branch until the core is done. `main` stays playable.
+
+**Every commit still builds.** The Vulkan code goes in beside the D3D12 code; D3D12 is deleted only at the end.
+`tools/d3d12_left.py` will count what remains.
+
+**The order:**
+
+| Step | Work | Status |
+|---|---|---|
+| 1 | Vendored Vulkan-Headers 1.4.369, volk (the loader) and VMA. Vulkan is always built. | Done, `2ec5f4b` |
+| 2 | **Device** (`src/gpu/vk/device.{h,cpp}`) | Started |
+| 3 | **`RecordedList` with Vulkan operations** | |
+| 4 | **Resources** | |
+| 5 | **Pipelines and shaders** | |
+| 6 | **The renderer, function by function** | |
+| 7 | **First boot**, only once the user agrees, then slice-by-slice comparison with `d3d12-reference` (phase 2 below) | |
+
+**Step 2, the device:**
+- Vulkan 1.3, with dynamic rendering, synchronization2, maintenance4 and descriptor indexing (update-after-bind and
+  partially bound arrays).
+- Timeline semaphores, robustness2 null descriptors, a VMA allocator and the pipeline cache.
+- Optional: conditional rendering, external host memory, push descriptors and the swap chain.
+- The presenter creates it and hands it out where `RenderDevice()`/`RenderQueue()` hand out D3D12's today.
+
+**Step 3, `RecordedList` with Vulkan operations:**
+- Replay goes into a `VkCommandBuffer`.
+- Barriers become sync2 barriers, driven by a per-image layout tracker.
+- Render targets: the replay begins and ends `vkCmdBeginRendering` lazily. Setting targets only records them; the first
+  draw or clear begins rendering; a barrier, copy or new target ends it.
+- Root constants become push constants.
+
+**Step 4, resources:**
+- Committed and placed resources, and the texture heaps, become VMA allocations.
+- The descriptor heaps become descriptor sets:
+  - set 0: the constant blocks as dynamic UBOs, plus the upload ring and guest memory as storage buffers;
+  - set 1: the samplers;
+  - sets 2-4: bindless 2D, cube and 3D.
+- RTV and DSV handles become `VkImageView`s.
+
+**Step 5, pipelines and shaders:**
+- The root signature becomes a pipeline layout, and `PipelineKey` builds a `VkPipeline` with dynamic viewport,
+  scissor, stencil reference and blend constants.
+- `PipelineLibrary` becomes `VkPipelineCache` plus the manifest.
+- `dxc.cpp` compiles to SPIR-V (`vk::AdaptHlsl`). The fxc path goes.
+
+**Step 6, the renderer, function by function:** in the order of the D3D12 map (`Init`, `GetSurface`,
+`BeginFrameIfNeeded`, `EnsurePipeline`, `Apply`, textures, resolves, `RendererOnSwapImpl`, then the extras).
+
 ## Phases
 
 The work happens on the long-lived branch **`vulkan`**. `main` stays at the D3D12 renderer until the branch renders

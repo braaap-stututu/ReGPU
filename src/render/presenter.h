@@ -33,6 +33,13 @@ struct ID3D12Resource;
 // Shared D3D12 device and queue (created on first use, also when headless).
 ID3D12Device* RenderDevice();
 ID3D12CommandQueue* RenderQueue();
+namespace vk
+{
+struct Device;
+}
+// The Vulkan device (gpu/vk/device.h), created on first use, also when headless. During the conversion
+// (docs/vulkan-conversion-plan.md) it exists beside the D3D12 device; it replaces it once renderer.cpp is converted.
+vk::Device& RenderVkDevice();
 // Records copying src (COPY_SOURCE, RGBA8 at RenderSize()) into the current back
 // buffer; returns false when there is no window. Call PresenterPresent()
 // after executing the list.

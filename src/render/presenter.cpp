@@ -23,6 +23,8 @@
 #include "live_switch.h"
 #include "precise_sleep.h"
 #include "render/presenter.h"
+#include "gpu/vk/device.h"
+#include "regpu/regpu.h"
 #include "settings.h"
 
 using Microsoft::WRL::ComPtr;
@@ -783,6 +785,14 @@ std::atomic<uint32_t> g_vkPresents{ 0 };
 void PresenterCountFrame()
 {
     g_vkPresents++;
+}
+
+vk::Device& RenderVkDevice()
+{
+    static vk::Device device;
+    static std::once_flag once;
+    std::call_once(once, [] { vk::CreateDevice(device, regpu::GetConfig().userDir); });
+    return device;
 }
 
 ID3D12Device* RenderDevice()
