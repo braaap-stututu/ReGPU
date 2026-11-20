@@ -18,6 +18,24 @@
 #include "gpu/hlsl.h"
 #include "gpu/ucode.h"
 
+// The renderer's pixel shader variants, made from the microcode as the HLSL path makes them from its text:
+// - noAlphaTest: no alpha test and no alpha to mask (NoKillVariant);
+// - plainFetchMask: 2D fetches of these slots (pixel, computed LOD, no register LOD) sample with the constant's sampler and
+//   nothing else (FetchVariant's TFetchPlain: the slots' constants are plain this draw);
+// - specs: these slots' fetch-constant words tinfo.x and tinfo.w as literals (SpecVariant's TFetch2DK), so each fetch
+//   compiles to what its constant asks for.
+struct SpirvFetchSpec
+{
+    uint32_t slot, info, w;
+};
+struct SpirvOptions
+{
+    bool noAlphaTest = false;
+    uint32_t plainFetchMask = 0;
+    std::vector<SpirvFetchSpec> specs;
+};
+
 // hlslInfo: the HLSL path's result for the same shader (TranslateShader, after the renderer's PackConstants): its
 // constant mask and packedConstants decide the constant numbering.
-bool TranslateSpirv(const ucode::Shader& shader, const TranslatedShader& hlslInfo, std::vector<uint32_t>& words, std::string& why);
+bool TranslateSpirv(const ucode::Shader& shader, const TranslatedShader& hlslInfo, std::vector<uint32_t>& words, std::string& why,
+    const SpirvOptions& options = {});

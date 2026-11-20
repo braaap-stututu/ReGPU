@@ -34,7 +34,15 @@ struct Translator
     bool exportsDepth = false;
     uint8_t rank[256] = {};
 
-    Translator(const Shader& s, const TranslatedShader& i) : shader(s), info(i) {}
+    const SpirvOptions& options;
+    Translator(const Shader& s, const TranslatedShader& i, const SpirvOptions& o) : shader(s), info(i), options(o) {}
+    const SpirvFetchSpec* Spec(uint32_t slot) const
+    {
+        for (const SpirvFetchSpec& s : options.specs)
+            if (s.slot == slot)
+                return &s;
+        return nullptr;
+    }
 
     // Small helpers.
     uint32_t F(float v) { return b.ConstFloat(v); }
@@ -509,12 +517,16 @@ struct Translator
 
     // TFetch(slot, coord, denorm, level, bias, texel) with the instruction's filter override (filt 0 point, 1 linear,
     // -1 the constant's) and gLevelWrap = level.
-    uint32_t TexFetch(uint32_t slot, uint32_t coord, bool denorm, bool level, uint32_t bias, float ox, float oy, int filt)
+    // lean: hlsl.cpp's lean TFetch2D (REGPU_LEAN_FETCH) for a 2D fetch: the constant's own filter (filt -1), no point
+    // snap, its mirror rule (bit 30/31 only with 28/29); 3D and cube as the full path.
+    uint32_t TexFetch(uint32_t slot, uint32_t coord, bool denorm, bool level, uint32_t bias, float ox, float oy, int filt, bool lean = false)
     {
         InitTextures();
         const uint32_t ti = Load(tUV4, b.Op(spv::OpAccessChain, pUniUV4, { cb, I(5), I(int32_t(slot)) }));
         const uint32_t tb = Load(tV4, b.Op(spv::OpAccessChain, pUniV4, { cb, I(6), I(int32_t(slot)) }));
-        const uint32_t info = Comp(ti, 0, tU), w = Comp(ti, 3, tU);
+        // (A specialised slot's words are literals: the driver folds every path its constant doesn't take.)
+        const SpirvFetchSpec* spec = Spec(slot);
+        const uint32_t info = spec ? U(spec->info) : Comp(ti, 0, tU), w = spec ? U(spec->w) : Comp(ti, 3, tU);
         const uint32_t index = b.Op(spv::OpBitcast, tU, { Comp(tb, 1) });
         const uint32_t dim = UBits(w, 0, 0xFF);
         const uint32_t result = b.Variable(pFnV4), border = b.Variable(pFnB);
@@ -543,10 +555,18 @@ struct Translator
                 uint32_t u = denorm ? FDiv(FAdd(cx, F(ox)), sx) : FAdd(cx, FDiv(F(ox), sx));
                 uint32_t v = denorm ? FDiv(FAdd(cy, F(oy)), sy) : FAdd(cy, FDiv(F(oy), sy));
                 auto mirror = [&](uint32_t x) { return FSub(F(1), FAbs(FSub(FMulS(Fract(FMulS(x, F(0.5f))), F(2)), F(1)))); };
-                u = SelF(UBit(info, 28), mirror(u), u);
-                v = SelF(UBit(info, 29), mirror(v), v);
-                u = SelF(UBit(info, 30), FAbs(u), u);
-                v = SelF(UBit(info, 31), FAbs(v), v);
+                if (lean)
+                {
+                    u = SelF(UBit(info, 28), SelF(UBit(info, 30), FAbs(u), mirror(u)), u);
+                    v = SelF(UBit(info, 29), SelF(UBit(info, 31), FAbs(v), mirror(v)), v);
+                }
+                else
+                {
+                    u = SelF(UBit(info, 28), mirror(u), u);
+                    v = SelF(UBit(info, 29), mirror(v), v);
+                    u = SelF(UBit(info, 30), FAbs(u), u);
+                    v = SelF(UBit(info, 31), FAbs(v), v);
+                }
                 const uint32_t outside = Or(Or(FLt(u, F(0)), FGt(u, F(1))), Or(FLt(v, F(0)), FGt(v, F(1))));
                 b.If(And(UBit(info, 16), outside), [&] {
                     Store(border, b.ConstBool(true));
@@ -577,7 +597,7 @@ struct Translator
                     }
                     uint32_t img = 0;
                     const uint32_t si = SampledImage(gtex, tImg2, index, s, &img);
-                    if (!level)
+                    if (!level && !lean)
                     {
                         // A point fetch within 1/16 of a texel of a boundary goes onto it, 1/512 back (pinfo.z bit 17).
                         const uint32_t snap = And(Or(UEq(mode, 2), UEq(mode, 3)), PinfoBit(131072));
@@ -615,6 +635,34 @@ struct Translator
         return b.Op(spv::OpSelect, tV4, { Splat4B(UBit(w, 31)), swizzled, t });
     }
 
+    // FetchVariant's TFetchPlain: the constant's sampler (its filter replaced by the instruction's), the coordinates and
+    // nothing else (the slot's constant is plain this draw: the full path would give the same).
+    uint32_t TexFetchPlain(uint32_t slot, uint32_t coord, bool denorm, uint32_t bias, float ox, float oy, int filt)
+    {
+        InitTextures();
+        const uint32_t ti = Load(tUV4, b.Op(spv::OpAccessChain, pUniUV4, { cb, I(5), I(int32_t(slot)) }));
+        const uint32_t tb = Load(tV4, b.Op(spv::OpAccessChain, pUniV4, { cb, I(6), I(int32_t(slot)) }));
+        const SpirvFetchSpec* spec = Spec(slot);
+        const uint32_t info = spec ? U(spec->info) : Comp(ti, 0, tU);
+        uint32_t mode = UBits(info, 0, 3);
+        if (filt == 0 || filt == 1)
+        {
+            const uint32_t wrap = Or(UEq(mode, 0), UEq(mode, 3));
+            mode = filt == 0 ? SelU(wrap, U(3), U(2)) : SelU(wrap, U(0), U(1));
+        }
+        const uint32_t aniso = UBits(info, 20, 7);
+        const uint32_t anisoS = SelU(And(Bin(spv::OpUGreaterThanEqual, tB, aniso, U(1)), Bin(spv::OpULessThanEqual, tB, aniso, U(4))),
+            Bin(spv::OpIAdd, tU, aniso, U(3)), U(0));
+        const uint32_t s = SelU(UEq(mode, 0), anisoS, mode);
+        const uint32_t sx = b.Op(spv::OpConvertUToF, tF, { b.Ext(tU, GLSLstd450UMax, { UBits(Comp(ti, 1, tU), 0, 0xFFFF), U(1) }) });
+        const uint32_t sy = b.Op(spv::OpConvertUToF, tF, { b.Ext(tU, GLSLstd450UMax, { UBits(Comp(ti, 2, tU), 0, 0xFFFF), U(1) }) });
+        const uint32_t cx = Comp(coord, 0), cy = Comp(coord, 1);
+        const uint32_t u = denorm ? FDiv(FAdd(cx, F(ox)), sx) : FAdd(cx, FDiv(F(ox), sx));
+        const uint32_t v = denorm ? FDiv(FAdd(cy, F(oy)), sy) : FAdd(cy, FDiv(F(oy), sy));
+        const uint32_t index = b.Op(spv::OpBitcast, tU, { Comp(tb, 1) });
+        return Sample(SampledImage(gtex, tImg2, index, s), Vec2(u, v), false, bias);
+    }
+
     // hlsl.cpp's DestSwizzleWrite: per component 0-3 a value component, 4 zero, 5 one, 6-7 kept.
     void DestSwizzleWrite(uint32_t dest, uint32_t swizzle, uint32_t value)
     {
@@ -646,7 +694,32 @@ struct Translator
                 bias = FAdd(Load(tF, regLod), bias);
             static const bool noOverride = getenv("REGPU_NO_FETCH_FILTER_OVERRIDE") != nullptr;
             const int filt = !noOverride && (f.magFilter == 0 || f.magFilter == 1) ? int(f.magFilter) : -1;
-            DestSwizzleWrite(f.dest, f.destSwizzle, TexFetch(f.constIndex, coord, f.denormalized, level, bias, f.offsetX, f.offsetY, filt));
+            // A 2D fetch at computed LOD without a register LOD is what the HLSL path makes a lean fetch (REGPU_LEAN_FETCH:
+            // 1 TFetch2D, 2 TFetch2DV2) and what its fetch variants replace: the same rules here, so both paths draw alike.
+            const bool leanCall = f.dimension == 1 && !level && !(!noRegisterLod && f.useRegisterLod);
+            const int leanLevel = LeanFetchLevel();
+            static const bool noOverrideLean = getenv("REGPU_NO_FETCH_FILTER_OVERRIDE") != nullptr;
+            const int filtV2 = !noOverrideLean && (f.magFilter == 0 || f.magFilter == 1) ? int(f.magFilter) : -1;
+            uint32_t t;
+            if (((options.plainFetchMask >> f.constIndex) & 1) && leanCall)
+                t = TexFetchPlain(f.constIndex, coord, f.denormalized, bias, f.offsetX, f.offsetY, leanLevel >= 2 ? filtV2 : -1);
+            else if (leanCall && leanLevel >= 2)
+            {
+                // TFetch2DV2: a plain constant (tinfo.x bit 7) one sample with the instruction's filter, else TFetch2D.
+                InitTextures();
+                const SpirvFetchSpec* spec = Spec(f.constIndex);
+                const uint32_t ti = Load(tUV4, b.Op(spv::OpAccessChain, pUniUV4, { cb, I(5), I(int32_t(f.constIndex)) }));
+                const uint32_t info = spec ? U(spec->info) : Comp(ti, 0, tU);
+                const uint32_t out = b.Variable(pFnV4);
+                b.If(UBit(info, 7), [&] { Store(out, TexFetchPlain(f.constIndex, coord, f.denormalized, bias, f.offsetX, f.offsetY, filtV2)); },
+                    [&] { Store(out, TexFetch(f.constIndex, coord, f.denormalized, false, bias, f.offsetX, f.offsetY, -1, true)); });
+                t = Load(tV4, out);
+            }
+            else if (leanCall && leanLevel == 1)
+                t = TexFetch(f.constIndex, coord, f.denormalized, false, bias, f.offsetX, f.offsetY, -1, true);
+            else
+                t = TexFetch(f.constIndex, coord, f.denormalized, level, bias, f.offsetX, f.offsetY, filt);
+            DestSwizzleWrite(f.dest, f.destSwizzle, t);
         }
         else if (f.opcode == 24)
             Store(regLod, comp(0)); // setTexLOD
@@ -1104,7 +1177,9 @@ struct Translator
                 spv::OpFOrdGreaterThanEqual };
             for (uint32_t k = 1; k <= 6; k++)
                 fail = Or(fail, And(is(k), Not(Bin(ops[k - 1], tB, alpha, ref))));
-            b.If(fail, [&] { b.Kill(); });
+            if (!options.noAlphaTest)
+                b.If(fail, [&] { b.Kill(); });
+            if (!options.noAlphaTest)
             b.If(PinfoBit(64), [&] {
                 // Alpha to mask, dithered.
                 const uint32_t qx = Bin(spv::OpBitwiseAnd, tU, b.Op(spv::OpConvertFToU, tU, { Comp(pos, 0) }), U(1));
@@ -1152,7 +1227,8 @@ struct Translator
 };
 }
 
-bool TranslateSpirv(const ucode::Shader& shader, const TranslatedShader& hlslInfo, std::vector<uint32_t>& words, std::string& why)
+bool TranslateSpirv(const ucode::Shader& shader, const TranslatedShader& hlslInfo, std::vector<uint32_t>& words, std::string& why,
+    const SpirvOptions& options)
 {
     words.clear();
     if (!shader.valid)
@@ -1160,7 +1236,7 @@ bool TranslateSpirv(const ucode::Shader& shader, const TranslatedShader& hlslInf
         why = "invalid microcode";
         return false;
     }
-    Translator t(shader, hlslInfo);
+    Translator t(shader, hlslInfo, options);
     if (!t.Run(words))
     {
         why = t.why;

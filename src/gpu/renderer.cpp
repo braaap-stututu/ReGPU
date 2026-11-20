@@ -845,6 +845,7 @@ struct CompiledShader
     mutable const CompiledShader* noKill = nullptr; // pixel shaders: the variant without the alpha test (NoKillShader)
     uint32_t tag = 0; // the game's mark for this shader (Host::rewriteShader), passed to Host::onDraw
     bool direct = false; // its SPIR-V came from the direct translator (REGPU_SPIRV_DIRECT), not HLSL and DXC
+    bool directNoKill = false; // ... as the alpha-test-free variant (its fetch variants are too)
     bool IsReady() const { return state.load(std::memory_order_acquire) == Ready; }
 };
 
@@ -6192,6 +6193,30 @@ std::string NoKillVariant(const std::string& hlsl)
     return h;
 }
 
+// A direct shader's variant (REGPU_SPIRV_DIRECT): translated again from the microcode with the variant's options, as
+// the HLSL path edits its text (~1 ms, so here, not on a compile worker). False: the variant takes the HLSL path.
+bool DirectVariant(const CompiledShader& base, const SpirvOptions& options, CompiledShader& cs, uint64_t seed)
+{
+    if (!base.direct || base.ucodeBE.empty())
+        return false;
+    const ucode::Shader parsed = ucode::Parse(base.ucodeBE.data(), uint32_t(base.ucodeBE.size()), true);
+    std::vector<uint32_t> words;
+    std::string why;
+    if (!TranslateSpirv(parsed, base.info, words, why, options))
+    {
+        LOG_ONCE("spirv direct: a variant of ps %016llx takes the HLSL path: %s", (unsigned long long)base.hash, why.c_str());
+        return false;
+    }
+    auto code = std::make_shared<SpirvCode>();
+    code->words = std::move(words);
+    cs.code = std::move(code);
+    cs.direct = true;
+    cs.directNoKill = options.noAlphaTest;
+    cs.cacheKey = base.cacheKey * 0x9E3779B97F4A7C15ull ^ seed;
+    cs.state = CompiledShader::Ready;
+    return true;
+}
+
 std::unordered_map<uint64_t, std::unique_ptr<CompiledShader>> g_noKillShaders;
 // The variant, made (and its compile queued, unless the shader cache has it) on first use; it may still be
 // pending, or failed. The base shader must be ready (its HLSL).
@@ -6212,7 +6237,11 @@ const CompiledShader* NoKillVariantOf(const CompiledShader& base)
         cs.ucodeBE = base.ucodeBE; // the pipeline manifest stores the base microcode
         cs.info = base.info;
         cs.info.hlsl = NoKillVariant(base.info.hlsl);
-        if (cs.info.hlsl.empty())
+        SpirvOptions noKill;
+        noKill.noAlphaTest = true;
+        if (DirectVariant(base, noKill, cs, 0x6E6F6B696C6Cull))
+            ; // (made from the microcode)
+        else if (cs.info.hlsl.empty())
         {
             LOG_ONCE("renderer: no alpha-test-free variant for ps %016llx", (unsigned long long)base.hash);
             cs.state = CompiledShader::Failed;
@@ -6589,7 +6618,20 @@ const CompiledShader* FetchVariantOf(const CompiledShader& base, uint32_t mask)
     cs->ucodeBE = base.ucodeBE; // the pipeline manifest stores the base microcode
     cs->info = base.info;
     cs->info.hlsl = (mask >> 31) ? SpecVariant(base.info.hlsl, mask) : FetchVariant(base.info.hlsl, mask);
-    if (cs->info.hlsl.empty())
+    SpirvOptions options;
+    options.noAlphaTest = base.directNoKill;
+    if (mask >> 31)
+    {
+        std::lock_guard specLock(g_specMutex);
+        if (auto it = g_specs.find(mask); it != g_specs.end())
+            for (const FetchSpec& f : it->second)
+                options.specs.push_back({ f.slot, f.info, f.w });
+    }
+    else
+        options.plainFetchMask = mask;
+    if (base.direct && ((mask >> 31) == 0 || !options.specs.empty()) && DirectVariant(base, options, *cs, uint64_t(mask) << 1 | (base.directNoKill ? 1 : 0)))
+        g_fetchVariantCount[base.cacheKey]++;
+    else if (cs->info.hlsl.empty())
         cs->state = CompiledShader::Failed;
     else
     {
