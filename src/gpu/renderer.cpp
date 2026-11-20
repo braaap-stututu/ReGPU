@@ -12259,8 +12259,34 @@ void StereoCaptureHud()
     g_drawState.Invalidate();
 }
 
+// VR pose tags (regpu::vr::SubmitTaggedPose, FM3 port session 39): the newest tag among the main view's vertex constants
+// this frame (float bits kPoseTagBits | tag). Constants stay in the register file across draws and frames, so a draw
+// early in the frame may still hold the last frame's tag: the newest (16-bit, wrapping) seen in the frame wins. Every
+// 32nd main-view draw is scanned (all ALU constants), from the head-tracked modes only.
+uint32_t g_frameVrTag = 0;
+uint32_t g_frameVrScans = 0;
+void ScanVrTag()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_VR");
+        return v && (strcmp(v, "cockpit") == 0 || strcmp(v, "stereo") == 0);
+    }();
+    if (!on || g_stereoReplay || !WidePass() || (g_frameVrScans++ & 31) != 0)
+        return;
+    for (uint32_t r = 0x4000; r < 0x4800; r++)
+    {
+        const uint32_t v = gpureg::Get(r);
+        if ((v & 0xFFFF0000u) != regpu::vr::kPoseTagBits || !(v & 0xFFFF))
+            continue;
+        const uint32_t tag = v & 0xFFFF;
+        if (!g_frameVrTag || int16_t(uint16_t(tag - g_frameVrTag)) > 0)
+            g_frameVrTag = tag;
+    }
+}
+
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
+    ScanVrTag();
     if (StereoHudDraw())
     {
         if (!g_stereoReplay)
@@ -15632,15 +15658,22 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         UINT64 fence = 0;
         ID3D12Resource* fps = nullptr;
         GradeJob* grade = nullptr;
+        uint32_t vrTag = 0; // the frame's VR pose tag (ScanVrTag)
     };
     static AsyncEnd asyncEnds[kFrames];
     AsyncEnd& asyncEnd = asyncEnds[g_r.frameIndex];
     bool presenting = false;
+    const uint32_t vrTag = g_frameVrTag;
+    g_frameVrTag = 0;
+    g_frameVrScans = 0;
     if (asyncPresent)
-        asyncEnd = { fromResolve, shown, overlay, timer, 0, fps, gradeJob };
+        asyncEnd = { fromResolve, shown, overlay, timer, 0, fps, gradeJob, vrTag };
     else
+    {
+        regpu::xr::SetCaptureTag(vrTag);
         presenting = fromResolve && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH, timer, kTimerW, kTimerH, fps, kFpsW, kFpsH,
             gradeJob ? GradeIntoBackBuffer : nullptr, gradeJob);
+    }
     {
         const uint64_t traceFrame = TraceFrame();
         if (traceFrame && g_r.frame + 1 == traceFrame)
@@ -15828,6 +15861,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         C().list->Call(
             [](ID3D12GraphicsCommandList* l, void* ctx) {
                 const AsyncEnd& e = *static_cast<const AsyncEnd*>(ctx);
+                regpu::xr::SetCaptureTag(e.vrTag);
                 const bool show = e.copy && PresenterRecordCopy(l, e.shown, e.overlay, kOverlayW, kOverlayH, e.timer, kTimerW, kTimerH, e.fps, kFpsW, kFpsH,
                     e.grade ? GradeIntoBackBuffer : nullptr, e.grade);
                 l->Close();

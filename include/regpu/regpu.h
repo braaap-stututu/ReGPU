@@ -223,10 +223,17 @@ struct HeadPose
 };
 // The head's pose predicted for the next headset frame. false: no running headset session.
 bool GetHeadPose(HeadPose& out);
-// Once per game frame, in frame order: the head pose the frame's 3D view was rendered with and the vertical field of
-// view it used (radians, the whole angle), or nullptr for a frame shown on the virtual screen. Paired with the
-// presented frames in order.
+// Once per game frame: whether the newest game frame's 3D view is head-tracked (pose or nullptr) and its vertical field
+// of view (radians, the whole angle). Decides stereo and the HUD panel; the pose a presented frame was drawn with comes
+// from SubmitTaggedPose.
 void SubmitFramePose(const HeadPose* pose, float renderFovY);
+// Exact pairing of poses with frames (FM3 port, session 39): a title whose logic runs more often than it draws (or on
+// another thread than the one that draws) can't pair poses with frames by counting. The host puts `tag` (1-65535) into
+// a vertex shader constant of the main view as the float bits 0x00C00000 | tag (a denormal: e.g. a view matrix's
+// unused m03, which changes nothing drawn) and hands the pose here; the draw thread reads the newest tag of each frame's
+// main view and the headset gets that frame with that pose.
+constexpr uint32_t kPoseTagBits = 0x00C00000u;
+void SubmitTaggedPose(uint32_t tag, const HeadPose& pose, float renderFovY);
 // The head's present place and heading become the origin (straight ahead, level): poses, the virtual screen and the
 // HUD panel follow. F8 in the game window does the same.
 void Recentre();

@@ -29,6 +29,7 @@ void CaptureFrame(ID3D12GraphicsCommandList*, ID3D12Resource*) {}
 bool StereoFrame(float&, float&) { return false; }
 bool MonoHudPanel() { return false; }
 uint32_t PaceCap() { return 0; }
+void SetCaptureTag(uint32_t) {}
 ID3D12Resource* StereoTarget(int, uint32_t, uint32_t) { return nullptr; }
 void StereoHudCaptured() {}
 }
@@ -36,6 +37,7 @@ namespace regpu::vr
 {
 bool GetHeadPose(HeadPose&) { return false; }
 void SubmitFramePose(const HeadPose*, float) {}
+void SubmitTaggedPose(uint32_t, const HeadPose&, float) {}
 void Recentre() {}
 }
 
@@ -96,7 +98,16 @@ struct FramePose
     regpu::vr::HeadPose pose;
     float fovY = 0;
 };
-std::deque<FramePose> g_framePoses; // (g_screenMutex)
+// Poses by tag (SubmitTaggedPose), and the tag of the frame CaptureFrame records next (SetCaptureTag).
+struct TaggedPose
+{
+    uint32_t tag = 0;
+    FramePose pose;
+};
+TaggedPose g_tagged[1024];                // (g_taggedMutex) by tag & 1023
+std::mutex g_taggedMutex;
+std::atomic<uint32_t> g_captureTag{ 0 };
+std::atomic<uint32_t> g_newestTag{ 0 };
 FramePose g_screenPose;             // (g_screenMutex) the captured frame's
 // For GetHeadPose from the game's threads: the running session's spaces and the next display time.
 std::mutex g_poseMutex;
@@ -108,6 +119,8 @@ XrFovf g_eyeFovs[2]{}; // (g_poseMutex) both eyes' fields of view, for the lens 
 std::atomic<uint64_t> g_captured{ 0 };
 // Headset pacing: the headset's display rate (0 without a running session), and a wake-up when a game frame is captured.
 std::atomic<uint32_t> g_headsetHz{ 0 };
+// Frame-pose pairing check (logged with the 30 s line): frames whose tag had no pose (overwritten or never handed in).
+std::atomic<uint64_t> g_posesMissing{ 0 };
 std::mutex g_capturedMutex;
 std::condition_variable g_capturedCv;
 // Stereo (REGPU_VR=stereo): the two eyes' images of the newest stereo frame (renderer.cpp RendererStereoCaptureEye
@@ -958,8 +971,8 @@ struct Session
             if (std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(30))
             {
                 lastLog = std::chrono::steady_clock::now();
-                Log("vr: %llu headset frames, %llu with the screen, %llu game frames captured", (unsigned long long)frames, (unsigned long long)shown,
-                    (unsigned long long)g_captured.load());
+                Log("vr: %llu headset frames, %llu with the screen, %llu game frames captured, %llu tags without a pose", (unsigned long long)frames,
+                    (unsigned long long)shown, (unsigned long long)g_captured.load(), (unsigned long long)g_posesMissing.load());
             }
         }
     }
@@ -1062,6 +1075,15 @@ ID3D12Resource* StereoTarget(int eye, uint32_t w, uint32_t h)
 
 void StereoHudCaptured() { g_hudThisFrame = true; }
 
+void SetCaptureTag(uint32_t tag)
+{
+    g_captureTag = tag;
+    // Every 600th frame end: the frame's tag beside the newest one handed in (how many logic frames the drawing trails).
+    static uint32_t calls = 0;
+    if (tag && ++calls % 600 == 0)
+        Log("vr: frame drawn with pose tag %u (newest handed in %u)", tag, g_newestTag.load(std::memory_order_relaxed));
+}
+
 bool MonoHudPanel()
 {
     static LiveSwitch test("REGPU_VR_STEREO_TEST");
@@ -1099,17 +1121,18 @@ void CaptureFrame(ID3D12GraphicsCommandList* list, ID3D12Resource* backBuffer)
             g_screen = made;
         }
         screen = g_screen;
-        // This captured frame's pose (the oldest game frame not shown yet). More than a few waiting: the two counts
-        // went apart (a frame drawn twice or not at all); start again from the newest.
-        while (g_framePoses.size() > 4)
-            g_framePoses.pop_front();
-        if (!g_framePoses.empty())
+        // This captured frame's pose: the one its main view was drawn with, by the tag the draw thread read from it
+        // (SetCaptureTag). No tag: not head-tracked (the virtual screen).
+        g_screenPose.valid = false;
+        if (const uint32_t tag = g_captureTag.exchange(0))
         {
-            g_screenPose = g_framePoses.front();
-            g_framePoses.pop_front();
+            std::lock_guard tl(g_taggedMutex);
+            const TaggedPose& t = g_tagged[tag & 1023];
+            if (t.tag == tag)
+                g_screenPose = t.pose;
+            else
+                g_posesMissing++;
         }
-        else
-            g_screenPose.valid = false;
         g_screenStereo = g_eyesThisFrame.exchange(false);
         g_screenHud = g_hudThisFrame.exchange(false);
     }
@@ -1155,15 +1178,17 @@ void SubmitFramePose(const HeadPose* pose, float renderFovY)
 {
     g_lastPosed.store(pose != nullptr, std::memory_order_relaxed);
     g_lastFovY.store(renderFovY, std::memory_order_relaxed);
-    if (!g_capturing.load(std::memory_order_relaxed))
-        return;
-    FramePose f;
-    f.valid = pose != nullptr;
-    if (pose)
-        f.pose = *pose;
-    f.fovY = renderFovY;
-    std::lock_guard lock(g_screenMutex);
-    g_framePoses.push_back(f);
+}
+
+void SubmitTaggedPose(uint32_t tag, const HeadPose& pose, float renderFovY)
+{
+    std::lock_guard lock(g_taggedMutex);
+    TaggedPose& t = g_tagged[tag & 1023];
+    g_newestTag.store(tag, std::memory_order_relaxed);
+    t.tag = tag;
+    t.pose.valid = true;
+    t.pose.pose = pose;
+    t.pose.fovY = renderFovY;
 }
 }
 
