@@ -174,7 +174,8 @@ the test titles, then the branch replaces it.
    - FSR 1, then FSR 3/4 (FidelityFX Vulkan backend), DLSS (NGX Vulkan) and XeSS (Vulkan).
    - Post AA (FXAA, SMAA, CMAA 2, TAA), SSAA and EQAA (or its Vulkan absence).
    - Hyper mode, VR (OpenXR Vulkan binding) and triple screen.
-5. **Host API and ports:** the regpu.h changes above, Glue2GPU, and a port each (FM3 first) updated against the
+5. **Host API and ports** (together with stage R3 of [modular-runtimes.md](modular-runtimes.md), so the ports take
+   one set of breaking changes): the regpu.h changes above, Glue2GPU, and a port each (FM3 first) updated against the
    branch.
 6. **Remove D3D12:** DXGI, d3d12, d3dcompiler, fxc, DXIL, the FidelityFX DX12 libs, `renderer_vk.cpp` and the
    `REGPU_VULKAN` option (Vulkan is always on). Merge `vulkan` into `main`.

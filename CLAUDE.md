@@ -12,6 +12,8 @@ builds for. Read [`README.md`](README.md) for the build and the API, and
 - [`docs/vulkan-conversion-plan.md`](docs/vulkan-conversion-plan.md): the decision, design rules and phases;
 - [`docs/vulkan.md`](docs/vulkan.md): the experimental backend in `src/gpu/vk`, the parts bin;
 - [`docs/merge-2026-11.md`](docs/merge-2026-11.md): where the code came from.
+- [`docs/modular-runtimes.md`](docs/modular-runtimes.md): the planned split into core, console frontends (Xenos, later
+  RSX) and CPU runtime adapters (ReXenon the default for 360).
 
 The tag `d3d12-reference` is the frozen D3D12 renderer to compare Vulkan frames against. Keep every `REGPU_*` switch
 and its behaviour through the conversion.
