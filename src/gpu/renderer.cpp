@@ -114,6 +114,7 @@ struct Upscale
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> easu, rcas, depthCopy, gamma, enhance;
     ComPtr<ID3D12PipelineState> gammaDraw; // the gamma pass as a draw into the back buffer (GradeIntoBackBuffer)
+    ComPtr<ID3D12PipelineState> bilinear;  // REGPU_UPSCALE_BILINEAR: one bilinear pass instead of EASU + RCAS
     ComPtr<ID3D12Resource> dlaaOut; // DLAA output (scene size), copied back into the scene image
     ComPtr<ID3D12Resource> depth; // temporal: the scene's depth as R32 (render size, top left)
     ComPtr<ID3D12Resource> temp; // EASU output (RGBA16F)
@@ -5106,6 +5107,55 @@ std::string SpecVariant(const std::string& hlsl, uint32_t id)
         replaced++;
     }
     out.append(hlsl, pos, std::string::npos);
+    // L62 (session 34): the full-path fetches (cube, 3D: TFetch(slot, coord, denorm, vertexStage, bias, texel)) too,
+    // as TFetchK with the words appended.
+    static LiveSwitch noFull("REGPU_NO_FETCH_SPECIALIZE_FULL");
+    if (!noFull)
+    {
+        std::string full;
+        full.reserve(out.size() + 1024);
+        pos = 0;
+        for (;;)
+        {
+            const size_t at = out.find("TFetch(", pos);
+            if (at == std::string::npos)
+                break;
+            const size_t open = at + 6;
+            size_t end = open + 1;
+            while (end < out.size() && isdigit(uint8_t(out[end])))
+                end++;
+            const bool call = end > open + 1 && end < out.size() && out[end] == ',' && (at == 0 || !isalnum(uint8_t(out[at - 1])));
+            const uint32_t slot = call ? uint32_t(atoi(out.c_str() + open + 1)) : 32;
+            const FetchSpec* f = nullptr;
+            for (const FetchSpec& s : spec)
+                if (s.slot == slot)
+                    f = &s;
+            size_t depth = 0, close = open;
+            for (; f && close < out.size(); close++)
+            {
+                if (out[close] == '(')
+                    depth++;
+                else if (out[close] == ')' && --depth == 0)
+                    break;
+            }
+            if (!f || close >= out.size())
+            {
+                full.append(out, pos, open + 1 - pos);
+                pos = open + 1;
+                continue;
+            }
+            char words[48];
+            snprintf(words, sizeof(words), ", 0x%08Xu, 0x%08Xu)", f->info, f->w);
+            full.append(out, pos, at - pos);
+            full += "TFetchK(";
+            full.append(out, open + 1, close - open - 1);
+            full += words;
+            pos = close + 1;
+            replaced++;
+        }
+        full.append(out, pos, std::string::npos);
+        out = std::move(full);
+    }
     if (!replaced)
         return {};
     // The function goes before the entry point, above any attribute line (as FetchVariant's helper).
@@ -8103,6 +8153,30 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         else
             Log("gamma: back-buffer pass failed to compile: %s", err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
     }
+    {
+        // L63 (FM3 port, session 34): a plain bilinear upscale for small GPUs (REGPU_UPSCALE_BILINEAR, live). FSR 1's
+        // EASU + RCAS cost 1.65 ms a frame on a 2-CU RDNA2 iGPU at 720p (~13% of its frame); softer picture.
+        static const char kBilinear[] = R"(
+cbuffer C : register(b0) { uint4 q0, q1, q2, q3, q4, outSize; };
+Texture2D<float4> src : register(t0);
+RWTexture2D<float4> dst : register(u0);
+SamplerState s : register(s0);
+[numthreads(16, 16, 1)] void main(uint2 id : SV_DispatchThreadID)
+{
+    if (any(id >= outSize.xy)) return;
+    dst[id] = src.SampleLevel(s, (float2(id) + 0.5) / float2(outSize.xy), 0);
+}
+)";
+        ComPtr<ID3DBlob> cs, err;
+        if (SUCCEEDED(D3DCompile(kBilinear, sizeof(kBilinear) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err)))
+        {
+            pd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
+            if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.bilinear))))
+                Log("upscale: bilinear pipeline failed");
+        }
+        else
+            Log("upscale: bilinear pass failed to compile: %s", err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+    }
     g_upscale.ready = true;
     Log("upscale: FSR 1 ready (scene at %.0f%% of %ux%u)", GetSettings().SceneScale() * 100.0f, OutputWidth(), OutputHeight());
     return true;
@@ -8480,6 +8554,18 @@ void UpscaleResolved(uint32_t base)
     const UINT gx = (outWidth + 15) / 16, gy = (outHeight + 15) / 16;
     C().list->SetComputeRootSignature(g_upscale.root.Get());
     C().list->SetComputeRoot32BitConstants(0, 24, c, 0);
+    // L63: REGPU_UPSCALE_BILINEAR=1 (live): the source straight into the output, one bilinear sample a pixel.
+    if (static LiveSwitch bilinear("REGPU_UPSCALE_BILINEAR"); bilinear && g_upscale.bilinear)
+    {
+        barrier(dest.resource.Get(), read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        C().list->SetPipelineState(g_upscale.bilinear.Get());
+        C().list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+        C().list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 3, g_r.srvStride));
+        C().list->Dispatch(gx, gy, 1);
+        barrier(dest.resource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+        g_drawState.Invalidate();
+        return;
+    }
     C().list->SetPipelineState(g_upscale.easu.Get());
     C().list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
     C().list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
@@ -12951,7 +13037,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             {
                 const uint32_t slot = uint32_t(std::countr_zero(m));
                 const uint32_t* ti = pc->tinfo[slot];
-                if ((ti[3] & 0xFFu) == 1)
+                // (L62: cube and 3D slots too, for the full-path TFetchK; REGPU_NO_FETCH_SPECIALIZE_FULL: 2D only.)
+                static LiveSwitch noFullSlots("REGPU_NO_FETCH_SPECIALIZE_FULL");
+                if ((ti[3] & 0xFFu) == 1 || (!noFullSlots && ((ti[3] & 0xFFu) == 2 || (ti[3] & 0xFFu) == 3)))
                     spec[n++] = { slot, ti[0], ti[3] };
             }
             plain = n ? RegisterSpec(spec, n) : 0u;
