@@ -1223,12 +1223,19 @@ void ReplaceOnce(std::string& h, const char* from, const char* to)
         h.replace(at, strlen(from), to);
 }
 
-std::string Preamble(bool plainMul)
+// REGPU_PLAIN_MUL_VS (FM3 port, session 33): plain multiplies in vertex shaders too (kPlainMul keeps Mul9 there).
+const char kPlainMulAll[] = R"(float4 Mul9(float4 a, float4 b) { return a * b; }
+float Mul9(float a, float b) { return a * b; }
+float Dot9(float4 a, float4 b) { return dot(a, b); })";
+
+std::string Preamble(bool plainMul, bool plainMulVertex = false)
 {
     std::string h = kPreamble;
     if (LeanVertexFetch())
         ReplaceOnce(h, kOrigVFetch, kLeanVFetch);
-    if (plainMul)
+    if (plainMulVertex)
+        ReplaceOnce(h, kOrigMul, kPlainMulAll);
+    else if (plainMul)
         ReplaceOnce(h, kOrigMul, kPlainMul);
     return LeanFetch() ? h + kLeanFetch : h;
 }
@@ -1283,6 +1290,59 @@ int PlainMulPixelLevel()
         return atoi(v) == 2 ? 2 : atoi(v) == 3 ? 3 : 1;
     }();
     return level;
+}
+
+// REGPU_PLAIN_MUL_VS: the same levels for vertex shaders (1 all, 2 safe, 3 safe with rsq/sqrt allowed). Session 33:
+// on a small GPU (2 RDNA2 compute units) vertex work was a quarter of the frame.
+int PlainMulVertexLevel()
+{
+    static const int level = [] {
+        const char* v = getenv("REGPU_PLAIN_MUL_VS");
+        if (!v || !*v || strcmp(v, "0") == 0)
+            return 0;
+        return atoi(v) == 2 ? 2 : atoi(v) == 3 ? 3 : 1;
+    }();
+    return level;
+}
+
+// TFetch2DK (session 33, FM3 port): the lean TFetch2D with the fetch-constant words as arguments, made from its own
+// text so the two can't drift apart. With literal words (a specialised variant: renderer.cpp SpecVariant) the
+// compiler folds every branch the constant rules out: FM3's car paint went from 117 KB of RDNA3 code (236 sample
+// instructions, 1,064 branches) to 22 KB (41, 182). filt: TFetch2DV2's own filter (-1 = the constant's), applied
+// as TFetch2DV2 does, only to a plain fetch (tinfo.x bit 7).
+const std::string& SpecializedFetchFunction()
+{
+    static const std::string text = [] {
+        const std::string lean = kLeanFetch;
+        const char* head = "float4 TFetch2D(uint slot, float3 coord, bool denorm, float bias, float2 texel)";
+        const size_t start = lean.find(head), end = lean.find("// REGPU_LEAN_FETCH=2", start);
+        if (start == std::string::npos || end == std::string::npos)
+            return std::string();
+        std::string f = lean.substr(start, end - start);
+        auto replaceAll = [&f](const std::string& a, const std::string& b) {
+            for (size_t at = f.find(a); at != std::string::npos; at = f.find(a, at + b.size()))
+                f.replace(at, a.size(), b);
+        };
+        replaceAll(head, "float4 TFetch2DK(uint slot, float3 coord, bool denorm, float bias, float2 texel, int filt, uint infoK, uint wK)");
+        replaceAll("tinfo[slot].x", "infoK");
+        replaceAll("tinfo[slot].w", "wK");
+        // (A literal selector: FXC rejects v[sel] once it can see sel may be 4-7.)
+        replaceAll("r[c] = sel < 4u ? v[sel] : (sel == 5u ? 1.0 : 0.0);",
+            "r[c] = sel == 0u ? v.x : sel == 1u ? v.y : sel == 2u ? v.z : sel == 3u ? v.w : (sel == 5u ? 1.0 : 0.0);");
+        // TFetch2DV2's own filter, for a plain fetch only (its other fetches go to TFetch2D, which has none).
+        const std::string open = "{\n";
+        const size_t body = f.find(open);
+        if (body == std::string::npos)
+            return std::string();
+        f.insert(body + open.size(),
+            "    if (filt >= 0 && (infoK & 128u))\n"
+            "    {\n"
+            "        const bool wrapK = (infoK & 3u) == 0u || (infoK & 3u) == 3u;\n"
+            "        infoK = (infoK & ~3u) | (filt == 0 ? (wrapK ? 3u : 2u) : (wrapK ? 0u : 1u));\n"
+            "    }\n");
+        return f;
+    }();
+    return text;
 }
 
 bool BakedVertexFetch()
@@ -1374,7 +1434,10 @@ TranslatedShader TranslateShader(const Shader& shader)
     const int plainLevel = PlainMulPixelLevel();
     // (=3: like 2, but square roots and reciprocal square roots (normalize) don't keep the rule.)
     const bool unsafe = plainLevel == 3 ? e.mayMakeInfStrict : e.mayMakeInf;
-    std::string h = Preamble(plainLevel == 1 || (plainLevel >= 2 && shader.pixel && !unsafe));
+    const int vsLevel = PlainMulVertexLevel();
+    const bool vsUnsafe = vsLevel == 3 ? e.mayMakeInfStrict : e.mayMakeInf;
+    const bool plainVertex = !shader.pixel && (vsLevel == 1 || (vsLevel >= 2 && !vsUnsafe));
+    std::string h = Preamble(plainLevel == 1 || (plainLevel >= 2 && shader.pixel && !unsafe), plainVertex);
     if (plainLevel >= 2 && shader.pixel)
         result.plainMul = !unsafe;
     result.bodyStart = h.size();
