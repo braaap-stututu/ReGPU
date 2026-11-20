@@ -10398,6 +10398,7 @@ void Resolve()
         // the image at its row (BlitResolve's destRow). REGPU_NO_RESOLVE_BANDS=1: as before (A/B).
         static LiveSwitch noBands("REGPU_NO_RESOLVE_BANDS");
         LONG destRow = 0;
+        const uint32_t ownBase = base, ownHeight = height; // (a band's own address and rows: see bandOwnImage)
         // (A zero pitch has no rows to find a band in: the copy stays an image of its own, as before.)
         if (!noBands && !placedInImage && rect.top == 0 && rect.bottom > 0 && pitch != 0)
         {
@@ -10413,6 +10414,12 @@ void Resolve()
                 const ResolvedTexture* image = nullptr;
             } any, last;
             uint32_t candidates = 0;
+            // A resolve writes tiled memory (32x32-texel tiles), so a band of an image starts on a tile row: a copy
+            // whose base is some other whole number of rows into an image is an image of its own that overlaps it (FM3's
+            // racing livery copies its second layer 12 rows into the first's memory; taken as a band, it was drawn
+            // over the first and the car showed a red base where the livery should be). FH1's 224-row bands are
+            // tile rows. REGPU_BANDS_ANY_ROW=1: any row (A/B, live).
+            static LiveSwitch bandsAnyRow("REGPU_BANDS_ANY_ROW");
             for (const auto& [imageBase, image] : g_r.resolved)
             {
                 if (!image.resource || imageBase >= rowBase || image.width != width || image.format != format || image.frame == ~0ull ||
@@ -10421,7 +10428,7 @@ void Resolve()
                 // (A band may overhang the image by a few rows, into the tile padding after it: FH1's
                 // 598-row sides copy 3 x 224 rows. The blit clips it.)
                 const uint32_t row = (rowBase - imageBase) / rowBytes;
-                if (row >= image.height)
+                if (row >= image.height || (row % 32 != 0 && !bandsAnyRow))
                     continue;
                 candidates++;
                 any = { imageBase, row, &image };
@@ -10433,7 +10440,8 @@ void Resolve()
                     last.image ? "the band goes to the one resolved last" : "ambiguous, kept as an image of its own");
             if (const Band band = candidates == 1 ? any : last; band.image)
             {
-                if (RendererTracing())
+                static const bool logBands = getenv("REGPU_LOG_BANDS") != nullptr; // (each band, every frame: debug)
+                if (RendererTracing() || logBands)
                     Log("resolve: %08X is rows %u-%u of the %ux%u image at %08X", destBase, band.row, band.row + uint32_t(rect.bottom), band.image->width,
                         band.image->height, band.base);
                 base = band.base;
@@ -10506,6 +10514,22 @@ void Resolve()
                 intoOwnBase = ResolveIntoEnclosing(base, pitch, declaredHeight, guestBpp, format, rect, std::ldexp(1.0f, bias), destRange, blitFlags, true);
         if (!intoOwnBase)
         {
+        // A band is also an image at its own address, and is drawn into the images that enclose that address, as any
+        // other copy: guest memory holds it in all of them. FM3's racing livery copies a 224-row layer to a tile row of
+        // a 608-row image that also lies inside the 1024x1024 livery, which the host writes back for the CPU to
+        // compress: with the band only in the 608-row image, the livery in memory lacked the layer and the car's side
+        // showed its red base. Copied first, so the taller image stays the one resolved last (the band rule's
+        // tie-break). REGPU_NO_BAND_OWN_IMAGE=1: the band only (A/B, live).
+        static LiveSwitch noBandOwnImage("REGPU_NO_BAND_OWN_IMAGE");
+        if (destRow && !noBandOwnImage)
+        {
+            BlitResolve(depth, ownBase, width, ownHeight, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias), false, destRange, blitFlags);
+            ResolvedTexture& own = g_r.resolved[ownBase];
+            own.guestBpp = guestBpp, own.copyPitch = pitch, own.swapped = swapRB;
+            own.guestFormat = depth ? 0u : destFormat, own.guestNumber = depth ? 0u : numberFormat;
+            if (!depth && rect.left == 0)
+                ResolveIntoEnclosing(ownBase, pitch, declaredHeight, guestBpp, format, rect, std::ldexp(1.0f, bias), destRange, blitFlags);
+        }
         BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias), false, destRange, blitFlags, destRow);
         // (A band of an image (destRow) is already drawn into it at its row.)
         if (!depth && !placedInImage && !destRow && rect.top == 0 && rect.left == 0)
