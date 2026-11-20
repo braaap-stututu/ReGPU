@@ -183,7 +183,7 @@ target_link_libraries(regpu_texture_test PRIVATE regpu)
 # Xenos shader disassembler / translator check (xenos_dis --hlsl <ucode files>).
 add_executable(regpu_dis EXCLUDE_FROM_ALL tools/xenos_dis.cpp)
 target_include_directories(regpu_dis PRIVATE src)
-target_link_libraries(regpu_dis PRIVATE regpu d3dcompiler)
+target_link_libraries(regpu_dis PRIVATE regpu)
 
 # The Vulkan backend's smoke test: device and shader compile (tests/vkprobe.cpp). Copy dxcompiler.dll beside it.
 if(REGPU_VULKAN)

@@ -9,11 +9,11 @@
 #include <string>
 #include <vector>
 
-#include <d3dcompiler.h>
 #include <windows.h>
 
 #include "gpu/hlsl.h"
 #include "gpu/ucode.h"
+#include "gpu/vk/vk_shader.h"
 
 int main(int argc, char** argv)
 {
@@ -94,18 +94,17 @@ int main(int argc, char** argv)
         }
         if (print)
             printf("%s\n", t.hlsl.c_str());
-        ID3DBlob* code = nullptr;
-        ID3DBlob* errors = nullptr;
-        const D3D_SHADER_MACRO vertexStage[] = { { "REGPU_VERTEX_STAGE", "1" }, { nullptr, nullptr } };
-        const HRESULT hr = D3DCompile(t.hlsl.data(), t.hlsl.size(), argv[i], pixel ? nullptr : vertexStage, nullptr, "main", pixel ? "ps_5_1" : "vs_5_1",
-            D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &code, &errors);
-        if (FAILED(hr))
+        // As the renderer compiles it: the bindings adapted, DXC to SPIR-V (dxcompiler.dll beside the tool).
+        const std::string source = vk::AdaptHlsl(t.hlsl);
+        std::vector<uint32_t> spirv;
+        std::string errors;
+        if (!vk::CompileHlsl(source, pixel, vk::HashSource(source), {}, spirv, &errors))
         {
-            printf("FAIL compile %s:\n%s\n", argv[i], errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+            printf("FAIL compile %s:\n%s\n", argv[i], errors.c_str());
             failures++;
         }
         else
-            printf("ok   %s (%zu bytes DXBC)\n", argv[i], code->GetBufferSize());
+            printf("ok   %s (%zu bytes SPIR-V)\n", argv[i], spirv.size() * 4);
     }
     return failures;
 }
