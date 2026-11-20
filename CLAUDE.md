@@ -5,6 +5,13 @@ XenonRecomp and link ReGPU for graphics: that is the supported route, and the on
 builds for. Read [`README.md`](README.md) for the build and the API, and
 [`docs/xenos-notes.md`](docs/xenos-notes.md) before changing the renderer.
 
+## Work in progress: the Vulkan conversion
+
+ReGPU is being converted to Vulkan. Start with [`docs/vulkan-conversion-plan.md`](docs/vulkan-conversion-plan.md) (state,
+the open design decision, phases), [`docs/vulkan.md`](docs/vulkan.md) (the experimental backend in `src/gpu/vk`) and
+[`docs/merge-2026-11.md`](docs/merge-2026-11.md) (where the code came from, and why conflicts were resolved as they
+were). Keep D3D12 working throughout: it is the reference the Vulkan output is compared with.
+
 ## Ground rules
 
 - **Keep ReGPU game-neutral.** A fix for one game goes in that game's port, through the hooks in
