@@ -544,6 +544,7 @@ std::string Handle(const std::string& line)
         value.erase(0, value.find_first_not_of(' '));
         _putenv_s(name.c_str(), value.c_str());
         SetEnvironmentVariableA(name.c_str(), value.empty() ? nullptr : value.c_str());
+        g_envGeneration.fetch_add(1, std::memory_order_relaxed);
         return Ok();
     }
     if (cmd == "quit")

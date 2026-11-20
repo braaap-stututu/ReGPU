@@ -28,6 +28,7 @@ void SetEnv(const std::string& name, bool on)
     // getenv() readers of the same name (startup code, other copies) see it too.
     _putenv_s(name.c_str(), on ? "1" : "");
     SetEnvironmentVariableA(name.c_str(), on ? "1" : nullptr);
+    g_envGeneration.fetch_add(1, std::memory_order_relaxed);
 }
 }
 

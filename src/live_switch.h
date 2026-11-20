@@ -11,6 +11,10 @@
 #include <utility>
 #include <vector>
 
+// Bumped whenever the process environment is changed through ReGPU (the debug server's "env", a LiveSwitch set),
+// so readers of a debug variable re-read it only after a change (renderer.cpp FrameEnv, REGPU_EXP_ENV_GENERATION).
+inline std::atomic<uint64_t> g_envGeneration{ 1 };
+
 class LiveSwitch
 {
 public:

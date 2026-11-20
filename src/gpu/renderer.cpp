@@ -3582,17 +3582,24 @@ UINT64 RingAlloc(UINT64 bytes, UINT64 alignment, RingKind kind)
 
 // A debug variable the debug server's "env" can set live, read once per frame: getenv on every draw
 // (REGPU_SKIP_SHADERS, REGPU_POLY_OFFSET_SCALE) cost FH1 half its frame rate on this PC.
+// (Experimental system, FM3 port session 45: even once a frame, the CRT's getenv took ~10 us each here, 1.8% of the
+// draw thread with five such readers. REGPU_EXP_ENV_GENERATION=1 (live): re-read only after ReGPU changed the
+// environment (g_envGeneration: the debug server's "env", a switch) or every 256 frames.)
 struct FrameEnv
 {
     const char* name;
     std::string value;
     uint64_t frame = ~0ull;
+    uint64_t generation = 0;
     bool set = false;
     const char* Get()
     {
-        if (frame != g_r.frame)
+        static LiveSwitch byGeneration("REGPU_EXP_ENV_GENERATION");
+        const uint64_t gen = g_envGeneration.load(std::memory_order_relaxed);
+        if (byGeneration ? gen != generation || g_r.frame - frame >= 256 : frame != g_r.frame)
         {
             frame = g_r.frame;
+            generation = gen;
             const char* v = getenv(name);
             set = v && *v;
             if (set)
@@ -13699,15 +13706,9 @@ bool g_failed = false;
 // (Read again each frame: Fm3 "env REGPU_DRAW_CULL <n>" changes it live; 0 or unset: off.)
 uint32_t Threshold()
 {
-    thread_local uint64_t frame = ~0ull;
-    thread_local uint32_t px = 0;
-    if (frame != g_r.frame)
-    {
-        frame = g_r.frame;
-        const char* v = getenv("REGPU_DRAW_CULL");
-        px = v ? uint32_t(std::max(0, atoi(v))) : 0u;
-    }
-    return px;
+    thread_local FrameEnv env{ "REGPU_DRAW_CULL" };
+    const char* v = env.Get();
+    return v ? uint32_t(std::max(0, atoi(v))) : 0u;
 }
 
 bool Init()
@@ -15929,15 +15930,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             // 1 = no draw call (all its state still set), 2 = one triangle per draw (fixed per-draw cost),
             // 3 = 1x1 scissor (vertex work, no pixels).
             static const auto expDraw = [] {
-                thread_local uint64_t frame = ~0ull;
-                thread_local int v = 0;
-                if (frame != g_r.frame)
-                {
-                    frame = g_r.frame;
-                    const char* e = getenv("REGPU_EXP_DRAW");
-                    v = e ? atoi(e) : 0;
-                }
-                return v;
+                thread_local FrameEnv env{ "REGPU_EXP_DRAW" };
+                const char* e = env.Get();
+                return e ? atoi(e) : 0;
             };
             const int exp = expDraw();
             if (exp == 3)
