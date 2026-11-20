@@ -89,15 +89,17 @@ FM3 (the `regpu-vulkan` branch of its port) on an RX 7900 XTX against its D3D12 
 
 ## The direct SPIR-V translator (experimental)
 
-`src/gpu/spirv` translates Xenos microcode straight to SPIR-V (its own builder, no glslang, no DXC). It covers pixel
-shaders: ALU, control flow, texture fetches as hlsl.cpp's TFetch (and the lean rules under `REGPU_LEAN_FETCH`), the
-renderer's no-kill, plain-fetch and specialised variants. `REGPU_SPIRV_DIRECT=1` (start-time) uses it for pixel shaders
-the game hasn't rewritten and no debug edit changed; the rest keep HLSL. `regpu_spirv_check` runs it over captured
-microcode with spirv-val.
-- FM3: every pixel shader and variant direct (~1 ms each against 100-900 ms through DXC); cold boot to the race grid
-  19 s against 42 s; the frame within 0.4/255 of the HLSL path; no validation messages. GPU: the RX 7900 XTX's 4K race
-  2-4% faster (238 fps against 228-233); the 9800X3D's graphics 2-6% slower (51-54 against 55 fps, within its noise).
-- Not yet: vertex shaders (the HLSL wrapper: index fetch, rectangles, points, the viewport transform, vertex fetch).
+`src/gpu/spirv` translates Xenos microcode straight to SPIR-V (its own builder, no glslang, no DXC), mirroring
+hlsl.cpp: pixel shaders (ALU, control flow, texture fetches as TFetch and the lean rules under `REGPU_LEAN_FETCH`, the
+renderer's no-kill, plain-fetch and specialised variants) and vertex shaders (the guest program as a function, the
+VSOut wrapper: guest index fetch, rectangles and points, the viewport transform; baked vertex fetches).
+`REGPU_SPIRV_DIRECT` (start-time): `1` both stages, `ps` or `vs` one; shaders the game rewrote or a debug edit changed,
+and vertex shaders under `REGPU_DYNAMIC_VFETCH` / `REGPU_LEAN_VFETCH` / `REGPU_PLAIN_MUL_VS` / triple / stereo, keep HLSL.
+`regpu_spirv_check` runs it over captured microcode with spirv-val.
+- FM3, both stages: ~0.7 ms a shader against 100-900 ms through DXC; a cold boot reaches the race grid in 12 s (as warm)
+  against 42 s; the frame within ~0.3/255 of the HLSL path; no validation messages (grid, menus, a race, every AA mode).
+- GPU: the RX 7900 XTX's 4K race 4-5% faster (238-240 fps against 229); the 9800X3D's graphics ~4% slower (54 against
+  56.6). VK_AMD_shader_info (register counts per pipeline) would show whether register use costs RDNA2 occupancy.
 
 ## Not done yet
 
