@@ -28,11 +28,13 @@ void Start(ID3D12Device*, ID3D12CommandQueue*) {}
 void CaptureFrame(ID3D12GraphicsCommandList*, ID3D12Resource*) {}
 bool StereoFrame(float&, float&) { return false; }
 ID3D12Resource* StereoTarget(int, uint32_t, uint32_t) { return nullptr; }
+void StereoHudCaptured() {}
 }
 namespace regpu::vr
 {
 bool GetHeadPose(HeadPose&) { return false; }
 void SubmitFramePose(const HeadPose*, float) {}
+void Recentre() {}
 }
 
 #else
@@ -102,7 +104,9 @@ XrFovf g_eyeFov{};
 std::atomic<uint64_t> g_captured{ 0 };
 // Stereo (REGPU_VR=stereo): the two eyes' images of the newest stereo frame (renderer.cpp RendererStereoCaptureEye
 // grades into them; COMMON between uses), and whether the frame CaptureFrame took was one.
-ComPtr<ID3D12Resource> g_eyes[2];          // (g_screenMutex)
+ComPtr<ID3D12Resource> g_eyes[3];          // (g_screenMutex) [2]: the HUD panel's image (premultiplied alpha)
+std::atomic<bool> g_hudThisFrame{ false };  // the HUD written since the last CaptureFrame
+bool g_screenHud = false;                   // (g_screenMutex) the captured frame has its HUD in g_eyes[2]
 std::atomic<bool> g_eyesThisFrame{ false }; // both eyes written since the last CaptureFrame
 bool g_screenStereo = false;                // (g_screenMutex) the captured frame has its eyes in g_eyes
 // The newest frame pose handed in (for StereoFrame on the draw thread): head-tracked or not, its field of view; and the
@@ -110,6 +114,7 @@ bool g_screenStereo = false;                // (g_screenMutex) the captured fram
 std::atomic<bool> g_lastPosed{ false };
 std::atomic<float> g_lastFovY{ 0.0f };
 std::atomic<float> g_ipd{ 0.064f };
+std::atomic<bool> g_recentre{ false }; // regpu::vr::Recentre or F8: the headset thread recentres at its next frame
 ComPtr<ID3D12Device> g_device;
 ComPtr<ID3D12CommandQueue> g_queue;
 
@@ -192,12 +197,20 @@ struct Session
     XrSystemId system = XR_NULL_SYSTEM_ID;
     XrSession session = XR_NULL_HANDLE;
     XrSpace local = XR_NULL_HANDLE, view = XR_NULL_HANDLE;
+    // `local` after a recentre is a LOCAL space moved to the head's pose then; the runtime's own and replaced ones are
+    // kept until the session ends (another thread may still be locating in them).
+    XrSpace baseLocal = XR_NULL_HANDLE;
+    std::vector<XrSpace> oldSpaces;
     XrSwapchain quad = XR_NULL_HANDLE;
     uint32_t quadW = 0, quadH = 0;
     // Stereo: one swapchain image holding both eyes side by side (left in the left half).
     XrSwapchain pair = XR_NULL_HANDLE;
     uint32_t pairW = 0, pairH = 0;
     std::vector<ID3D12Resource*> pairImages;
+    // The HUD panel (stereo frames whose title draws its HUD apart: renderer.cpp StereoHudDraw).
+    XrSwapchain hud = XR_NULL_HANDLE;
+    uint32_t hudW = 0, hudH = 0;
+    std::vector<ID3D12Resource*> hudImages;
     int64_t quadFormat = 0;
     std::vector<ID3D12Resource*> images;
     static constexpr uint32_t kLists = 3;
@@ -223,6 +236,12 @@ struct Session
             xrDestroySwapchain(quad);
         if (pair)
             xrDestroySwapchain(pair);
+        if (hud)
+            xrDestroySwapchain(hud);
+        for (XrSpace sp : oldSpaces)
+            xrDestroySpace(sp);
+        if (baseLocal && baseLocal != local)
+            xrDestroySpace(baseLocal);
         if (local)
             xrDestroySpace(local);
         if (session)
@@ -303,6 +322,7 @@ struct Session
             Log("vr: xrCreateReferenceSpace failed: %s", ResultText(instance, r).c_str());
             return false;
         }
+        baseLocal = local;
         rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
         if (XrResult r = xrCreateReferenceSpace(session, &rs, &view); XR_FAILED(r))
         {
@@ -417,6 +437,46 @@ struct Session
         return true;
     }
 
+    // The HUD panel's swapchain (w x h, the format the screen's uses).
+    bool EnsureHud(uint32_t w, uint32_t h)
+    {
+        if (hud && hudW == w && hudH == h)
+            return true;
+        if (hud)
+        {
+            WaitIdle();
+            xrDestroySwapchain(hud);
+            hud = XR_NULL_HANDLE;
+            hudImages.clear();
+        }
+        if (!quadFormat && !EnsureQuad(w, h))
+            return false;
+        XrSwapchainCreateInfo ci{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
+        ci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        ci.format = quadFormat;
+        ci.sampleCount = 1;
+        ci.width = w;
+        ci.height = h;
+        ci.faceCount = 1;
+        ci.arraySize = 1;
+        ci.mipCount = 1;
+        if (XrResult r = xrCreateSwapchain(session, &ci, &hud); XR_FAILED(r))
+        {
+            Log("vr: xrCreateSwapchain %ux%u (HUD) failed: %s", w, h, ResultText(instance, r).c_str());
+            hud = XR_NULL_HANDLE;
+            return false;
+        }
+        uint32_t count = 0;
+        xrEnumerateSwapchainImages(hud, 0, &count, nullptr);
+        std::vector<XrSwapchainImageD3D12KHR> imgs(count, { XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR });
+        xrEnumerateSwapchainImages(hud, count, &count, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
+        for (const auto& i : imgs)
+            hudImages.push_back(i.texture);
+        hudW = w, hudH = h;
+        Log("vr: HUD panel %ux%u", w, h);
+        return true;
+    }
+
     void WaitIdle()
     {
         const uint64_t v = nextFence++;
@@ -429,19 +489,20 @@ struct Session
     }
 
     // Copies the latest captured frame into the quad's next image.
-    bool DrawQuad(FramePose& pose, bool& stereo)
+    bool DrawQuad(FramePose& pose, bool& stereo, bool& withHud)
     {
-        ComPtr<ID3D12Resource> screen, eyes[2];
+        ComPtr<ID3D12Resource> screen, eyes[3];
         {
             std::lock_guard lock(g_screenMutex);
             screen = g_screen;
             pose = g_screenPose;
             stereo = g_screenStereo && g_eyes[0] && g_eyes[1] && pose.valid;
+            withHud = stereo && g_screenHud && g_eyes[2];
             if (stereo)
-                eyes[0] = g_eyes[0], eyes[1] = g_eyes[1];
+                eyes[0] = g_eyes[0], eyes[1] = g_eyes[1], eyes[2] = withHud ? g_eyes[2] : nullptr;
         }
         if (stereo)
-            return DrawPair(eyes);
+            return DrawPair(eyes, withHud);
         if (!screen)
             return false;
         const D3D12_RESOURCE_DESC d = screen->GetDesc();
@@ -480,11 +541,24 @@ struct Session
     }
 
     // Copies the two eyes of the newest stereo frame into the pair's next image, side by side.
-    bool DrawPair(ComPtr<ID3D12Resource> (&eyes)[2])
+    bool DrawPair(ComPtr<ID3D12Resource> (&eyes)[3], bool& withHud)
     {
         const D3D12_RESOURCE_DESC d = eyes[0]->GetDesc();
         if (!EnsurePair(uint32_t(d.Width), d.Height))
             return false;
+        uint32_t hudIndex = 0;
+        if (withHud)
+        {
+            const D3D12_RESOURCE_DESC hd = eyes[2]->GetDesc();
+            XrSwapchainImageAcquireInfo hai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+            withHud = EnsureHud(uint32_t(hd.Width), hd.Height) && XR_SUCCEEDED(xrAcquireSwapchainImage(hud, &hai, &hudIndex));
+            if (withHud)
+            {
+                XrSwapchainImageWaitInfo hwi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+                hwi.timeout = XR_INFINITE_DURATION;
+                xrWaitSwapchainImage(hud, &hwi);
+            }
+        }
         uint32_t index = 0;
         XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
         if (XR_FAILED(xrAcquireSwapchainImage(pair, &ai, &index)))
@@ -512,6 +586,15 @@ struct Session
             Barrier(list.Get(), eyes[e].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
         }
         Barrier(list.Get(), image, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        if (withHud)
+        {
+            ID3D12Resource* hudImage = hudImages[hudIndex];
+            Barrier(list.Get(), hudImage, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+            Barrier(list.Get(), eyes[2].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->CopyResource(hudImage, eyes[2].Get());
+            Barrier(list.Get(), eyes[2].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(list.Get(), hudImage, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
         list->Close();
         ID3D12CommandList* lists[] = { list.Get() };
         g_queue->ExecuteCommandLists(1, lists);
@@ -519,7 +602,37 @@ struct Session
         g_queue->Signal(fence.Get(), fenceValues[li]);
         XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
         xrReleaseSwapchainImage(pair, &ri);
+        if (withHud)
+            xrReleaseSwapchainImage(hud, &ri);
         return true;
+    }
+
+    // The head's pose now (in the runtime's LOCAL space) becomes the origin: position, and its heading about the
+    // vertical only (the horizon stays level).
+    void Recentre(XrTime time)
+    {
+        XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+        if (!time || XR_FAILED(xrLocateSpace(view, baseLocal, time, &loc)) || !(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
+            return;
+        const XrQuaternionf q = loc.pose.orientation;
+        // Forward (-z) turned by q, its heading in the horizontal plane.
+        const float fx = -(2 * (q.x * q.z + q.y * q.w)), fz = -(1 - 2 * (q.x * q.x + q.y * q.y));
+        const float yaw = atan2f(-fx, -fz);
+        XrReferenceSpaceCreateInfo rs{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+        rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        rs.poseInReferenceSpace.orientation = { 0, sinf(yaw * 0.5f), 0, cosf(yaw * 0.5f) };
+        rs.poseInReferenceSpace.position = (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) ? loc.pose.position : XrVector3f{ 0, 0, 0 };
+        XrSpace made = XR_NULL_HANDLE;
+        if (XR_FAILED(xrCreateReferenceSpace(session, &rs, &made)))
+            return;
+        {
+            std::lock_guard lock(g_poseMutex);
+            if (local != baseLocal)
+                oldSpaces.push_back(local);
+            local = made;
+            g_poseLocal = made;
+        }
+        Log("vr: recentred (heading %.0f deg)", yaw * 57.2958f);
     }
 
     // Runs until the session ends or is lost.
@@ -527,6 +640,8 @@ struct Session
     {
         const float width = EnvFloat("REGPU_VR_SCREEN_WIDTH", 2.2f), distance = EnvFloat("REGPU_VR_SCREEN_DISTANCE", 2.5f);
         const float height = EnvFloat("REGPU_VR_SCREEN_HEIGHT", 0.0f);
+        const float hudWidth = EnvFloat("REGPU_VR_HUD_WIDTH", 1.4f), hudDistance = EnvFloat("REGPU_VR_HUD_DISTANCE", 1.1f);
+        const float hudHeight = EnvFloat("REGPU_VR_HUD_HEIGHT", -0.05f);
         uint64_t frames = 0, shown = 0;
         auto lastLog = std::chrono::steady_clock::now();
         for (;;)
@@ -579,6 +694,18 @@ struct Session
                 return;
             g_predicted.store(fs.predictedDisplayTime, std::memory_order_relaxed);
             {
+                // F8 in the game window (edge), or regpu::vr::Recentre.
+                static bool wasDown = false;
+                const bool down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+                DWORD pid = 0;
+                GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+                if (down && !wasDown && pid == GetCurrentProcessId())
+                    g_recentre = true;
+                wasDown = down;
+                if (g_recentre.exchange(false))
+                    Recentre(fs.predictedDisplayTime);
+            }
+            {
                 XrViewLocateInfo vli{ XR_TYPE_VIEW_LOCATE_INFO };
                 vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                 vli.displayTime = fs.predictedDisplayTime;
@@ -604,11 +731,12 @@ struct Session
             XrCompositionLayerQuad layer{ XR_TYPE_COMPOSITION_LAYER_QUAD };
             XrCompositionLayerProjection projection{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
             XrCompositionLayerProjectionView eyes[2] = { { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW }, { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW } };
-            const XrCompositionLayerBaseHeader* layers[1] = { reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer) };
+            const XrCompositionLayerBaseHeader* layers[2] = { reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer), nullptr };
+            XrCompositionLayerQuad hudLayer{ XR_TYPE_COMPOSITION_LAYER_QUAD };
             uint32_t layerCount = 0;
             FramePose framePose;
-            bool stereo = false;
-            const bool drawn = fs.shouldRender && DrawQuad(framePose, stereo);
+            bool stereo = false, withHud = false;
+            const bool drawn = fs.shouldRender && DrawQuad(framePose, stereo, withHud);
             if (drawn && stereo)
             {
                 // A stereo frame: each eye from the head pose moved half the eye distance along the head's x axis (as
@@ -633,6 +761,21 @@ struct Session
                 projection.views = eyes;
                 layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&projection);
                 layerCount = 1;
+                if (withHud)
+                {
+                    // The HUD on a panel in front of the seat, fixed in the room (REGPU_VR_HUD_WIDTH / _DISTANCE /
+                    // _HEIGHT, metres), its own alpha over the view (premultiplied, as the title drew it).
+                    hudLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                    hudLayer.space = local;
+                    hudLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                    hudLayer.subImage.swapchain = hud;
+                    hudLayer.subImage.imageRect = { { 0, 0 }, { int32_t(hudW), int32_t(hudH) } };
+                    hudLayer.pose.orientation.w = 1;
+                    hudLayer.pose.position = { 0, hudHeight, -hudDistance };
+                    hudLayer.size = { hudWidth, hudWidth * float(hudH) / float(std::max(hudW, 1u)) };
+                    layers[1] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&hudLayer);
+                    layerCount = 2;
+                }
                 shown++;
             }
             else if (drawn && framePose.valid)
@@ -750,7 +893,8 @@ bool StereoFrame(float& clipPerMetre, float& halfIpd)
 
 ID3D12Resource* StereoTarget(int eye, uint32_t w, uint32_t h)
 {
-    if (eye < 0 || eye > 1 || !g_capturing.load(std::memory_order_relaxed))
+    static LiveSwitch test("REGPU_VR_STEREO_TEST"); // (the images are made without a headset too)
+    if (eye < 0 || eye > 2 || !(g_capturing.load(std::memory_order_relaxed) || test) || !g_device)
         return nullptr;
     std::lock_guard lock(g_screenMutex);
     ComPtr<ID3D12Resource>& t = g_eyes[eye];
@@ -779,6 +923,8 @@ ID3D12Resource* StereoTarget(int eye, uint32_t w, uint32_t h)
         g_eyesThisFrame = true;
     return t.Get();
 }
+
+void StereoHudCaptured() { g_hudThisFrame = true; }
 
 void CaptureFrame(ID3D12GraphicsCommandList* list, ID3D12Resource* backBuffer)
 {
@@ -814,6 +960,7 @@ void CaptureFrame(ID3D12GraphicsCommandList* list, ID3D12Resource* backBuffer)
         else
             g_screenPose.valid = false;
         g_screenStereo = g_eyesThisFrame.exchange(false);
+        g_screenHud = g_hudThisFrame.exchange(false);
     }
     Barrier(list, backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Barrier(list, screen.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -846,6 +993,8 @@ bool GetHeadPose(HeadPose& out)
     out.fovLeft = g_eyeFov.angleLeft, out.fovRight = g_eyeFov.angleRight, out.fovUp = g_eyeFov.angleUp, out.fovDown = g_eyeFov.angleDown;
     return true;
 }
+
+void Recentre() { g_recentre = true; }
 
 void SubmitFramePose(const HeadPose* pose, float renderFovY)
 {

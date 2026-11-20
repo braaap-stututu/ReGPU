@@ -227,5 +227,8 @@ bool GetHeadPose(HeadPose& out);
 // view it used (radians, the whole angle), or nullptr for a frame shown on the virtual screen. Paired with the
 // presented frames in order.
 void SubmitFramePose(const HeadPose* pose, float renderFovY);
+// The head's present place and heading become the origin (straight ahead, level): poses, the virtual screen and the
+// HUD panel follow. F8 in the game window does the same.
+void Recentre();
 } // namespace vr
 } // namespace regpu

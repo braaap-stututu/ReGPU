@@ -8570,14 +8570,17 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl, GradeJob* dire
 {
     static LiveSwitch off("REGPU_NO_GAMMA"), noPwl("REGPU_NO_GAMMA_PWL");
     pwl = pwl && !noPwl && g_gammaPwlSet.load(std::memory_order_relaxed);
-    if (off || (!pwl && !g_gammaSet.load(std::memory_order_relaxed)) || !InitUpscale())
+    const bool noRamp = off || (!pwl && !g_gammaSet.load(std::memory_order_relaxed));
+    if ((noRamp && !into) || !InitUpscale())
         return nullptr;
     // 17 points of the ramp (green; the title writes equal channels), at x = k/16.
     float points[17];
     bool identity = true;
     for (uint32_t k = 0; k <= 16; k++)
     {
-        if (pwl)
+        if (noRamp)
+            points[k] = k / 16.0f;
+        else if (pwl)
         {
             // A 10-bit value: its top 7 bits pick the entry, its low 3 step along the delta
             // (base and delta are 16-bit, bits 0-5 zero).
@@ -8602,7 +8605,7 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl, GradeJob* dire
         h = (h ^ uint32_t(pt * 65535.0f)) * 0x100000001B3ull;
     if (loggedHash.exchange(h) != h && logs++ < 4)
         Log("gamma: display ramp (%s): %.3f %.3f %.3f %.3f %.3f ... %.3f", pwl ? "PWL" : "table", points[0], points[1], points[2], points[4], points[8], points[16]);
-    if (identity)
+    if (identity && !into)
         return nullptr;
     const D3D12_RESOURCE_DESC desc = image->GetDesc();
     FrameResources& f = Frame();
@@ -8639,7 +8642,7 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl, GradeJob* dire
     const UINT slots = f.descriptorBase + f.descriptorsUsed;
     f.descriptorsUsed += 2;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.Format = into ? desc.Format : DXGI_FORMAT_R8G8B8A8_UNORM; // (VR's HUD: a half-float copy of the surface)
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
@@ -12191,8 +12194,87 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
     g_drawState.Invalidate();
 }
 
+// VR stereo, the HUD on its own panel: a title that draws its HUD first, onto a cleared surface, and then the scene's
+// composite under it by destination alpha (FM3: the HUD's colour premultiplied, its coverage in alpha) is named by that
+// composite's pixel shader (REGPU_VR_HUD_UNDER=<hash>, the port's). On a stereo frame the surface just before that draw
+// is the HUD alone: it goes to the headset's HUD panel (first eye's pass), and the composite is drawn opaque, so neither
+// eye has the HUD in its picture. REGPU_VR_HUD_IN_VIEW=1 (live): the HUD stays in both eyes' pictures, as before.
+ComPtr<ID3D12Resource> g_hudCopy;
+bool StereoHudDraw()
+{
+    static const uint64_t hudUnder = [] {
+        const char* v = getenv("REGPU_VR_HUD_UNDER");
+        return v && *v ? strtoull(v, nullptr, 16) : 0ull;
+    }();
+    static LiveSwitch inView("REGPU_VR_HUD_IN_VIEW");
+    // (Not the resolve that follows: a copy packet runs with the composite's shaders still loaded.)
+    return hudUnder && g_stereoClipX != 0.0f && C().psHash == hudUnder && WidePass() && !inView && C().color && !RendererIsResolveDraw();
+}
+
+void StereoCaptureHud()
+{
+    const D3D12_RECT host = ToHost(D3D12_RECT{ 0, 0, LONG(kWidth), LONG(kHeight) });
+    const UINT w = UINT(host.right - host.left), h = UINT(host.bottom - host.top);
+    ID3D12Resource* target = regpu::xr::StereoTarget(2, w, h);
+    if (!target)
+        return;
+    if (!g_hudCopy || g_hudCopy->GetDesc().Width != w || g_hudCopy->GetDesc().Height != h)
+    {
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = w;
+        td.Height = h;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.Format = kColorFormat;
+        td.SampleDesc.Count = 1;
+        RetireTexture(std::move(g_hudCopy));
+        g_hudCopy = CreateTexture(td, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "vr hud");
+        if (!g_hudCopy)
+            return;
+    }
+    const bool ms = g_msaa > 1;
+    TransitionColor(ms ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = g_hudCopy.Get();
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = ms ? D3D12_RESOURCE_STATE_RESOLVE_DEST : D3D12_RESOURCE_STATE_COPY_DEST;
+    C().list->ResourceBarrier(1, &b);
+    if (ms)
+        C().list->ResolveSubresourceRegion(g_hudCopy.Get(), 0, 0, C().color.Get(), host, kColorFormat);
+    else
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst{ g_hudCopy.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, src{ C().color.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+        dst.SubresourceIndex = src.SubresourceIndex = 0;
+        const D3D12_BOX box{ UINT(host.left), UINT(host.top), 0, UINT(host.right), UINT(host.bottom), 1 };
+        C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    }
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    C().list->ResourceBarrier(1, &b);
+    TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
+    GradeFrontBuffer(g_hudCopy.Get(), false, nullptr, target);
+    regpu::xr::StereoHudCaptured();
+    g_drawState.Invalidate();
+}
+
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
+    if (StereoHudDraw())
+    {
+        if (!g_stereoReplay)
+            StereoCaptureHud();
+        // REGPU_VR_SHOW_HUD=1 (live): the composite not drawn at all: the picture is the HUD panel's (on black).
+        static LiveSwitch showHud("REGPU_VR_SHOW_HUD");
+        const uint32_t blend = gpureg::Get(RB_BLENDCONTROL0);
+        gpureg::Set(RB_BLENDCONTROL0, 0x00010001); // one, zero: the scene alone
+        if (!showHud)
+            DrawImpl(initiator, dmaBase, dmaSize);
+        gpureg::Set(RB_BLENDCONTROL0, blend);
+        g_perf.draws++;
+        g_passDraws++;
+        return;
+    }
     if (g_gpuShaders)
         PassMark("vs %08X ps %08X", uint32_t(C().vsHash), uint32_t(C().psHash));
     if (!g_perfTiming)
