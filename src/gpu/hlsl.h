@@ -30,6 +30,9 @@ struct TranslatedShader
     bool memExport = false;         // a vertex shader writing eA/eM (memory export): not translated, its writes are lost
     std::vector<uint32_t> vertexFetchConstants; // vertex shaders
     std::vector<std::array<uint32_t, 4>> vertexFetchLayout; // vfl[k] for each vertex fetch (see hlsl.cpp)
+    // The first full vertex fetch (Hyper's mesh decimation reads positions through it; from the FM2 port): fetch constant
+    // + 1 (0: none), format | 0x100 when signed, stride and offset in dwords.
+    std::array<uint32_t, 4> positionFetch{};
     // Float constants the code reads: c[0] up to this (exclusive), 256 with relative
     // addressing. Only these are uploaded per draw.
     uint32_t constantsUsed = 0;
