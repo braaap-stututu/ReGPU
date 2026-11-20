@@ -2057,7 +2057,9 @@ void VblankLoop()
         // keeps game time by the clock, not by frames, so vblanks run at twice the frame cap
         // (120-720 Hz) and the limiter in VdSwap sets the frame rate for both.
         static const char* fixedHz = getenv("REGPU_VBLANK_HZ");
-        const int hz = fixedHz ? std::clamp(atoi(fixedHz), 30, 1000) : std::clamp(int(FrameCap()) * 2, 120, 720);
+        // (REGPU_VBLANK_HZ up to 4000: a title that presents on vblank boundaries waits less for the next one at
+        // high rates, with ReGPU's limiter holding the frame cap.)
+        const int hz = fixedHz ? std::clamp(atoi(fixedHz), 30, 4000) : std::clamp(int(FrameCap()) * 2, 120, 720);
         const int64_t defaultUs = int64_t(1000000 / hz);
         // A host that owns the video mode (driver::SetRefreshRate) sets the rate instead.
         const int64_t hostUs = g_vblankUs.load(std::memory_order_relaxed);
