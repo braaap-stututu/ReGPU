@@ -409,6 +409,8 @@ struct Emitter
     TranslatedShader& result;
     bool layoutOnly = false;   // only collect the vertex fetch layout (no HLSL)
     bool literalFetch = false; // a fetch had to be baked into the code
+    bool mayMakeInf = false;   // a scalar op that can give inf or NaN (raw rcp/rsq/log, sqrt, exp2): keeps 0 x inf = 0
+    bool mayMakeInfStrict = false; // the same without rsq/sqrt (REGPU_PLAIN_MUL_PS=3: normalize's rsq counted safe)
     mutable bool exportsDepth = false; // a pixel shader writing depth (export 61)
     uint32_t lastStride = 0;
     uint32_t lastSrc = 0, lastSrcSwizzle = 0; // mini fetches reuse the full fetch's index
@@ -534,6 +536,15 @@ struct Emitter
     // Emits code computing the scalar result into `s`; may update p.
     std::string ScalarCode(const Alu& a)
     {
+        // Raw reciprocal / reciprocal square root / log (inf at 0, NaN below 0), log with its -inf clamped (NaN below 0
+        // stays), square root (NaN below 0) and exp2 (overflow): a later multiply by 0 may rely on Xenos' 0 x inf = 0.
+        switch (a.scalarOp)
+        {
+        case 14: case 15: case 16: case 19: case 22: case 40: mayMakeInf = true; break;
+        default: break;
+        }
+        if (a.scalarOp == 14 || a.scalarOp == 15 || a.scalarOp == 16 || a.scalarOp == 19)
+            mayMakeInfStrict = true;
         const std::string sv = Src(a.src[2]);
         const std::string A = sv + ".w", B = sv + ".x";
         auto set = [](const std::string& e) { return "s = " + e + ";"; };
@@ -1212,12 +1223,12 @@ void ReplaceOnce(std::string& h, const char* from, const char* to)
         h.replace(at, strlen(from), to);
 }
 
-std::string Preamble()
+std::string Preamble(bool plainMul)
 {
     std::string h = kPreamble;
     if (LeanVertexFetch())
         ReplaceOnce(h, kOrigVFetch, kLeanVFetch);
-    if (PlainMulPixel())
+    if (plainMul)
         ReplaceOnce(h, kOrigMul, kPlainMul);
     return LeanFetch() ? h + kLeanFetch : h;
 }
@@ -1259,8 +1270,19 @@ bool LeanVertexFetch()
 
 bool PlainMulPixel()
 {
-    static const bool plain = EnvOn("REGPU_PLAIN_MUL_PS");
-    return plain;
+    return PlainMulPixelLevel() != 0;
+}
+
+// REGPU_PLAIN_MUL_PS: 0/unset off, 2 safe shaders only (no op that can give inf/NaN), anything else 1 = every pixel shader.
+int PlainMulPixelLevel()
+{
+    static const int level = [] {
+        const char* v = getenv("REGPU_PLAIN_MUL_PS");
+        if (!v || !*v || strcmp(v, "0") == 0)
+            return 0;
+        return atoi(v) == 2 ? 2 : atoi(v) == 3 ? 3 : 1;
+    }();
+    return level;
 }
 
 bool BakedVertexFetch()
@@ -1347,7 +1369,14 @@ TranslatedShader TranslateShader(const Shader& shader)
         return result;
     }
 
-    std::string h = Preamble();
+    // REGPU_PLAIN_MUL_PS=1: plain multiplies in every pixel shader; =2: only in those with no op that can give inf or NaN
+    // (session 33 of the FM3 port: =1 turned the crowd's waving flags black, a shader relying on 0 x inf = 0).
+    const int plainLevel = PlainMulPixelLevel();
+    // (=3: like 2, but square roots and reciprocal square roots (normalize) don't keep the rule.)
+    const bool unsafe = plainLevel == 3 ? e.mayMakeInfStrict : e.mayMakeInf;
+    std::string h = Preamble(plainLevel == 1 || (plainLevel >= 2 && shader.pixel && !unsafe));
+    if (plainLevel >= 2 && shader.pixel)
+        result.plainMul = !unsafe;
     result.bodyStart = h.size();
     std::vector<uint32_t> regs = ScalarRegisters(e.out);
     std::string decl;

@@ -113,6 +113,7 @@ struct Upscale
     bool tried = false, ready = false;
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> easu, rcas, depthCopy, gamma, enhance;
+    ComPtr<ID3D12PipelineState> gammaDraw; // the gamma pass as a draw into the back buffer (GradeIntoBackBuffer)
     ComPtr<ID3D12Resource> dlaaOut; // DLAA output (scene size), copied back into the scene image
     ComPtr<ID3D12Resource> depth; // temporal: the scene's depth as R32 (render size, top left)
     ComPtr<ID3D12Resource> temp; // EASU output (RGBA16F)
@@ -728,6 +729,7 @@ struct Renderer
     ComPtr<ID3D12PipelineState> colorBlit8, colorBlit16;  // colour -> 8888 / RGBA16F, scaled
     ComPtr<ID3D12PipelineState> depthBlitMs, colorBlitMs8, colorBlitMs16; // the same from multisampled surfaces
     ComPtr<ID3D12PipelineState> colorBlit10, colorBlitMs10; // colour -> R10G10B10A2 (REGPU_COPIES_1010102)
+    ComPtr<ID3D12Resource> resolveScratch; // REGPU_RESOLVE_TWO_STEP: the colour surface averaged to 1x (BlitResolve)
     // EDRAM surfaces: one host colour and one host depth target per EDRAM base
     // (RB_COLOR_INFO / RB_DEPTH_INFO bits 0-11), so passes that the title
     // places at different EDRAM offsets do not overwrite each other.
@@ -7219,7 +7221,58 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
         TransitionColor(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     C().list->ResourceBarrier(barriers, b);
 
-    const bool ms = g_msaa > 1;
+    bool ms = g_msaa > 1;
+    // REGPU_RESOLVE_TWO_STEP=1 (live, session 33 of the FM3 port): a multisampled colour resolve in two steps: the
+    // hardware averages the rectangle's samples into a 1x scratch copy of the surface (ResolveSubresourceRegion, which
+    // can use the MSAA compression instead of reading every sample), then the usual 1x pass scales and converts from it.
+    // At 4K 4x the three colour resolves took 0.63 ms of FM3's 4.2 ms GPU frame, each reading all samples in a shader.
+    static LiveSwitch twoStep("REGPU_RESOLVE_TWO_STEP");
+    if (ms && !depth && twoStep && f.descriptorsUsed < kDescriptorsPerFrame)
+    {
+        const D3D12_RESOURCE_DESC cd = C().color->GetDesc();
+        if (!g_r.resolveScratch || g_r.resolveScratch->GetDesc().Width != cd.Width || g_r.resolveScratch->GetDesc().Height != cd.Height)
+        {
+            if (g_r.resolveScratch)
+                Frame().garbage.push_back(std::move(g_r.resolveScratch));
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC td = cd;
+            td.SampleDesc = { 1, 0 };
+            td.Format = kColorFormat;
+            td.Flags = D3D12_RESOURCE_FLAG_NONE;
+            if (SUCCEEDED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                    IID_PPV_ARGS(&g_r.resolveScratch))))
+                CountCreate("resolve scratch");
+        }
+        if (g_r.resolveScratch)
+        {
+            // The colour surface: shader resource (above) -> resolve source; the scratch: shader resource -> resolve destination.
+            D3D12_RESOURCE_BARRIER rb[2]{};
+            rb[0].Type = rb[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            rb[0].Transition.pResource = C().color.Get();
+            rb[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            rb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            rb[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+            rb[1].Transition.pResource = g_r.resolveScratch.Get();
+            rb[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            rb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            rb[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+            C().list->ResourceBarrier(2, rb);
+            const D3D12_RECT src = ToHost(sr);
+            C().list->ResolveSubresourceRegion(g_r.resolveScratch.Get(), UINT(src.left), UINT(src.top), C().color.Get(), src, kColorFormat);
+            for (auto& x : rb)
+                std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+            C().list->ResourceBarrier(2, rb);
+            // The 1x pass reads the scratch copy at the same place.
+            D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+            sv.Format = kColorFormat;
+            sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sv.Texture2D.MipLevels = 1;
+            g_r.device->CreateShaderResourceView(g_r.resolveScratch.Get(), &sv, Cpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
+            ms = false;
+        }
+    }
     ID3D12PipelineState* pso = depth ? (ms ? g_r.depthBlitMs.Get() : g_r.depthBlit.Get())
         : format == DXGI_FORMAT_R8G8B8A8_UNORM ? (ms ? g_r.colorBlitMs8.Get() : g_r.colorBlit8.Get())
         : format == DXGI_FORMAT_R10G10B10A2_UNORM ? (ms ? g_r.colorBlitMs10.Get() : g_r.colorBlit10.Get())
@@ -7783,6 +7836,46 @@ bool InitUpscale()
     pd.CS = { kEnhanceMain, sizeof(kEnhanceMain) };
     if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.enhance))))
         return false;
+    {
+        // The display gamma pass drawn into the back buffer (session 33; the swap chain can't be a UAV). Same ramp as
+        // GammaMain in fsr1.hlsl, same constants and root signature.
+        static const char kGammaDraw[] = R"(
+cbuffer C : register(b0) { uint4 q0, q1, q2, q3, q4, outSize; };
+Texture2D<float4> src : register(t0);
+float4 vs(uint id : SV_VertexID) : SV_Position { return float4(float(id == 1) * 4.0 - 1.0, float(id == 2) * -4.0 + 1.0, 0, 1); }
+float Curve(float x, float p[17]) { const float f = saturate(x) * 16.0; const uint i = min(uint(f), 15u); return lerp(p[i], p[i + 1], f - float(i)); }
+float4 ps(float4 pos : SV_Position) : SV_Target
+{
+    const uint4 q[5] = { q0, q1, q2, q3, q4 };
+    float p[17];
+    [unroll] for (uint k = 0; k < 17; k++) p[k] = asfloat(q[k / 4][k % 4]);
+    const float4 c = src.Load(int3(pos.xy, 0));
+    return float4(Curve(c.r, p), Curve(c.g, p), Curve(c.b, p), c.a);
+}
+)";
+        ComPtr<ID3DBlob> vs, ps, err;
+        if (SUCCEEDED(D3DCompile(kGammaDraw, sizeof(kGammaDraw) - 1, nullptr, nullptr, nullptr, "vs", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vs, &err)) &&
+            SUCCEEDED(D3DCompile(kGammaDraw, sizeof(kGammaDraw) - 1, nullptr, nullptr, nullptr, "ps", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps, &err)))
+        {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC gd{};
+            gd.pRootSignature = g_upscale.root.Get();
+            gd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+            gd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+            gd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            gd.SampleMask = UINT_MAX;
+            gd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            gd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            gd.RasterizerState.DepthClipEnable = TRUE;
+            gd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            gd.NumRenderTargets = 1;
+            gd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            gd.SampleDesc.Count = 1;
+            if (FAILED(g_r.device->CreateGraphicsPipelineState(&gd, IID_PPV_ARGS(&g_upscale.gammaDraw))))
+                Log("gamma: back-buffer pass pipeline failed: grading into a copy");
+        }
+        else
+            Log("gamma: back-buffer pass failed to compile: %s", err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+    }
     g_upscale.ready = true;
     Log("upscale: FSR 1 ready (scene at %.0f%% of %ux%u)", GetSettings().SceneScale() * 100.0f, OutputWidth(), OutputHeight());
     return true;
@@ -7804,9 +7897,94 @@ std::atomic<bool> g_gammaPwlSet{ false };
 ComPtr<ID3D12Resource> g_gammaOut;
 ComPtr<ID3D12Resource> g_enhanceOut; // enhanced lighting output (Settings::enhance)
 
+// The gamma pass straight into the back buffer (FM3 port, session 33): GradeFrontBuffer fills one of these for the
+// frame end (PresenterRecordCopy's grade callback, GradeIntoBackBuffer) instead of grading into g_gammaOut, which was
+// then copied: one 4K RGBA8 write and read less (~4% at 4K 4x). REGPU_GAMMA_COPY=1 (live): the old way.
+struct GradeJob
+{
+    bool valid = false;
+    uint32_t c[24] = {};
+    UINT slots = 0; // the image's SRV
+    ID3D12Resource* image = nullptr; // COPY_SOURCE at the frame end
+};
+GradeJob g_gradeJobs[kFrames];
+
+void GradeIntoBackBuffer(ID3D12GraphicsCommandList* l, size_t rtvPtr, uint32_t width, uint32_t height, void* ctx)
+{
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv{ rtvPtr };
+    const GradeJob& j = *static_cast<const GradeJob*>(ctx);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = j.image;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    l->ResourceBarrier(1, &b);
+    l->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    const D3D12_VIEWPORT vp{ 0, 0, float(width), float(height), 0, 1 };
+    const D3D12_RECT sc{ 0, 0, LONG(width), LONG(height) };
+    l->RSSetViewports(1, &vp);
+    l->RSSetScissorRects(1, &sc);
+    l->SetGraphicsRootSignature(g_upscale.root.Get());
+    l->SetGraphicsRoot32BitConstants(0, 24, j.c, 0);
+    l->SetGraphicsRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), j.slots, g_r.srvStride));
+    l->SetGraphicsRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), j.slots, g_r.srvStride)); // (unused UAV range)
+    l->SetPipelineState(g_upscale.gammaDraw.Get());
+    l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    l->DrawInstanced(3, 1, 0, 0);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    l->ResourceBarrier(1, &b);
+}
+
+// The same pass into a texture (COPY_SOURCE afterwards), for frames the debug server or a dump reads (they read the
+// image before the present, which in this mode is not graded).
+ComPtr<ID3D12Resource> g_gammaDrawOut;
+ComPtr<ID3D12DescriptorHeap> g_gammaDrawRtv;
+ID3D12Resource* GradeIntoTexture(GradeJob* job)
+{
+    const D3D12_RESOURCE_DESC desc = job->image->GetDesc();
+    if (!g_gammaDrawRtv)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = 1;
+        if (FAILED(g_r.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_gammaDrawRtv))))
+            return job->image;
+    }
+    if (!g_gammaDrawOut || g_gammaDrawOut->GetDesc().Width != desc.Width || g_gammaDrawOut->GetDesc().Height != desc.Height)
+    {
+        D3D12_RESOURCE_DESC td = desc;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        RetireTexture(std::move(g_gammaDrawOut));
+        g_gammaDrawOut = CreateTexture(td, D3D12_RESOURCE_STATE_COPY_SOURCE, "gamma draw");
+        if (!g_gammaDrawOut)
+            return job->image;
+        g_r.device->CreateRenderTargetView(g_gammaDrawOut.Get(), nullptr, g_gammaDrawRtv->GetCPUDescriptorHandleForHeapStart());
+    }
+    C().list->Call(
+        [](ID3D12GraphicsCommandList* l, void* ctx) {
+            GradeJob* j = static_cast<GradeJob*>(ctx);
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = g_gammaDrawOut.Get();
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            l->ResourceBarrier(1, &b);
+            const D3D12_RESOURCE_DESC d = g_gammaDrawOut->GetDesc();
+            GradeIntoBackBuffer(l, g_gammaDrawRtv->GetCPUDescriptorHandleForHeapStart().ptr, uint32_t(d.Width), d.Height, j);
+            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+            l->ResourceBarrier(1, &b);
+        },
+        job);
+    g_drawState.Invalidate();
+    return g_gammaDrawOut.Get();
+}
+
 // Returns the graded copy of `image` (in COPY_SOURCE state), or null to show it as is. `pwl`: the
 // front buffer is k_2_10_10_10, so the display uses the PWL ramp. REGPU_NO_GAMMA_PWL=1: always the table.
-ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl)
+// With `direct`, a pass that grades fills *direct (valid) for the frame end and returns null.
+ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl, GradeJob* direct = nullptr)
 {
     static LiveSwitch off("REGPU_NO_GAMMA"), noPwl("REGPU_NO_GAMMA_PWL");
     pwl = pwl && !noPwl && g_gammaPwlSet.load(std::memory_order_relaxed);
@@ -7848,6 +8026,25 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl)
     FrameResources& f = Frame();
     if (f.descriptorsUsed + 2 > kDescriptorsPerFrame)
         return nullptr;
+    if (direct && g_upscale.gammaDraw)
+    {
+        direct->slots = f.descriptorBase + f.descriptorsUsed;
+        f.descriptorsUsed += 1;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        g_r.device->CreateShaderResourceView(image, &srv, Cpu(g_r.srvHeap.Get(), direct->slots, g_r.srvStride));
+        memset(direct->c, 0, sizeof(direct->c));
+        memcpy(direct->c, points, sizeof(points));
+        direct->c[20] = uint32_t(desc.Width);
+        direct->c[21] = desc.Height;
+        direct->image = image;
+        direct->valid = true;
+        g_drawState.Invalidate(); // (the frame end sets the compute pipeline)
+        return nullptr;
+    }
     if (!g_gammaOut || g_gammaOut->GetDesc().Width != desc.Width || g_gammaOut->GetDesc().Height != desc.Height)
     {
         D3D12_RESOURCE_DESC td = desc;
@@ -10303,6 +10500,7 @@ bool RendererIsResolveDraw()
 
 uint64_t RendererFenceSubmit() { return FenceSubmitImpl(); }
 bool LongFramesOn() { return LongFramesEnabled(); }
+bool RegpuPerfLiteOn() { return PerfLiteOn(); } // (render/presenter.cpp)
 void RendererDrawThreadIdle(double ms) { g_drawIdleMs += ms; }
 // A host's long-frame callback (driver::SetLongFrameCallback): called on the draw thread at the end of a long frame,
 // e.g. to log stack samples taken while it ran. It must be quick.
@@ -13339,6 +13537,25 @@ void LogThread()
                     double(n) / windowS, sum / double(n),
                     double(sorted[k]), worst, double(r.draws - windowFirst.draws) / double(n),
                     gpuFrames ? (r.gpuMs - windowFirst.gpuMs) / double(gpuFrames) : 0.0, busy, longText);
+                // Video memory every 5th line (session 33 of the FM3 port: high resolutions): what the process uses of the
+                // budget the OS gives it, from DXGI on this log thread (nothing on the draw thread).
+                static uint32_t vramLines = 0;
+                if (vramLines++ % 5 == 0 && g_r.device)
+                {
+                    static ComPtr<IDXGIAdapter3> adapter = [] {
+                        ComPtr<IDXGIFactory4> factory;
+                        ComPtr<IDXGIAdapter3> a;
+                        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+                            factory->EnumAdapterByLuid(g_r.device->GetAdapterLuid(), IID_PPV_ARGS(&a));
+                        return a;
+                    }();
+                    DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
+                    if (adapter && SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+                        SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared)))
+                        Log("perf lite: VRAM %llu MB used of %llu MB budget | system memory for the GPU %llu MB of %llu MB",
+                            (unsigned long long)(local.CurrentUsage >> 20), (unsigned long long)(local.Budget >> 20),
+                            (unsigned long long)(shared.CurrentUsage >> 20), (unsigned long long)(shared.Budget >> 20));
+                }
                 windowFirst = r, cpuFirst = cpuNow;
                 frameMs.clear();
             }
@@ -13988,10 +14205,16 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     const bool fromResolve = it != g_r.resolved.end() && it->second.width == kWidth && it->second.height == kHeight &&
         it->second.format == DXGI_FORMAT_R8G8B8A8_UNORM;
     ID3D12Resource* graded = nullptr; // the front buffer through the display's gamma table
+    GradeJob* gradeJob = nullptr;     // ... graded straight into the back buffer at the frame end
     if (fromResolve)
     {
         image = it->second.resource.Get();
-        graded = GradeFrontBuffer(image, it->second.guestFormat == 7);
+        static LiveSwitch gammaCopy("REGPU_GAMMA_COPY");
+        GradeJob& job = g_gradeJobs[g_r.frameIndex];
+        job.valid = false;
+        graded = GradeFrontBuffer(image, it->second.guestFormat == 7, gammaCopy || GetSettings().enhance ? nullptr : &job);
+        if (job.valid)
+            gradeJob = &job;
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.pResource = image;
@@ -14023,14 +14246,16 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         ID3D12Resource *shown = nullptr, *overlay = nullptr, *timer = nullptr;
         UINT64 fence = 0;
         ID3D12Resource* fps = nullptr;
+        GradeJob* grade = nullptr;
     };
     static AsyncEnd asyncEnds[kFrames];
     AsyncEnd& asyncEnd = asyncEnds[g_r.frameIndex];
     bool presenting = false;
     if (asyncPresent)
-        asyncEnd = { fromResolve, shown, overlay, timer, 0, fps };
+        asyncEnd = { fromResolve, shown, overlay, timer, 0, fps, gradeJob };
     else
-        presenting = fromResolve && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH, timer, kTimerW, kTimerH, fps, kFpsW, kFpsH);
+        presenting = fromResolve && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH, timer, kTimerW, kTimerH, fps, kFpsW, kFpsH,
+            gradeJob ? GradeIntoBackBuffer : nullptr, gradeJob);
     {
         const uint64_t traceFrame = TraceFrame();
         if (traceFrame && g_r.frame + 1 == traceFrame)
@@ -14111,7 +14336,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, OutputWidth(), OutputHeight(), 1, (OutputWidth() * 4 + 255) & ~255u };
         D3D12_TEXTURE_COPY_LOCATION src{};
-        src.pResource = shown;
+        src.pResource = gradeJob ? GradeIntoTexture(gradeJob) : shown; // (graded only into the back buffer otherwise)
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
@@ -14218,7 +14443,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         C().list->Call(
             [](ID3D12GraphicsCommandList* l, void* ctx) {
                 const AsyncEnd& e = *static_cast<const AsyncEnd*>(ctx);
-                const bool show = e.copy && PresenterRecordCopy(l, e.shown, e.overlay, kOverlayW, kOverlayH, e.timer, kTimerW, kTimerH, e.fps, kFpsW, kFpsH);
+                const bool show = e.copy && PresenterRecordCopy(l, e.shown, e.overlay, kOverlayW, kOverlayH, e.timer, kTimerW, kTimerH, e.fps, kFpsW, kFpsH,
+                    e.grade ? GradeIntoBackBuffer : nullptr, e.grade);
                 l->Close();
                 ID3D12CommandList* lists[] = { l };
                 SubmitLists(1, lists);
