@@ -1516,7 +1516,9 @@ uint32_t ExecutePacket(uint32_t ptr)
             seg::Flush();
         // A memory poll may wait for a fence the worker writes: let it catch up, unless the
         // condition already holds (most waits are for values the title set).
-        if ((info & 0x10) && !WaitCompare(info & 7, ReadBack(arg(1)) & arg(3), arg(2)))
+        // REGPU_NO_WAIT_DRAIN=1 (live, test): no drain here; the wait polls while the draw thread runs on.
+        static LiveSwitch noWaitDrain("REGPU_NO_WAIT_DRAIN");
+        if ((info & 0x10) && !noWaitDrain && !WaitCompare(info & 7, ReadBack(arg(1)) & arg(3), arg(2)))
             work::Drain();
         g_gpu.waitingOn = arg(1);
         g_gpu.waitingRef = arg(2);
@@ -1577,8 +1579,12 @@ uint32_t ExecutePacket(uint32_t ptr)
         break;
     }
     case 0x54: // INTERRUPT: cpu mask
+    {
         seg::Flush();
-        work::Drain(); // after the draws before it, like the hardware
+        // REGPU_NO_INTERRUPT_DRAIN=1 (live, test): the handler runs without waiting for the draw thread.
+        static LiveSwitch noInterruptDrain("REGPU_NO_INTERRUPT_DRAIN");
+        if (!noInterruptDrain)
+            work::Drain(); // after the draws before it, like the hardware
         if (!g_noFenceOrder)
             PendingWrites::Drain(); // and after the fence writes before it
         for (uint32_t cpu = 0; cpu < 6; cpu++)
@@ -1593,6 +1599,7 @@ uint32_t ExecutePacket(uint32_t ptr)
             }
         }
         break;
+    }
     case 0x60: // SET_BIN_MASK_LO
         g_gpu.binMask = (g_gpu.binMask & 0xFFFFFFFF00000000ull) | arg(0);
         break;
