@@ -10,12 +10,9 @@
 #include "log.h"
 #include "regpu/regpu.h"
 
-// The OpenXR session below is still the D3D12 one (XR_KHR_D3D12_enable): on Vulkan (XR_KHR_vulkan_enable2) it is to be
-// ported. Until then every build takes the stub, and REGPU_VR says so in the log.
-#ifndef REGPU_OPENXR_VULKAN
-#define REGPU_OPENXR_VULKAN 0
-#endif
-#if !REGPU_OPENXR || !REGPU_OPENXR_VULKAN
+// The session runs on ReGPU's Vulkan device and queue (XR_KHR_vulkan_enable, or enable2): ported from the D3D12 one
+// (XR_KHR_D3D12_enable) in November 2026, its logic unchanged. Built without OpenXR: the stub below.
+#if !REGPU_OPENXR
 
 namespace regpu::xr
 {
@@ -25,7 +22,7 @@ bool Wanted()
     if (getenv("REGPU_VR") && !logged)
     {
         logged = true;
-        Log("vr: REGPU_VR is set but VR is not available in this build (no OpenXR, or its Vulkan session is not ported yet)");
+        Log("vr: REGPU_VR is set but VR is not available in this build (built without OpenXR: REGPU_OPENXR_DIR)");
     }
     return false;
 }
@@ -52,9 +49,7 @@ void Recentre() {}
 
 #include <windows.h>
 
-#include <d3d12.h>
-#include <unknwn.h>
-#include <wrl/client.h>
+#include <unknwn.h> // (IUnknown: openxr_platform.h's Win32 declarations)
 
 #include <algorithm>
 #include <atomic>
@@ -62,24 +57,26 @@ void Recentre() {}
 #include <cmath>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
 
-#define XR_USE_GRAPHICS_API_D3D12
+#include "gpu/vk/device.h"
+#include "gpu/vk/resources.h"
+
+#define XR_USE_GRAPHICS_API_VULKAN
 #define XR_USE_PLATFORM_WIN32
 #define XR_NO_PROTOTYPES
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-
-using Microsoft::WRL::ComPtr;
 
 namespace
 {
 // The OpenXR functions used, fetched from the loader at run time (no link to it).
 #define REGPU_XR_GLOBAL(X) X(xrCreateInstance) X(xrEnumerateInstanceExtensionProperties)
 #define REGPU_XR_INSTANCE(X)                                                                                                     \
-    X(xrDestroyInstance) X(xrGetSystem) X(xrGetSystemProperties) X(xrGetD3D12GraphicsRequirementsKHR) X(xrCreateSession)          \
+    X(xrDestroyInstance) X(xrGetSystem) X(xrGetSystemProperties) X(xrCreateSession)          \
     X(xrDestroySession) X(xrCreateReferenceSpace) X(xrDestroySpace) X(xrEnumerateSwapchainFormats) X(xrCreateSwapchain)          \
     X(xrDestroySwapchain) X(xrEnumerateSwapchainImages) X(xrAcquireSwapchainImage) X(xrWaitSwapchainImage)                      \
     X(xrReleaseSwapchainImage) X(xrPollEvent) X(xrBeginSession) X(xrEndSession) X(xrWaitFrame) X(xrBeginFrame) X(xrEndFrame)     \
@@ -90,12 +87,21 @@ PFN_xrGetInstanceProcAddr xrGetInstanceProcAddr = nullptr;
 REGPU_XR_GLOBAL(REGPU_XR_DECLARE)
 REGPU_XR_INSTANCE(REGPU_XR_DECLARE)
 #undef REGPU_XR_DECLARE
+// The Vulkan binding's functions: XR_KHR_vulkan_enable's or enable2's, whichever the runtime has (loaded per instance).
+PFN_xrGetVulkanGraphicsRequirementsKHR xrGetVulkanGraphicsRequirementsKHR = nullptr;
+PFN_xrGetVulkanGraphicsDeviceKHR xrGetVulkanGraphicsDeviceKHR = nullptr;
+PFN_xrGetVulkanInstanceExtensionsKHR xrGetVulkanInstanceExtensionsKHR = nullptr;
+PFN_xrGetVulkanDeviceExtensionsKHR xrGetVulkanDeviceExtensionsKHR = nullptr;
+PFN_xrGetVulkanGraphicsRequirements2KHR xrGetVulkanGraphicsRequirements2KHR = nullptr;
+PFN_xrGetVulkanGraphicsDevice2KHR xrGetVulkanGraphicsDevice2KHR = nullptr;
 
 // The finished frame for the headset: written where the presenter copies into the back buffer, read by the headset
-// thread; both on the one queue, so in submission order. Kept in COMMON between the two.
+// thread; both on the one queue, so in submission order. Kept in TRANSFER_SRC_OPTIMAL between the two (each side's
+// barrier makes the other's earlier writes visible: barriers cover everything earlier on the queue).
 std::mutex g_screenMutex;
-ComPtr<ID3D12Resource> g_screen;
-std::vector<ComPtr<ID3D12Resource>> g_oldScreens; // replaced ones, kept a while (commands in flight may read them)
+std::unique_ptr<vk::Image> g_screen;
+bool g_screenFresh = false;                          // (g_screenMutex) made since its last copy: UNDEFINED
+std::vector<std::unique_ptr<vk::Image>> g_oldScreens; // replaced ones, kept a while (commands in flight may read them)
 std::atomic<bool> g_capturing{ false };
 // Head-tracked frames (regpu::vr): the pose each game frame was rendered with, in frame order, paired with the captured
 // frames in order; the screen's own pose comes with it.
@@ -132,8 +138,9 @@ std::atomic<uint64_t> g_posesMissing{ 0 };
 std::mutex g_capturedMutex;
 std::condition_variable g_capturedCv;
 // Stereo (REGPU_VR=stereo): the two eyes' images of the newest stereo frame (renderer.cpp RendererStereoCaptureEye
-// grades into them; COMMON between uses), and whether the frame CaptureFrame took was one.
-ComPtr<ID3D12Resource> g_eyes[3];          // (g_screenMutex) [2]: the HUD panel's image (premultiplied alpha)
+// grades into them; the renderer leaves them SHADER_READ_ONLY_OPTIMAL, its own state tracking, and the headset thread's
+// copies put them back so), and whether the frame CaptureFrame took was one.
+std::unique_ptr<vk::Image> g_eyes[3];      // (g_screenMutex) [2]: the HUD panel's image (premultiplied alpha)
 std::atomic<bool> g_hudThisFrame{ false };  // the HUD written since the last CaptureFrame
 bool g_screenHud = false;                   // (g_screenMutex) the captured frame has its HUD in g_eyes[2]
 std::atomic<bool> g_eyesThisFrame{ false }; // both eyes written since the last CaptureFrame
@@ -144,8 +151,7 @@ std::atomic<bool> g_lastPosed{ false };
 std::atomic<float> g_lastFovY{ 0.0f };
 std::atomic<float> g_ipd{ 0.064f };
 std::atomic<bool> g_recentre{ false }; // regpu::vr::Recentre or F8: the headset thread recentres at its next frame
-ComPtr<ID3D12Device> g_device;
-ComPtr<ID3D12CommandQueue> g_queue;
+vk::Device* g_dev = nullptr;
 
 std::string ResultText(XrInstance instance, XrResult r)
 {
@@ -155,16 +161,59 @@ std::string ResultText(XrInstance instance, XrResult r)
     return std::string(text) + " (" + std::to_string(int(r)) + ")";
 }
 
-void Barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+// A layout change with a full dependency on everything before (the copies here are few and small).
+void Barrier(VkCommandBuffer cb, VkImage image, VkImageLayout before, VkImageLayout after)
 {
-    D3D12_RESOURCE_BARRIER b{};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = resource;
-    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = before;
-    b.Transition.StateAfter = after;
-    list->ResourceBarrier(1, &b);
+    VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.oldLayout = before;
+    b.newLayout = after;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cb, &di);
 }
+
+void Copy(VkCommandBuffer cb, VkImage src, VkImage dst, uint32_t w, uint32_t h, int32_t dstX = 0)
+{
+    VkImageCopy c{};
+    c.srcSubresource = c.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    c.dstOffset = { dstX, 0, 0 };
+    c.extent = { w, h, 1 };
+    vkCmdCopyImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+}
+
+// The swapchain format for a source image (copied byte for byte): its sRGB twin (the runtime then reads the gamma-
+// encoded bytes as sRGB), else itself.
+VkFormat SrgbTwin(VkFormat f)
+{
+    return f == VK_FORMAT_R8G8B8A8_UNORM ? VK_FORMAT_R8G8B8A8_SRGB : f == VK_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_SRGB : f;
+}
+
+// Keeps a replaced image a while (commands in flight may still read it), releasing the oldest.
+void Retire(std::unique_ptr<vk::Image>& image)
+{
+    if (!image)
+        return;
+    g_oldScreens.push_back(std::move(image));
+    while (g_oldScreens.size() > 8)
+    {
+        vk::Destroy(*g_dev, *g_oldScreens.front());
+        g_oldScreens.erase(g_oldScreens.begin());
+    }
+}
+
+// The runtime may use the queue in these calls (XR_KHR_vulkan_enable): held as ReGPU's own submissions hold it.
+struct QueueLock
+{
+    std::lock_guard<std::mutex> lock{ g_dev->queueLock };
+};
 
 float EnvFloat(const char* name, float fallback)
 {
@@ -200,6 +249,16 @@ bool LoadInstanceFunctions(XrInstance instance)
     }
     REGPU_XR_INSTANCE(REGPU_XR_LOAD)
 #undef REGPU_XR_LOAD
+    auto optional = [&](const char* name, auto& fn) {
+        fn = nullptr;
+        xrGetInstanceProcAddr(instance, name, reinterpret_cast<PFN_xrVoidFunction*>(&fn));
+    };
+    optional("xrGetVulkanGraphicsRequirementsKHR", xrGetVulkanGraphicsRequirementsKHR);
+    optional("xrGetVulkanGraphicsDeviceKHR", xrGetVulkanGraphicsDeviceKHR);
+    optional("xrGetVulkanInstanceExtensionsKHR", xrGetVulkanInstanceExtensionsKHR);
+    optional("xrGetVulkanDeviceExtensionsKHR", xrGetVulkanDeviceExtensionsKHR);
+    optional("xrGetVulkanGraphicsRequirements2KHR", xrGetVulkanGraphicsRequirements2KHR);
+    optional("xrGetVulkanGraphicsDevice2KHR", xrGetVulkanGraphicsDevice2KHR);
     return ok;
 }
 
@@ -285,21 +344,20 @@ struct Session
     // Stereo: one swapchain image holding both eyes side by side (left in the left half).
     XrSwapchain pair = XR_NULL_HANDLE;
     uint32_t pairW = 0, pairH = 0;
-    std::vector<ID3D12Resource*> pairImages;
+    std::vector<VkImage> pairImages;
     // The HUD panel (stereo frames whose title draws its HUD apart: renderer.cpp StereoHudDraw).
     XrSwapchain hud = XR_NULL_HANDLE;
     uint32_t hudW = 0, hudH = 0;
-    std::vector<ID3D12Resource*> hudImages;
-    int64_t quadFormat = 0;
-    std::vector<ID3D12Resource*> images;
+    std::vector<VkImage> hudImages;
+    int64_t quadFormat = 0, pairFormat = 0;
+    std::vector<VkImage> images;
+    bool vulkan2 = false; // XR_KHR_vulkan_enable2 (else enable)
     static constexpr uint32_t kLists = 3;
-    ComPtr<ID3D12CommandAllocator> allocators[kLists];
-    ComPtr<ID3D12GraphicsCommandList> list;
-    ComPtr<ID3D12Fence> fence;
-    uint64_t fenceValues[kLists] = {};
-    uint64_t nextFence = 1;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer lists[kLists] = {};
+    uint64_t listValues[kLists] = {}; // the device timeline value each list's last submission signals
+    uint64_t lastValue = 0;
     uint32_t listIndex = 0;
-    HANDLE fenceEvent = nullptr;
     bool running = false;
     uint32_t recommendedW = 0, recommendedH = 0;
     bool densityLogged = false;
@@ -314,12 +372,17 @@ struct Session
         }
         if (view)
             xrDestroySpace(view);
-        if (quad)
-            xrDestroySwapchain(quad);
-        if (pair)
-            xrDestroySwapchain(pair);
-        if (hud)
-            xrDestroySwapchain(hud);
+        if (lastValue)
+            vk::WaitFor(*g_dev, lastValue, 2000000000ull);
+        {
+            QueueLock q;
+            if (quad)
+                xrDestroySwapchain(quad);
+            if (pair)
+                xrDestroySwapchain(pair);
+            if (hud)
+                xrDestroySwapchain(hud);
+        }
         for (XrSpace sp : oldSpaces)
             xrDestroySpace(sp);
         if (baseLocal && baseLocal != local)
@@ -327,11 +390,17 @@ struct Session
         if (local)
             xrDestroySpace(local);
         if (session)
+        {
+            QueueLock q;
             xrDestroySession(session);
+        }
         if (instance)
             xrDestroyInstance(instance);
-        if (fenceEvent)
-            CloseHandle(fenceEvent);
+        if (pool)
+        {
+            vk::WaitFor(*g_dev, lastValue, 2000000000ull);
+            vkDestroyCommandPool(g_dev->device, pool, nullptr);
+        }
     }
 
     // false: try again later (no runtime, no headset yet, ...). `quiet`: the reason was logged before.
@@ -341,16 +410,22 @@ struct Session
         xrEnumerateInstanceExtensionProperties(nullptr, 0, &count, nullptr);
         std::vector<XrExtensionProperties> exts(count, { XR_TYPE_EXTENSION_PROPERTIES });
         xrEnumerateInstanceExtensionProperties(nullptr, count, &count, exts.data());
-        bool d3d12 = false;
+        bool v1 = false, v2 = false;
         for (const auto& e : exts)
-            d3d12 |= strcmp(e.extensionName, XR_KHR_D3D12_ENABLE_EXTENSION_NAME) == 0;
-        if (!d3d12)
+        {
+            v1 |= strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0;
+            v2 |= strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0;
+        }
+        if (!v1 && !v2)
         {
             if (!quiet)
-                Log("vr: the OpenXR runtime has no Direct3D 12 support (%u extensions; is a runtime installed and active?)", count);
+                Log("vr: the OpenXR runtime has no Vulkan support (%u extensions; is a runtime installed and active?)", count);
             return false;
         }
-        const char* enabled[] = { XR_KHR_D3D12_ENABLE_EXTENSION_NAME };
+        // XR_KHR_vulkan_enable where the runtime has it: ReGPU's instance and device exist before the headset does, and
+        // enable lets an application bring its own (with the extensions the runtime asks for); enable2 otherwise.
+        vulkan2 = !v1;
+        const char* enabled[] = { vulkan2 ? XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME : XR_KHR_VULKAN_ENABLE_EXTENSION_NAME };
         XrInstanceCreateInfo ci{ XR_TYPE_INSTANCE_CREATE_INFO };
         strcpy_s(ci.applicationInfo.applicationName, "ReGPU");
         ci.applicationInfo.applicationVersion = 1;
@@ -376,25 +451,65 @@ struct Session
         }
         XrSystemProperties props{ XR_TYPE_SYSTEM_PROPERTIES };
         xrGetSystemProperties(instance, system, &props);
-        XrGraphicsRequirementsD3D12KHR req{ XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR };
-        if (XrResult r = xrGetD3D12GraphicsRequirementsKHR(instance, system, &req); XR_FAILED(r))
+        // The graphics requirements (the runtime insists on the call before the session), the GPU it wants, and with
+        // enable the extensions it wants on ReGPU's instance and device (logged when missing: the session may still work).
+        XrGraphicsRequirementsVulkanKHR req{ XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR };
+        VkPhysicalDevice wanted = VK_NULL_HANDLE;
+        if (vulkan2)
         {
-            Log("vr: xrGetD3D12GraphicsRequirementsKHR failed: %s", ResultText(instance, r).c_str());
-            return false;
+            if (!xrGetVulkanGraphicsRequirements2KHR || !xrGetVulkanGraphicsDevice2KHR)
+                return false;
+            if (XrResult r = xrGetVulkanGraphicsRequirements2KHR(instance, system, &req); XR_FAILED(r))
+            {
+                Log("vr: xrGetVulkanGraphicsRequirements2KHR failed: %s", ResultText(instance, r).c_str());
+                return false;
+            }
+            XrVulkanGraphicsDeviceGetInfoKHR gi{ XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR };
+            gi.systemId = system;
+            gi.vulkanInstance = g_dev->instance;
+            xrGetVulkanGraphicsDevice2KHR(instance, &gi, &wanted);
         }
-        const LUID ours = g_device->GetAdapterLuid();
-        if (ours.LowPart != req.adapterLuid.LowPart || ours.HighPart != req.adapterLuid.HighPart)
+        else
+        {
+            if (!xrGetVulkanGraphicsRequirementsKHR || !xrGetVulkanGraphicsDeviceKHR)
+                return false;
+            if (XrResult r = xrGetVulkanGraphicsRequirementsKHR(instance, system, &req); XR_FAILED(r))
+            {
+                Log("vr: xrGetVulkanGraphicsRequirementsKHR failed: %s", ResultText(instance, r).c_str());
+                return false;
+            }
+            xrGetVulkanGraphicsDeviceKHR(instance, system, g_dev->instance, &wanted);
+            auto list = [&](PFN_xrGetVulkanDeviceExtensionsKHR fn, const char* what) {
+                if (!fn)
+                    return;
+                uint32_t n = 0;
+                fn(instance, system, 0, &n, nullptr);
+                std::string names(n, '\0');
+                if (n && XR_SUCCEEDED(fn(instance, system, n, &n, names.data())))
+                    Log("vr: the runtime asks for %s extensions: %s", what, names.c_str());
+            };
+            list(xrGetVulkanInstanceExtensionsKHR, "instance");
+            list(xrGetVulkanDeviceExtensionsKHR, "device");
+        }
+        if (wanted && wanted != g_dev->physical)
             Log("vr: the headset runtime wants another graphics card than the one the game renders on (set it in the launcher)");
-        XrGraphicsBindingD3D12KHR binding{ XR_TYPE_GRAPHICS_BINDING_D3D12_KHR };
-        binding.device = g_device.Get();
-        binding.queue = g_queue.Get();
+        XrGraphicsBindingVulkanKHR binding{ XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR };
+        binding.instance = g_dev->instance;
+        binding.physicalDevice = g_dev->physical;
+        binding.device = g_dev->device;
+        binding.queueFamilyIndex = g_dev->queueFamily;
+        binding.queueIndex = 0;
         XrSessionCreateInfo sci{ XR_TYPE_SESSION_CREATE_INFO };
         sci.next = &binding;
         sci.systemId = system;
-        if (XrResult r = xrCreateSession(instance, &sci, &session); XR_FAILED(r))
         {
-            Log("vr: xrCreateSession failed: %s", ResultText(instance, r).c_str());
-            return false;
+            QueueLock q;
+            if (XrResult r = xrCreateSession(instance, &sci, &session); XR_FAILED(r))
+            {
+                Log("vr: xrCreateSession failed: %s", ResultText(instance, r).c_str());
+                session = XR_NULL_HANDLE;
+                return false;
+            }
         }
         XrReferenceSpaceCreateInfo rs{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
         rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
@@ -411,75 +526,87 @@ struct Session
             Log("vr: xrCreateReferenceSpace (view) failed: %s", ResultText(instance, r).c_str());
             return false;
         }
-        for (uint32_t i = 0; i < kLists; i++)
-            if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocators[i]))))
-                return false;
-        if (FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[0].Get(), nullptr, IID_PPV_ARGS(&list))))
+        VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = g_dev->queueFamily;
+        if (vkCreateCommandPool(g_dev->device, &pci, nullptr, &pool) != VK_SUCCESS)
             return false;
-        list->Close();
-        if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
+        VkCommandBufferAllocateInfo ai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        ai.commandPool = pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = kLists;
+        if (vkAllocateCommandBuffers(g_dev->device, &ai, lists) != VK_SUCCESS)
             return false;
-        fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        Log("vr: headset session created: %s (vendor %u)", props.systemName, props.vendorId);
+        Log("vr: headset session created: %s (vendor %u, %s)", props.systemName, props.vendorId, vulkan2 ? "XR_KHR_vulkan_enable2" : "XR_KHR_vulkan_enable");
         return true;
     }
 
-    // The quad's swapchain at the screen's size (made again when the game's output size changes).
-    bool EnsureQuad(uint32_t w, uint32_t h)
+
+    // A swapchain of `fmt` (w x h) for copies into, and its images.
+    bool MakeSwapchain(int64_t fmt, uint32_t w, uint32_t h, XrSwapchain& out, std::vector<VkImage>& imgsOut, const char* what)
     {
-        if (quad && quadW == w && quadH == h)
-            return true;
-        if (quad)
-        {
-            WaitIdle();
-            xrDestroySwapchain(quad);
-            quad = XR_NULL_HANDLE;
-            images.clear();
-        }
-        uint32_t count = 0;
-        xrEnumerateSwapchainFormats(session, 0, &count, nullptr);
-        std::vector<int64_t> formats(count);
-        xrEnumerateSwapchainFormats(session, count, &count, formats.data());
-        // The back buffer is R8G8B8A8_UNORM holding gamma-encoded colour: an sRGB swapchain of the same layout takes
-        // its bytes as they are (a copy, no shader) and the runtime reads them as sRGB.
-        quadFormat = 0;
-        for (int64_t want : { int64_t(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB), int64_t(DXGI_FORMAT_R8G8B8A8_UNORM) })
-            if (std::find(formats.begin(), formats.end(), want) != formats.end())
-            {
-                quadFormat = want;
-                break;
-            }
-        if (!quadFormat)
-        {
-            Log("vr: the runtime offers no RGBA8 swapchain format (%u formats)", count);
-            return false;
-        }
         XrSwapchainCreateInfo ci{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
         ci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-        ci.format = quadFormat;
+        ci.format = fmt;
         ci.sampleCount = 1;
         ci.width = w;
         ci.height = h;
         ci.faceCount = 1;
         ci.arraySize = 1;
         ci.mipCount = 1;
-        if (XrResult r = xrCreateSwapchain(session, &ci, &quad); XR_FAILED(r))
+        QueueLock q;
+        if (XrResult r = xrCreateSwapchain(session, &ci, &out); XR_FAILED(r))
         {
-            Log("vr: xrCreateSwapchain %ux%u failed: %s", w, h, ResultText(instance, r).c_str());
-            quad = XR_NULL_HANDLE;
+            Log("vr: xrCreateSwapchain %ux%u (%s) failed: %s", w, h, what, ResultText(instance, r).c_str());
+            out = XR_NULL_HANDLE;
             return false;
         }
-        xrEnumerateSwapchainImages(quad, 0, &count, nullptr);
-        std::vector<XrSwapchainImageD3D12KHR> imgs(count, { XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR });
-        xrEnumerateSwapchainImages(quad, count, &count, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
+        uint32_t count = 0;
+        xrEnumerateSwapchainImages(out, 0, &count, nullptr);
+        std::vector<XrSwapchainImageVulkanKHR> imgs(count, { XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR });
+        xrEnumerateSwapchainImages(out, count, &count, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
+        imgsOut.clear();
         for (const auto& i : imgs)
-            images.push_back(i.texture);
-        quadW = w, quadH = h;
-        Log("vr: virtual screen %ux%u (%s)", w, h, quadFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ? "sRGB" : "linear format: colours may look washed out");
+            imgsOut.push_back(i.image);
         return true;
     }
 
-    // The stereo pair's swapchain: two eyes of w x h side by side.
+    // The runtime's format for a source of `src` (copied byte for byte: its sRGB twin, else the same), or 0.
+    int64_t PickFormat(VkFormat src)
+    {
+        uint32_t count = 0;
+        xrEnumerateSwapchainFormats(session, 0, &count, nullptr);
+        std::vector<int64_t> formats(count);
+        xrEnumerateSwapchainFormats(session, count, &count, formats.data());
+        for (int64_t want : { int64_t(SrgbTwin(src)), int64_t(src) })
+            if (std::find(formats.begin(), formats.end(), want) != formats.end())
+                return want;
+        Log("vr: the runtime offers no swapchain format for the game's picture (format %d; %u formats)", int(src), count);
+        return 0;
+    }
+
+    // The quad's swapchain at the screen's size and format (made again when the game's output size changes).
+    bool EnsureQuad(uint32_t w, uint32_t h, VkFormat src)
+    {
+        if (quad && quadW == w && quadH == h)
+            return true;
+        if (quad)
+        {
+            WaitIdle();
+            QueueLock q;
+            xrDestroySwapchain(quad);
+            quad = XR_NULL_HANDLE;
+            images.clear();
+        }
+        quadFormat = PickFormat(src);
+        if (!quadFormat || !MakeSwapchain(quadFormat, w, h, quad, images, "screen"))
+            return false;
+        quadW = w, quadH = h;
+        Log("vr: virtual screen %ux%u (%s)", w, h, quadFormat != int64_t(src) ? "sRGB" : "linear format: colours may look washed out");
+        return true;
+    }
+
+    // The stereo pair's swapchain: two eyes of w x h side by side (the eyes' format, RGBA8).
     bool EnsurePair(uint32_t w, uint32_t h)
     {
         if (pair && pairW == w && pairH == h)
@@ -487,39 +614,20 @@ struct Session
         if (pair)
         {
             WaitIdle();
+            QueueLock q;
             xrDestroySwapchain(pair);
             pair = XR_NULL_HANDLE;
             pairImages.clear();
         }
-        if (!quadFormat && !EnsureQuad(w, h)) // (picks the format)
+        pairFormat = PickFormat(VK_FORMAT_R8G8B8A8_UNORM);
+        if (!pairFormat || !MakeSwapchain(pairFormat, w * 2, h, pair, pairImages, "stereo"))
             return false;
-        XrSwapchainCreateInfo ci{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
-        ci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-        ci.format = quadFormat;
-        ci.sampleCount = 1;
-        ci.width = w * 2;
-        ci.height = h;
-        ci.faceCount = 1;
-        ci.arraySize = 1;
-        ci.mipCount = 1;
-        if (XrResult r = xrCreateSwapchain(session, &ci, &pair); XR_FAILED(r))
-        {
-            Log("vr: xrCreateSwapchain %ux%u (stereo) failed: %s", w * 2, h, ResultText(instance, r).c_str());
-            pair = XR_NULL_HANDLE;
-            return false;
-        }
-        uint32_t count = 0;
-        xrEnumerateSwapchainImages(pair, 0, &count, nullptr);
-        std::vector<XrSwapchainImageD3D12KHR> imgs(count, { XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR });
-        xrEnumerateSwapchainImages(pair, count, &count, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
-        for (const auto& i : imgs)
-            pairImages.push_back(i.texture);
         pairW = w, pairH = h;
         Log("vr: stereo, %ux%u per eye", w, h);
         return true;
     }
 
-    // The HUD panel's swapchain (w x h, the format the screen's uses).
+    // The HUD panel's swapchain (w x h, RGBA8 as its image).
     bool EnsureHud(uint32_t w, uint32_t h)
     {
         if (hud && hudW == w && hudH == h)
@@ -527,33 +635,14 @@ struct Session
         if (hud)
         {
             WaitIdle();
+            QueueLock q;
             xrDestroySwapchain(hud);
             hud = XR_NULL_HANDLE;
             hudImages.clear();
         }
-        if (!quadFormat && !EnsureQuad(w, h))
+        const int64_t fmt = PickFormat(VK_FORMAT_R8G8B8A8_UNORM);
+        if (!fmt || !MakeSwapchain(fmt, w, h, hud, hudImages, "HUD"))
             return false;
-        XrSwapchainCreateInfo ci{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
-        ci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-        ci.format = quadFormat;
-        ci.sampleCount = 1;
-        ci.width = w;
-        ci.height = h;
-        ci.faceCount = 1;
-        ci.arraySize = 1;
-        ci.mipCount = 1;
-        if (XrResult r = xrCreateSwapchain(session, &ci, &hud); XR_FAILED(r))
-        {
-            Log("vr: xrCreateSwapchain %ux%u (HUD) failed: %s", w, h, ResultText(instance, r).c_str());
-            hud = XR_NULL_HANDLE;
-            return false;
-        }
-        uint32_t count = 0;
-        xrEnumerateSwapchainImages(hud, 0, &count, nullptr);
-        std::vector<XrSwapchainImageD3D12KHR> imgs(count, { XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR });
-        xrEnumerateSwapchainImages(hud, count, &count, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
-        for (const auto& i : imgs)
-            hudImages.push_back(i.texture);
         hudW = w, hudH = h;
         Log("vr: HUD panel %ux%u", w, h);
         return true;
@@ -561,154 +650,143 @@ struct Session
 
     void WaitIdle()
     {
-        const uint64_t v = nextFence++;
-        g_queue->Signal(fence.Get(), v);
-        if (fence->GetCompletedValue() < v)
-        {
-            fence->SetEventOnCompletion(v, fenceEvent);
-            WaitForSingleObject(fenceEvent, 2000);
-        }
+        if (lastValue)
+            vk::WaitFor(*g_dev, lastValue, 2000000000ull);
     }
 
-    // Copies the latest captured frame into the quad's next image.
+    // The next command buffer, its last use finished.
+    VkCommandBuffer BeginList()
+    {
+        const uint32_t li = listIndex++ % kLists;
+        if (listValues[li])
+            vk::WaitFor(*g_dev, listValues[li], 1000000000ull);
+        VkCommandBuffer cb = lists[li];
+        vkResetCommandBuffer(cb, 0);
+        VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cb, &bi);
+        return cb;
+    }
+    void SubmitList(VkCommandBuffer cb)
+    {
+        vkEndCommandBuffer(cb);
+        lastValue = vk::Submit(*g_dev, &cb, 1);
+        listValues[(listIndex - 1) % kLists] = lastValue;
+    }
+
+    // Acquires and waits for a swapchain's next image (under the queue lock: the runtime may use the queue).
+    bool Acquire(XrSwapchain sc, uint32_t& index)
+    {
+        QueueLock q;
+        XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+        if (XR_FAILED(xrAcquireSwapchainImage(sc, &ai, &index)))
+            return false;
+        XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+        wi.timeout = XR_INFINITE_DURATION;
+        xrWaitSwapchainImage(sc, &wi);
+        return true;
+    }
+    void Release(XrSwapchain sc)
+    {
+        QueueLock q;
+        XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+        xrReleaseSwapchainImage(sc, &ri);
+    }
+
+    // Copies the latest captured frame into the quad's next image.    // Copies the latest captured frame into the quad's next image.
     bool DrawQuad(FramePose& pose, bool& stereo, bool& withHud)
     {
-        ComPtr<ID3D12Resource> screen, eyes[3];
+        VkImage screen = VK_NULL_HANDLE, eyes[3] = {};
+        uint32_t sw = 0, sh = 0, ew = 0, eh = 0, hw = 0, hh = 0;
+        VkFormat sf = VK_FORMAT_UNDEFINED;
+        bool fresh = false;
         {
             std::lock_guard lock(g_screenMutex);
-            screen = g_screen;
+            if (g_screen)
+                screen = g_screen->image, sw = g_screen->desc.width, sh = g_screen->desc.height, sf = g_screen->desc.format, fresh = g_screenFresh;
             pose = g_screenPose;
-            stereo = g_screenStereo && g_eyes[0] && g_eyes[1] && pose.valid;
+            stereo = g_screenStereo && g_eyes[0] && g_eyes[1] && pose.valid && g_eyes[0]->desc.width == g_eyes[1]->desc.width &&
+                     g_eyes[0]->desc.height == g_eyes[1]->desc.height;
             // The HUD on its panel: stereo frames, and head-tracked mono ones (cockpit) whose HUD was taken apart.
             withHud = pose.valid && g_screenHud && g_eyes[2];
             if (stereo)
-                eyes[0] = g_eyes[0], eyes[1] = g_eyes[1];
-            eyes[2] = withHud ? g_eyes[2] : nullptr;
+                eyes[0] = g_eyes[0]->image, eyes[1] = g_eyes[1]->image, ew = g_eyes[0]->desc.width, eh = g_eyes[0]->desc.height;
+            if (withHud)
+                eyes[2] = g_eyes[2]->image, hw = g_eyes[2]->desc.width, hh = g_eyes[2]->desc.height;
         }
         if (stereo)
-            return DrawPair(eyes, withHud);
-        if (!screen)
+            return DrawPair(eyes, ew, eh, hw, hh, withHud);
+        if (!screen || fresh)
             return false;
-        const D3D12_RESOURCE_DESC d = screen->GetDesc();
-        if (!EnsureQuad(uint32_t(d.Width), d.Height))
+        if (!EnsureQuad(sw, sh, sf))
             return false;
         uint32_t hudIndex = 0;
         if (withHud)
-        {
-            const D3D12_RESOURCE_DESC hd = eyes[2]->GetDesc();
-            XrSwapchainImageAcquireInfo hai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
-            withHud = EnsureHud(uint32_t(hd.Width), hd.Height) && XR_SUCCEEDED(xrAcquireSwapchainImage(hud, &hai, &hudIndex));
-            if (withHud)
-            {
-                XrSwapchainImageWaitInfo hwi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
-                hwi.timeout = XR_INFINITE_DURATION;
-                xrWaitSwapchainImage(hud, &hwi);
-            }
-        }
+            withHud = EnsureHud(hw, hh) && Acquire(hud, hudIndex);
         uint32_t index = 0;
-        XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
-        if (XR_FAILED(xrAcquireSwapchainImage(quad, &ai, &index)))
-            return false;
-        XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
-        wi.timeout = XR_INFINITE_DURATION;
-        xrWaitSwapchainImage(quad, &wi);
-        // (This list's previous use has finished: kLists frames ago.)
-        const uint32_t li = listIndex++ % kLists;
-        if (fence->GetCompletedValue() < fenceValues[li])
+        if (!Acquire(quad, index))
         {
-            fence->SetEventOnCompletion(fenceValues[li], fenceEvent);
-            WaitForSingleObject(fenceEvent, 1000);
+            if (withHud)
+                Release(hud);
+            return false;
         }
-        allocators[li]->Reset();
-        list->Reset(allocators[li].Get(), nullptr);
-        ID3D12Resource* image = images[index];
-        Barrier(list.Get(), screen.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        Barrier(list.Get(), image, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
-        list->CopyResource(image, screen.Get());
-        Barrier(list.Get(), image, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        Barrier(list.Get(), screen.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        VkCommandBuffer cb = BeginList();
+        VkImage image = images[index];
+        Barrier(cb, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        Barrier(cb, screen, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); // (the capture's writes)
+        Copy(cb, screen, image, std::min(sw, quadW), std::min(sh, quadH));
+        Barrier(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         if (withHud)
-            CopyHud(hudIndex, eyes[2].Get());
-        list->Close();
-        ID3D12CommandList* lists[] = { list.Get() };
-        g_queue->ExecuteCommandLists(1, lists);
-        fenceValues[li] = nextFence++;
-        g_queue->Signal(fence.Get(), fenceValues[li]);
-        XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-        xrReleaseSwapchainImage(quad, &ri);
+            CopyHud(cb, hudIndex, eyes[2], hw, hh);
+        SubmitList(cb);
+        Release(quad);
         if (withHud)
-            xrReleaseSwapchainImage(hud, &ri);
+            Release(hud);
         return true;
     }
 
-    // The HUD's image into the HUD panel's swapchain image `index` (in the open list).
-    void CopyHud(uint32_t index, ID3D12Resource* src)
+    // The HUD's image into the HUD panel's swapchain image `index`.
+    void CopyHud(VkCommandBuffer cb, uint32_t index, VkImage src, uint32_t w, uint32_t h)
     {
-        ID3D12Resource* hudImage = hudImages[index];
-        Barrier(list.Get(), hudImage, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
-        Barrier(list.Get(), src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        list->CopyResource(hudImage, src);
-        Barrier(list.Get(), src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-        Barrier(list.Get(), hudImage, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        VkImage hudImage = hudImages[index];
+        Barrier(cb, hudImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        Barrier(cb, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        Copy(cb, src, hudImage, std::min(w, hudW), std::min(h, hudH));
+        Barrier(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        Barrier(cb, hudImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     }
 
     // Copies the two eyes of the newest stereo frame into the pair's next image, side by side.
-    bool DrawPair(ComPtr<ID3D12Resource> (&eyes)[3], bool& withHud)
+    bool DrawPair(const VkImage (&eyes)[3], uint32_t ew, uint32_t eh, uint32_t hw, uint32_t hh, bool& withHud)
     {
-        const D3D12_RESOURCE_DESC d = eyes[0]->GetDesc();
-        if (!EnsurePair(uint32_t(d.Width), d.Height))
+        if (!EnsurePair(ew, eh))
             return false;
         uint32_t hudIndex = 0;
         if (withHud)
-        {
-            const D3D12_RESOURCE_DESC hd = eyes[2]->GetDesc();
-            XrSwapchainImageAcquireInfo hai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
-            withHud = EnsureHud(uint32_t(hd.Width), hd.Height) && XR_SUCCEEDED(xrAcquireSwapchainImage(hud, &hai, &hudIndex));
-            if (withHud)
-            {
-                XrSwapchainImageWaitInfo hwi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
-                hwi.timeout = XR_INFINITE_DURATION;
-                xrWaitSwapchainImage(hud, &hwi);
-            }
-        }
+            withHud = EnsureHud(hw, hh) && Acquire(hud, hudIndex);
         uint32_t index = 0;
-        XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
-        if (XR_FAILED(xrAcquireSwapchainImage(pair, &ai, &index)))
-            return false;
-        XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
-        wi.timeout = XR_INFINITE_DURATION;
-        xrWaitSwapchainImage(pair, &wi);
-        const uint32_t li = listIndex++ % kLists;
-        if (fence->GetCompletedValue() < fenceValues[li])
+        if (!Acquire(pair, index))
         {
-            fence->SetEventOnCompletion(fenceValues[li], fenceEvent);
-            WaitForSingleObject(fenceEvent, 1000);
+            if (withHud)
+                Release(hud);
+            return false;
         }
-        allocators[li]->Reset();
-        list->Reset(allocators[li].Get(), nullptr);
-        ID3D12Resource* image = pairImages[index];
-        Barrier(list.Get(), image, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+        VkCommandBuffer cb = BeginList();
+        VkImage image = pairImages[index];
+        Barrier(cb, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         for (int e = 0; e < 2; e++)
         {
-            Barrier(list.Get(), eyes[e].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            D3D12_TEXTURE_COPY_LOCATION dst{ image, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, src{ eyes[e].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
-            dst.SubresourceIndex = src.SubresourceIndex = 0;
-            const D3D12_BOX box{ 0, 0, 0, std::min(uint32_t(eyes[e]->GetDesc().Width), pairW), std::min(eyes[e]->GetDesc().Height, pairH), 1 };
-            list->CopyTextureRegion(&dst, e ? pairW : 0, 0, 0, &src, &box);
-            Barrier(list.Get(), eyes[e].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(cb, eyes[e], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            Copy(cb, eyes[e], image, std::min(ew, pairW), std::min(eh, pairH), e ? int32_t(pairW) : 0);
+            Barrier(cb, eyes[e], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
-        Barrier(list.Get(), image, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        Barrier(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         if (withHud)
-            CopyHud(hudIndex, eyes[2].Get());
-        list->Close();
-        ID3D12CommandList* lists[] = { list.Get() };
-        g_queue->ExecuteCommandLists(1, lists);
-        fenceValues[li] = nextFence++;
-        g_queue->Signal(fence.Get(), fenceValues[li]);
-        XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-        xrReleaseSwapchainImage(pair, &ri);
+            CopyHud(cb, hudIndex, eyes[2], hw, hh);
+        SubmitList(cb);
+        Release(pair);
         if (withHud)
-            xrReleaseSwapchainImage(hud, &ri);
+            Release(hud);
         return true;
     }
 
@@ -762,7 +840,12 @@ struct Session
                     {
                         XrSessionBeginInfo bi{ XR_TYPE_SESSION_BEGIN_INFO };
                         bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-                        if (XrResult r = xrBeginSession(session, &bi); XR_FAILED(r))
+                        XrResult r;
+                        {
+                            QueueLock q;
+                            r = xrBeginSession(session, &bi);
+                        }
+                        if (XR_FAILED(r))
                             Log("vr: xrBeginSession failed: %s", ResultText(instance, r).c_str());
                         else
                         {
@@ -791,6 +874,8 @@ struct Session
                             std::lock_guard lock(g_poseMutex);
                             g_poseSession = XR_NULL_HANDLE;
                         }
+                        WaitIdle();
+                        QueueLock q;
                         xrEndSession(session);
                     }
                     else if (sc.state == XR_SESSION_STATE_EXITING || sc.state == XR_SESSION_STATE_LOSS_PENDING)
@@ -851,7 +936,10 @@ struct Session
                     }
                 }
             }
-            xrBeginFrame(session, nullptr);
+            {
+                QueueLock q;
+                xrBeginFrame(session, nullptr);
+            }
             XrCompositionLayerQuad layer{ XR_TYPE_COMPOSITION_LAYER_QUAD };
             XrCompositionLayerProjection projection{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
             XrCompositionLayerProjectionView eyes[2] = { { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW }, { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW } };
@@ -973,7 +1061,12 @@ struct Session
             end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
             end.layerCount = layerCount;
             end.layers = layers;
-            if (XrResult r = xrEndFrame(session, &end); XR_FAILED(r))
+            XrResult endResult;
+            {
+                QueueLock q;
+                endResult = xrEndFrame(session, &end);
+            }
+            if (XrResult r = endResult; XR_FAILED(r))
                 Log("vr: xrEndFrame failed: %s", ResultText(instance, r).c_str());
             frames++;
             if (std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(30))
@@ -1018,14 +1111,13 @@ bool Wanted()
     return v && *v && strcmp(v, "0") != 0 && strcmp(v, "off") != 0;
 }
 
-void Start(ID3D12Device* device, ID3D12CommandQueue* queue)
+void Start(vk::Device& device)
 {
     static bool started = false;
     if (started || !Wanted())
         return;
     started = true;
-    g_device = device;
-    g_queue = queue;
+    g_dev = &device;
     Log("vr: on (%s): waiting for a headset", getenv("REGPU_VR"));
     std::thread(Thread).detach();
 }
@@ -1064,37 +1156,32 @@ bool StereoFrame(float& clipPerMetre, float& halfIpd)
     return true;
 }
 
-ID3D12Resource* StereoTarget(int eye, uint32_t w, uint32_t h)
+vk::Image* StereoTarget(int eye, uint32_t w, uint32_t h)
 {
     static LiveSwitch test("REGPU_VR_STEREO_TEST"); // (the images are made without a headset too)
-    if (eye < 0 || eye > 2 || !(g_capturing.load(std::memory_order_relaxed) || test) || !g_device)
+    if (eye < 0 || eye > 2 || !(g_capturing.load(std::memory_order_relaxed) || test) || !g_dev)
         return nullptr;
     std::lock_guard lock(g_screenMutex);
-    ComPtr<ID3D12Resource>& t = g_eyes[eye];
-    if (!t || t->GetDesc().Width != w || t->GetDesc().Height != h)
+    std::unique_ptr<vk::Image>& t = g_eyes[eye];
+    if (!t || t->desc.width != w || t->desc.height != h)
     {
-        D3D12_RESOURCE_DESC d{};
-        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        d.Width = w;
-        d.Height = h;
-        d.DepthOrArraySize = 1;
-        d.MipLevels = 1;
-        d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        d.SampleDesc.Count = 1;
-        d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
-        ComPtr<ID3D12Resource> made;
-        if (FAILED(g_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&made))))
+        // Graded into as a storage image or copied into, copied out of by the headset thread; the renderer tracks its
+        // state (and leaves it SHADER_READ_ONLY_OPTIMAL).
+        vk::ImageDesc d;
+        d.width = w;
+        d.height = h;
+        d.format = VK_FORMAT_R8G8B8A8_UNORM;
+        d.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        d.name = eye == 2 ? "vr hud" : "vr eye";
+        auto made = std::make_unique<vk::Image>(vk::CreateImage(*g_dev, d));
+        if (!*made)
             return nullptr;
-        if (t)
-            g_oldScreens.push_back(t);
-        while (g_oldScreens.size() > 8)
-            g_oldScreens.erase(g_oldScreens.begin());
-        t = made;
+        Retire(t);
+        t = std::move(made);
     }
     if (eye == 1)
         g_eyesThisFrame = true;
-    return t.Get();
+    return t.get();
 }
 
 void StereoHudCaptured() { g_hudThisFrame = true; }
@@ -1136,28 +1223,32 @@ uint32_t PaceCap()
     return hz >= 30 ? uint32_t(std::lround(float(hz) * mult)) : 0;
 }
 
-void CaptureFrame(ID3D12GraphicsCommandList* list, ID3D12Resource* backBuffer)
+void CaptureFrame(VkCommandBuffer cb, VkImage backBuffer, uint32_t width, uint32_t height, VkFormat format)
 {
-    if (!g_capturing.load(std::memory_order_relaxed))
+    if (!g_capturing.load(std::memory_order_relaxed) || !g_dev)
         return;
-    D3D12_RESOURCE_DESC d = backBuffer->GetDesc();
-    ComPtr<ID3D12Resource> screen;
+    VkImage screen = VK_NULL_HANDLE;
+    bool fresh = false;
     {
         std::lock_guard lock(g_screenMutex);
-        if (!g_screen || g_screen->GetDesc().Width != d.Width || g_screen->GetDesc().Height != d.Height)
+        if (!g_screen || g_screen->desc.width != width || g_screen->desc.height != height || g_screen->desc.format != format)
         {
-            d.Flags = D3D12_RESOURCE_FLAG_NONE;
-            D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
-            ComPtr<ID3D12Resource> made;
-            if (FAILED(g_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&made))))
+            vk::ImageDesc d;
+            d.width = width;
+            d.height = height;
+            d.format = format;
+            d.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            d.name = "vr screen";
+            auto made = std::make_unique<vk::Image>(vk::CreateImage(*g_dev, d));
+            if (!*made)
                 return;
-            if (g_screen)
-                g_oldScreens.push_back(g_screen);
-            if (g_oldScreens.size() > 8)
-                g_oldScreens.erase(g_oldScreens.begin());
-            g_screen = made;
+            Retire(g_screen);
+            g_screen = std::move(made);
+            g_screenFresh = true;
         }
-        screen = g_screen;
+        screen = g_screen->image;
+        fresh = g_screenFresh;
+        g_screenFresh = false; // (written below: the headset thread may copy it from the next submission on)
         // This captured frame's pose: the one its main view was drawn with, by the tag the draw thread read from it
         // (SetCaptureTag). No tag: not head-tracked (the virtual screen).
         g_screenPose.valid = false;
@@ -1183,11 +1274,12 @@ void CaptureFrame(ID3D12GraphicsCommandList* list, ID3D12Resource* backBuffer)
         g_screenStereo = frameStereo;
         g_screenHud = frameHud;
     }
-    Barrier(list, backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    Barrier(list, screen.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-    list->CopyResource(screen.Get(), backBuffer);
-    Barrier(list, screen.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-    Barrier(list, backBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    // (The back buffer is TRANSFER_DST_OPTIMAL here and stays so for the presenter.)
+    Barrier(cb, backBuffer, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    Barrier(cb, screen, fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    Copy(cb, backBuffer, screen, width, height);
+    Barrier(cb, screen, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    Barrier(cb, backBuffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     {
         std::lock_guard lock(g_capturedMutex);
         g_captured++;
