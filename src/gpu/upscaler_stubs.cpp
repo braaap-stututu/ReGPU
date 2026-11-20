@@ -8,4 +8,6 @@ bool DlssEvaluate(ID3D12GraphicsCommandList*, const DlssSetup&, const DlssFrame&
 #endif
 #ifndef REGPU_FSR3
 bool Fsr3Evaluate(ID3D12Device*, ID3D12GraphicsCommandList*, const DlssSetup&, const DlssFrame&, float) { return false; }
+bool Fsr3Prepare(ID3D12Device*, const DlssSetup&, void**, bool*) { return false; }
+bool Fsr3Dispatch(ID3D12GraphicsCommandList*, void*, bool, const DlssSetup&, const DlssFrame&, float) { return false; }
 #endif

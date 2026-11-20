@@ -3046,7 +3046,7 @@ void BeginFrameIfNeeded()
     // This frame's scene phase and scale (see UpscaleScene).
     {
         const Settings& st = GetSettings();
-        const bool temporalUpscaler = st.upscaler == Settings::Upscaler::Dlss || st.upscaler == Settings::Upscaler::Fsr3;
+        const bool temporalUpscaler = st.upscaler == Settings::Upscaler::Dlss || st.upscaler == Settings::Upscaler::Fsr3 || st.upscaler == Settings::Upscaler::Fsr4;
         const float scale = st.SceneScale();
         g_upscale.switchedThisFrame = false;
         // Anti-aliasing filters (session 36) need the scene's end too: TAA the temporal path (not with DLSS/FSR 3, which
@@ -8060,6 +8060,7 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     setup.outputHeight = outHeight;
     setup.quality = GetSettings().quality;
     setup.hdr = format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    setup.fsr4 = GetSettings().upscaler == Settings::Upscaler::Fsr4;
     static auto last = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     DlssFrame in{};
@@ -8089,15 +8090,59 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     barrier(g_upscale.depth.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(g_upscale.motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(in.output, read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    // NGX records into the real command list (after everything recorded so far).
-    const bool ok = dlss ? DlssEvaluate(C().list->Real(), setup, in)
-                         : Fsr3Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness);
+    // NGX records into the real command list (after everything recorded so far: Real() waits for the replay).
+    // FSR (FM3 port, session 36): its context is made here, the dispatch queued with RecordedList::Call and run where
+    // the list replays, so the draw thread doesn't wait for the replay thread to catch up each frame (it limits the
+    // frame rate where the GPU doesn't: FM3 at 1440p on an RX 7900 XTX). REGPU_FSR_ON_REAL=1: as before.
+    struct FsrJob
+    {
+        void* handle;
+        bool switched;
+        DlssSetup setup;
+        DlssFrame in;
+        float sharpness;
+        ID3D12Resource *copyDst, *copySrc;
+    };
+    static FsrJob fsrJobs[kFrames];
+    static LiveSwitch fsrOnReal("REGPU_FSR_ON_REAL");
+    const bool queued = !dlss && !fsrOnReal;
+    bool ok;
+    if (dlss)
+        ok = DlssEvaluate(C().list->Real(), setup, in);
+    else if (!queued)
+        ok = Fsr3Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness);
+    else
+    {
+        FsrJob& job = fsrJobs[g_r.frameIndex];
+        job = { nullptr, false, setup, in, GetSettings().sharpness, nullptr, nullptr };
+        ok = Fsr3Prepare(g_r.device, setup, &job.handle, &job.switched);
+        if (ok)
+            C().list->Call(
+                [](ID3D12GraphicsCommandList* l, void* c) {
+                    const FsrJob& j = *static_cast<const FsrJob*>(c);
+                    Fsr3Dispatch(l, j.handle, j.switched, j.setup, j.in, j.sharpness);
+                },
+                &job);
+    }
     barrier(in.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
     if (dlaa && ok)
     {
         barrier(in.output, read, D3D12_RESOURCE_STATE_COPY_SOURCE);
         barrier(color.Get(), read, D3D12_RESOURCE_STATE_COPY_DEST);
-        C().list->Real()->CopyResource(color.Get(), in.output);
+        if (queued)
+        {
+            FsrJob& job = fsrJobs[g_r.frameIndex];
+            job.copyDst = color.Get();
+            job.copySrc = in.output;
+            C().list->Call(
+                [](ID3D12GraphicsCommandList* l, void* c) {
+                    const FsrJob& j = *static_cast<const FsrJob*>(c);
+                    l->CopyResource(j.copyDst, j.copySrc);
+                },
+                &job);
+        }
+        else
+            C().list->Real()->CopyResource(color.Get(), in.output);
         barrier(color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, read);
         barrier(in.output, D3D12_RESOURCE_STATE_COPY_SOURCE, read);
     }
@@ -8126,7 +8171,7 @@ bool TaaScene(uint32_t base);
 void TemporalEvaluate(uint32_t base)
 {
     // TAA (Config::postAA, FM3 port session 36): the temporal path without an upscaler.
-    if (const Settings::Upscaler u = GetSettings().upscaler; u != Settings::Upscaler::Dlss && u != Settings::Upscaler::Fsr3)
+    if (const Settings::Upscaler u = GetSettings().upscaler; u != Settings::Upscaler::Dlss && u != Settings::Upscaler::Fsr3 && u != Settings::Upscaler::Fsr4)
     {
         TaaScene(base);
         g_upscale.reset = false;
