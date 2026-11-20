@@ -85,6 +85,19 @@ std::atomic<bool> g_gameWidescreen{ false }; // regpu::SetGameWidescreen
 namespace
 {
 constexpr UINT kWidth = 1280, kHeight = 720;
+// The guest frame: the size of the picture the title draws its main view at and hands to the display. 1280x720 for
+// most titles (kWidth x kHeight, which also stay the 16:9 display shape: OutputWide); PGR3's races draw 1024x600 (a
+// 2x MSAA surface of pitch 1040, the console's scaler stretched it to the screen) while its menus draw 1280x720. The
+// swap takes the size of the front buffer the title resolved (RendererNoteFrontBuffer) and the next frame uses it,
+// so the main view fills the output at its own scale (1440p: 2.5 x 2.4 for 1024x600) instead of being scaled from
+// 720 rows and shown centred. REGPU_FIXED_FRAME_SIZE=1 (live, from the next swap): always 1280x720, as before.
+std::atomic<uint32_t> g_frameWidth{ kWidth }, g_frameHeight{ kHeight };
+std::atomic<uint32_t> g_frameRoomHeight{ kHeight }; // the smallest frame height seen: the EDRAM surfaces' rows (SurfaceHeight)
+std::atomic<uint32_t> g_frameRequest{ 0 };          // width << 16 | height asked by the swap (ApplyFrameSize), 0 none
+inline uint32_t FrameW() { return g_frameWidth.load(std::memory_order_relaxed); }
+inline uint32_t FrameH() { return g_frameHeight.load(std::memory_order_relaxed); }
+// The frame's surface pitch: its width rounded up to EDRAM tiles (80 pixels; PGR3's 1024 -> 1040).
+inline uint32_t FramePitch() { return (FrameW() + 79) / 80 * 80; }
 // Output size (RenderSize: REGPU_RESOLUTION or REGPU_RENDER_SCALE). Everything else
 // (registers, scissors, resolve and clear rectangles, shader constants) stays in the game's
 // own pixels; only the D3D calls scale. Vertically that is output height / 720. A pass at
@@ -124,6 +137,18 @@ uint32_t OutputHeight()
     if (!g_outputHeight.load(std::memory_order_relaxed))
         LoadOutputSize();
     return g_outputHeight.load(std::memory_order_relaxed);
+}
+// The swap's front buffer (guest size): a frame size for the next frame (ApplyFrameSize) when it differs. Only the
+// shapes a display scaler takes (640x360 .. 1280x720).
+void NoteFrontBuffer(uint32_t width, uint32_t height)
+{
+    static LiveSwitch fixed("REGPU_FIXED_FRAME_SIZE");
+    if (fixed)
+        width = kWidth, height = kHeight;
+    if (width < 640 || width > kWidth || height < 360 || height > kHeight)
+        return;
+    if (width != FrameW() || height != FrameH())
+        g_frameRequest.store(width << 16 | height, std::memory_order_relaxed);
 }
 // Upscaling: the 3D scene of a frame renders at this fraction of the output (1 otherwise);
 // after the scene is upscaled (UpscaleScene), the rest of the frame renders at full size.
@@ -299,7 +324,7 @@ uint32_t BigPassSizeUncached()
     // 1329 wide: small uncovered spots at the edges of the car's vinyls.) 2080 still gives 2048.
     // REGPU_BIG_PASS_6465=1: pitch * 64 / 65 as before (A/B, from the next pass).
     static LiveSwitch padded("REGPU_BIG_PASS_6465");
-    return !off && pitch > kWidth ? std::min<uint32_t>(2048, padded ? pitch * 64 / 65 : pitch) : 0;
+    return !off && pitch > FramePitch() ? std::min<uint32_t>(2048, padded ? pitch * 64 / 65 : pitch) : 0;
 }
 // The pass sizes and scales (BigPassSize ... ScaleX) are asked ~25 times a draw, nested: each answer depends only on
 // the surface registers, the layout table, the tall pass, the output size and the scene scale, so all of them are
@@ -380,7 +405,7 @@ uint32_t PassHeightOf(uint32_t big)
     if (big)
         return big;
     const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
-    return g_tallHeight && (surface == g_tallInfo || TallView()) ? g_tallHeight : kHeight;
+    return g_tallHeight && (surface == g_tallInfo || TallView()) ? g_tallHeight : FrameH();
 }
 uint32_t PassHeight() { return PassScales().height; }
 // Guest rows the host EDRAM surfaces hold at full scale. A 1024-row pass (a 1024x1024 shadow
@@ -401,7 +426,9 @@ uint32_t TallScaleRoom() { return std::max<uint32_t>(1, (OutputHeight() + kHeigh
 uint32_t SurfaceWidth() { return std::max(OutputWidth(), TallScaleRoom() * kWidth); }
 uint32_t SurfaceHeight()
 {
-    return std::max(uint32_t((uint64_t(OutputHeight()) * SurfaceRows() + kHeight - 1) / kHeight), TallScaleRoom() * SurfaceRows());
+    // (Rows for the smallest guest frame seen: a 600-row frame scales 1.2x more than a 720-row one.)
+    const uint32_t room = g_frameRoomHeight.load(std::memory_order_relaxed);
+    return std::max(uint32_t((uint64_t(OutputHeight()) * SurfaceRows() + room - 1) / room), TallScaleRoom() * SurfaceRows());
 }
 
 // A tall pass (a shadow atlas) is drawn at a whole number of host texels per guest texel: titles move
@@ -414,9 +441,9 @@ uint32_t SurfaceHeight()
 float IntegerTallScale(float passScale, uint32_t big, uint32_t passHeight)
 {
     static LiveSwitch fractional("REGPU_FRACTIONAL_TALL_SCALE");
-    if (fractional || big || passHeight <= kHeight)
+    if (fractional || big || passHeight <= FrameH())
         return passScale;
-    const float total = float(OutputHeight()) / float(kHeight) * g_sceneScale * passScale;
+    const float total = float(OutputHeight()) / float(FrameH()) * g_sceneScale * passScale;
     if (total <= 1.0f)
         return passScale;
     const uint32_t pitch = gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF;
@@ -438,7 +465,7 @@ float HelperScale()
 bool HelperPassOf(uint32_t big)
 {
     const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
-    return (surface & 0x3FFF) < kWidth && !big && !(g_tallHeight && (surface == g_tallInfo || TallView()));
+    return (surface & 0x3FFF) < FrameW() && !big && !(g_tallHeight && (surface == g_tallInfo || TallView()));
 }
 bool HelperPass() { return HelperPassOf(BigPassSize()); }
 
@@ -447,7 +474,12 @@ float HelperPassScale(float passScale, uint32_t big)
     return HelperScale() < 1.0f && HelperPassOf(big) ? passScale * HelperScale() : passScale;
 }
 
-bool WidePass() { return (gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF) == kWidth; }
+// The main view's pass: the frame's pitch (1280; PGR3's 1024-wide races 1024..1040).
+bool WidePass()
+{
+    const uint32_t pitch = gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF;
+    return pitch >= FrameW() && pitch <= FramePitch();
+}
 // VR stereo (gpu.cpp stereo::): the eye being drawn, as a clip-space x offset (0: none).
 float g_stereoClipX = 0.0f;
 bool g_stereoReplay = false; // the second eye's pass (no write-backs to guest memory)
@@ -502,11 +534,12 @@ const PassScaleSnapshot& PassScalesSlow()
     n.surface = surface, n.color = color, n.generation = generation, n.tallInfo = g_tallInfo, n.tallHeight = g_tallHeight, n.tallKey = g_tallKey;
     n.outW = OutputWidth(), n.outH = OutputHeight(), n.scene = g_sceneScale;
     n.big = BigPassSizeUncached();
-    n.width = n.big ? n.big : kWidth;
+    const uint32_t frameW = FrameW(), frameH = FrameH();
+    n.width = n.big ? n.big : frameW;
     n.height = PassHeightOf(n.big);
-    n.passScale = HelperPassScale(IntegerTallScale(std::min(float(kWidth) / float(n.width), float(SurfaceRows()) / float(n.height)), n.big, n.height), n.big);
-    n.scaleY = float(n.outH) / float(kHeight) * n.scene * n.passScale;
-    n.scaleWide = float(n.outW) / float(kWidth) * n.scene * n.passScale;
+    n.passScale = HelperPassScale(IntegerTallScale(std::min(float(frameW) / float(n.width), float(SurfaceRows()) / float(n.height)), n.big, n.height), n.big);
+    n.scaleY = float(n.outH) / float(frameH) * n.scene * n.passScale;
+    n.scaleWide = float(n.outW) / float(frameW) * n.scene * n.passScale;
     n.scaleX = WidePass() ? n.scaleWide : n.scaleY;
     return n;
 }
@@ -2766,6 +2799,44 @@ void ApplyOutputSize()
     Log("renderer: output %ux%u (live)", OutputWidth(), OutputHeight());
 }
 
+// A new guest frame size (NoteFrontBuffer), taken at the start of a frame like a new output size. The EDRAM surfaces
+// hold the rows of the smallest frame seen (SurfaceHeight); a smaller one drops them, and they come back taller.
+void ApplyFrameSize()
+{
+    const uint32_t request = g_frameRequest.exchange(0);
+    if (!request || !g_r.ok)
+        return;
+    const uint32_t w = request >> 16, h = request & 0xFFFF;
+    if (w == FrameW() && h == FrameH())
+        return;
+    const bool taller = h < g_frameRoomHeight.load(std::memory_order_relaxed);
+    if (taller)
+    {
+        g_r.recorder.Real();
+        if (const UINT64 last = g_r.nextFence - 1; g_r.fence->GetCompletedValue() < last)
+        {
+            g_r.fence->SetEventOnCompletion(last, g_r.fenceEvent);
+            WaitForSingleObject(g_r.fenceEvent, INFINITE);
+        }
+        g_frameRoomHeight = h;
+        std::lock_guard surfaceLock(g_surfaceMutex);
+        for (auto* map : { &g_r.colorSurfaces, &g_r.depthSurfaces })
+        {
+            for (auto& [base, s] : *map)
+                Frame().garbage.push_back(std::move(s.resource));
+            map->clear();
+        }
+        C().colorBase = C().depthBase = ~0u;
+        C().color.Reset();
+        C().depth.Reset();
+    }
+    g_frameWidth = w;
+    g_frameHeight = h;
+    BumpPassEpoch();
+    Log("renderer: guest frame %ux%u (pitch %u): scale %.3f x %.3f%s", w, h, FramePitch(), double(OutputWidth()) / w, double(OutputHeight()) / h,
+        taller ? ", EDRAM surfaces remade taller" : "");
+}
+
 void TransitionColor(D3D12_RESOURCE_STATES to);
 
 // Gets (creating on first use) the host surface for an EDRAM base.
@@ -3161,6 +3232,7 @@ void BeginFrameIfNeeded()
     }
     f.garbage.clear();
     ApplyOutputSize(); // (a new resolution: between frames)
+    ApplyFrameSize();  // (a new guest frame size: the same)
     void FinishDeferredWritebacks(UINT frameIndex);
     FinishDeferredWritebacks(UINT(&f - g_r.frames)); // this slot's previous frame has completed
     static LiveSwitch perf("REGPU_PERF");
@@ -7806,7 +7878,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         // post-processing composite, a grid of rectangles). HUD elements sample only atlases
         // and reduced-size buffers (a 320x180 blur of the scene behind their panels).
         // (By the size the draw fetches it at: the HUD samples the scene image too, at 320x180.)
-        if (resolvedTexture->frame == g_r.frame && fetch.Width() >= kWidth)
+        if (resolvedTexture->frame == g_r.frame && fetch.Width() >= FrameW())
             g_drawSamplesResolve = true;
         // A colour-format fetch of a depth resolve reads the guest's D24S8 words (BlitResolve's pack).
         if (resolvedTexture->format == DXGI_FORMAT_R32_FLOAT && resolvedTexture->packed && fetch.Format() == 6 /* k_8_8_8_8 */)
@@ -8718,7 +8790,7 @@ D3D12_RECT WindowScissor()
     // Taller than the screen on a pass narrower than it: a tall render target (see PassHeight).
     const uint32_t surfaceInfo = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
     static LiveSwitch noTall("REGPU_NO_TALL_PASS");
-    if (!noTall && y1 > int32_t(kHeight) && y1 <= 2048 && (surfaceInfo & 0x3FFF) < kWidth)
+    if (!noTall && y1 > int32_t(FrameH()) && y1 <= 2048 && (surfaceInfo & 0x3FFF) < FrameW())
     {
         if (g_tallInfo != surfaceInfo || g_tallHeight != uint32_t(y1))
             Log("tall pass: scissor y %d..%d x %d..%d window offset %d,%d vertexOffset %d surface %08X", y0, y1, x0, x1, wx, wy, int(vertexOffset), surfaceInfo);
@@ -10942,7 +11014,7 @@ void Resolve()
         // the 10-bit colours where half floats held more. Not the main view's image while the scene is
         // upscaled: the upscalers take 8888 and half floats only.
         static LiveSwitch copies1010102("REGPU_COPIES_1010102");
-        const bool as1010102 = copies1010102 && !depth && destFormat == 7 && !(g_scenePhase && width >= kWidth);
+        const bool as1010102 = copies1010102 && !depth && destFormat == 7 && !(g_scenePhase && width >= FrameW());
         const DXGI_FORMAT format = depth ? DXGI_FORMAT_R32_FLOAT
             : as1010102 ? DXGI_FORMAT_R10G10B10A2_UNORM
             : destFormat == 6 || (destFormat == 7 && bias == 0 && !no1010102) ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -11016,10 +11088,10 @@ void Resolve()
         if (!depth && !placedInImage && rect.top == 0 && rect.left == 0)
             ResolveIntoEnclosing(base, pitch, declaredHeight, guestBpp, format, rect, std::ldexp(1.0f, bias), destRange, blitFlags);
         // Temporal upscaling: each tile of the main view keeps its depth before it is cleared.
-        if (g_temporal && g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth))
+        if (g_temporal && g_scenePhase && !depth && width >= FrameW() && rect.left == 0 && rect.right >= LONG(FrameW()))
             CopySceneDepth(rect);
         // The main view's full image (its last tile reaches the bottom): the scene is done.
-        if (g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth) && rect.bottom >= LONG(kHeight))
+        if (g_scenePhase && !depth && width >= FrameW() && rect.left == 0 && rect.right >= LONG(FrameW()) && rect.bottom >= LONG(FrameH()))
             UpscaleScene(base);
         g_r.resolved[base].swapped = swapRB;
         g_r.resolved[base].guestFormat = depth ? 0u : destFormat;
@@ -11117,7 +11189,7 @@ void Resolve()
         lc.colorHi = gpureg::Get(RB_COLOR_CLEAR), lc.colorLo = gpureg::Get(RB_COLOR_CLEAR_LO), lc.depthValue = gpureg::Get(RB_DEPTH_CLEAR);
         lc.colorFormat = (gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF, lc.depthFloat = (gpureg::Get(RB_DEPTH_INFO) >> 16) & 1;
     }
-    if (!noClearExtend && !merged && surfacePitch && uint32_t(rect.right - rect.left) >= std::min<uint32_t>(surfacePitch, kWidth) && rect.left == 0)
+    if (!noClearExtend && !merged && surfacePitch && uint32_t(rect.right - rect.left) >= std::min<uint32_t>(surfacePitch, FrameW()) && rect.left == 0)
         clearRect.bottom = PassHeight();
     if ((control >> 8) & 1) // colour clear (ARGB)
     {
@@ -13579,7 +13651,7 @@ bool StereoHudDraw()
 
 void StereoCaptureHud()
 {
-    const D3D12_RECT host = ToHost(D3D12_RECT{ 0, 0, LONG(kWidth), LONG(kHeight) });
+    const D3D12_RECT host = ToHost(D3D12_RECT{ 0, 0, LONG(FrameW()), LONG(FrameH()) });
     const UINT w = UINT(host.right - host.left), h = UINT(host.bottom - host.top);
     ID3D12Resource* target = regpu::xr::StereoTarget(2, w, h);
     if (!target)
@@ -15637,11 +15709,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // A scissor narrower than the screen in a wide pass clips 2D content (a minimap),
     // which the vertex shader keeps in the centred 16:9 area: map it the same way. Not for
     // screen layers (post-processing done in halves would leave a seam).
-    if (WidePass() && ScaleWide() != ScaleY() && !g_drawSamplesResolve && (scissor.left > 0 || scissor.right < LONG(kWidth)))
+    // (The centred area's scale is the 16:9 one, ScaleWide / OutputWide: ScaleY for a 1280x720 frame, 2.5 at 1440p
+    // for PGR3's 1024x600 against ScaleY 2.4.)
+    if (const float wide = OutputWide(); WidePass() && std::abs(wide - 1.0f) > 1e-4f && !g_drawSamplesResolve && (scissor.left > 0 || scissor.right < LONG(FrameW())))
     {
-        const double centre = kWidth * ScaleWide() / 2.0, s = ScaleY();
-        hostScissor.left = LONG(std::lround(centre + (scissor.left - double(kWidth) / 2) * s));
-        hostScissor.right = LONG(std::lround(centre + (scissor.right - double(kWidth) / 2) * s));
+        const double frameW = FrameW(), centre = frameW * ScaleWide() / 2.0, s = ScaleWide() / wide;
+        hostScissor.left = LONG(std::lround(centre + (scissor.left - frameW / 2) * s));
+        hostScissor.right = LONG(std::lround(centre + (scissor.right - frameW / 2) * s));
     }
     DrawState& ds = g_drawState;
     if (memcmp(&ds.viewport, &vp, sizeof(vp)) != 0)
@@ -16749,7 +16823,7 @@ void RendererTripleCapture(int slot, uint32_t frontBuffer)
     if (!g_r.ok || slot < 0 || slot > 2)
         return;
     auto it = g_r.resolved.find(frontBuffer);
-    if (it == g_r.resolved.end() || it->second.width != kWidth || it->second.height != kHeight || it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM)
+    if (it == g_r.resolved.end() || it->second.width != FrameW() || it->second.height != FrameH() || it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM)
         return;
     ID3D12Resource* image = it->second.resource.Get();
     const D3D12_RESOURCE_DESC d = image->GetDesc();
@@ -16804,7 +16878,7 @@ void RendererStereoCaptureEye(int eye, uint32_t frontBuffer)
     if (!g_r.ok)
         return;
     auto it = g_r.resolved.find(frontBuffer);
-    if (it == g_r.resolved.end() || it->second.width != kWidth || it->second.height != kHeight || it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM)
+    if (it == g_r.resolved.end() || it->second.width != FrameW() || it->second.height != FrameH() || it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM)
         return;
     ID3D12Resource* image = it->second.resource.Get();
     const D3D12_RESOURCE_DESC d = image->GetDesc();
@@ -17455,7 +17529,9 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     // (the presenter's letterbox path); not yet scaled up. REGPU_FRONT_BUFFER_EXACT=1 (live): only 1280x720, as before.
     static LiveSwitch frontExact("REGPU_FRONT_BUFFER_EXACT");
     const bool frontFound = it != g_r.resolved.end() && it->second.format == DXGI_FORMAT_R8G8B8A8_UNORM;
-    const bool frontFullSize = frontFound && it->second.width == kWidth && it->second.height == kHeight;
+    if (frontFound)
+        NoteFrontBuffer(it->second.width, it->second.height);
+    const bool frontFullSize = frontFound && it->second.width == FrameW() && it->second.height == FrameH();
     const bool fromResolve = frontFound && (frontFullSize || (!frontExact && it->second.width <= kWidth && it->second.height <= kHeight));
     ID3D12Resource* graded = nullptr; // the front buffer through the display's gamma table
     GradeJob* gradeJob = nullptr;     // ... graded straight into the back buffer at the frame end
