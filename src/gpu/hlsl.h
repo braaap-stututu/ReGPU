@@ -38,6 +38,12 @@ struct TranslatedShader
     std::array<uint64_t, 4> constantMask{};
     // Vertex shaders: bit per interpolator (o0-o15) the code exports.
     uint32_t interpolatorsWritten = 0;
+    // Where the shader's own code starts in hlsl (after the shared preamble).
+    size_t bodyStart = 0;
+    // The other parts of the constant blocks the code reads (ScanBlockUse in renderer.cpp, after the game's
+    // rewrite): bool constants, loop constants, the vertex fetch layout (vfl), the game's vuser constants.
+    // A draw writes the unread ones to the upload ring no more. True (written) until scanned.
+    bool readsBools = true, readsLoops = true, readsFetchLayout = true, readsUser = true;
 };
 
 TranslatedShader TranslateShader(const ucode::Shader& shader);

@@ -1348,6 +1348,7 @@ TranslatedShader TranslateShader(const Shader& shader)
     }
 
     std::string h = Preamble();
+    result.bodyStart = h.size();
     std::vector<uint32_t> regs = ScalarRegisters(e.out);
     std::string decl;
     if (!shader.pixel)
