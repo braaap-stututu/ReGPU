@@ -4807,8 +4807,10 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     else
     {
         // Static: hash all six faces, decode on change.
+        static LiveSwitch oldStaging("REGPU_NO_CUBE_FACE_STAGING");
         const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
-        uint64_t hash = ContentHash(source, size_t(stride) * 6) ^ (uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Endian()) << 44) ^ (uint64_t(mips) << 52);
+        uint64_t hash = ContentHash(source, size_t(stride) * 6) ^ (uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Endian()) << 44) ^ (uint64_t(mips) << 52) ^
+                        (uint64_t(bool(oldStaging)) << 63);
         // Each level's face address: level 0 at the base, levels 1+ from the mip address, every level
         // holding its six faces one after another.
         uint32_t levelBase[16]{}, levelStride[16]{};
@@ -4833,6 +4835,10 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
         if (offset == ~0ull)
             return nullptr;
         C().list->ResourceBarrier(1, &b);
+        // Every level of every face is staged at its own place, one after another, and copied from there. The copy of
+        // level 0 used to read the running position while the face was written at offset + faceBytes * i: all six faces
+        // showed face 0 (one level), or level 0 came from other levels' bytes (mips), so reflections read from memory
+        // were wrong; sharp reads (chrome) worst. REGPU_NO_CUBE_FACE_STAGING=1 (live, part of the hash): the old placement.
         UINT64 at = offset;
         for (uint32_t i = 0; i < 6; i++)
             for (UINT16 l = 0; l < mips; l++)
@@ -4873,8 +4879,9 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
                 snprintf(name, sizeof(name), "out/cube/%08X_face%u_stride%X.png", fetch.Address(), i, stride);
                 WritePng(name, w, h, rgba);
             }
+            const UINT64 staged = oldStaging ? offset + faceBytes * i : at;
             for (uint32_t y = 0; y < h; y++)
-                memcpy(Frame().ringCpu + offset + faceBytes * i + UINT64(y) * rowPitch, &rgba[size_t(y) * w * 4], size_t(w) * 4);
+                memcpy(Frame().ringCpu + staged + UINT64(y) * rowPitch, &rgba[size_t(y) * w * 4], size_t(w) * 4);
             D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
             dst.pResource = cached.resource.Get();
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -4884,6 +4891,8 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             src.PlacedFootprint.Offset = at;
             src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, rowPitch };
             C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            if (!oldStaging)
+                at += faceBytes;
         }
         cached.contentHash = hash;
     }

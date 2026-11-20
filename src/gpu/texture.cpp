@@ -18,6 +18,7 @@ enum Format : uint32_t
     k_1_5_5_5 = 3,
     k_5_6_5 = 4,
     k_8_8_8_8 = 6,
+    k_2_10_10_10 = 7, // X in bits 0-9, Y 10-19, Z 20-29, W 30-31 of the (swapped) word
     k_8_8 = 10,
     k_4_4_4_4 = 15,
     k_DXT1 = 18,
@@ -44,6 +45,16 @@ bool Info(uint32_t format, FormatInfo& out)
     case k_8_8:
     case k_4_4_4_4: out = { 1, 1 }; return true;
     case k_8_8_8_8: out = { 1, 2 }; return true;
+    // Unsupported, it decoded to nothing: a cube map of it came out black (FM3's showroom reflection cube, so chrome
+    // was black and paint lost its shine). REGPU_NO_2_10_10_10=1: unsupported again (A/B, for textures decoded after).
+    case k_2_10_10_10:
+    {
+        static LiveSwitch off("REGPU_NO_2_10_10_10");
+        if (off)
+            return false;
+        out = { 1, 2 };
+        return true;
+    }
     case k_DXT1: out = { 4, 3 }; return true;
     case k_DXT2_3:
     case k_DXT4_5: out = { 4, 4 }; return true;
@@ -260,6 +271,16 @@ void DecodeTexel(uint32_t format, const uint8_t* t, uint8_t* out)
         out[3] = uint8_t(((c >> 12) & 15) * 17);
         break;
     }
+    case k_2_10_10_10:
+    {
+        // Like k_8_8_8_8, X comes first (the low bits); the fetch swizzle is applied afterwards. 8 bits kept of the 10;
+        // the fetch's exponent adjust is applied in the shader.
+        const uint32_t c = uint32_t(t[0]) | uint32_t(t[1]) << 8 | uint32_t(t[2]) << 16 | uint32_t(t[3]) << 24;
+        for (int i = 0; i < 3; i++)
+            out[i] = uint8_t((((c >> (i * 10)) & 1023) * 255 + 511) / 1023);
+        out[3] = uint8_t((c >> 30) * 85);
+        break;
+    }
     case k_8_8_8_8:
         // The channels in memory order after the swap (R G B A). The title's fetch constants for
         // these textures carry the BGRA swizzle (applied below), so what it samples is B G R A of
@@ -314,6 +335,7 @@ const char* TextureFormatName(uint32_t format)
     case k_1_5_5_5: return "1555";
     case k_5_6_5: return "565";
     case k_8_8_8_8: return "8888";
+    case k_2_10_10_10: return "2101010";
     case k_8_8: return "88";
     case k_4_4_4_4: return "4444";
     case k_DXT1: return "DXT1";
