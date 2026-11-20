@@ -78,6 +78,18 @@ public:
         Submit();
     }
 
+    // fn(real list, ctx) when the replay reaches this point; the replay goes on in the same list (unless fn closed it:
+    // then Switch must follow before anything else is recorded). For the asynchronous frame end (REGPU_ASYNC_PRESENT).
+    void Call(HandOffFn fn, void* ctx)
+    {
+        struct A { HandOffFn fn; void* ctx; } a{ fn, ctx };
+        Put(kCall, &a, sizeof(a));
+        Submit();
+    }
+
+    // Records into another list from here on, without waiting (Rebind waits for the replay).
+    void Switch(ID3D12GraphicsCommandList* next) { Put(kSwitch, &next, sizeof(next)); }
+
     // The real list, with everything recorded so far replayed into it.
     ID3D12GraphicsCommandList* Real()
     {
@@ -176,7 +188,8 @@ private:
     {
         kBarrier, kCopyTexture, kRootSignature, kTable, kCbv, kRoot32, kTargets, kPipeline, kViewports, kScissors, kStencilRef, kBlendFactor,
         kTopology, kHeaps, kDraw, kEndQuery, kResolveQuery, kClearRtv, kClearDsv, kCreateRtv, kCreateDsv, kDrawIndexed, kIndexBuffer, kCopyBuffer,
-        kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch, kBeginQuery, kHandOff, kComputeSrv, kComputeUav, kPredication
+        kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch, kBeginQuery, kHandOff, kComputeSrv, kComputeUav, kPredication,
+        kCall, kSwitch
     };
     static constexpr size_t kChunk = 64 << 10;
 
@@ -325,6 +338,14 @@ private:
                 l->DrawInstanced(d[0], d[1], d[2], d[3]);
                 break;
             }
+            case kCall:
+            {
+                struct A { HandOffFn fn; void* ctx; };
+                const A h = At<A>(a);
+                h.fn(l, h.ctx);
+                break;
+            }
+            case kSwitch: l = m_real = At<ID3D12GraphicsCommandList*>(a); break;
             case kHandOff:
             {
                 struct A { ID3D12GraphicsCommandList* next; HandOffFn fn; void* ctx; };
