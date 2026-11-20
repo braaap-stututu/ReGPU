@@ -9143,6 +9143,11 @@ void RendererOcclusionBegin()
         Log("occlusion query %u begins (draw #%u next)", g_occlusionOrder, g_r.drawsThisFrame.load() + 1);
 }
 
+bool RendererOcclusionCounting()
+{
+    return g_occlusionOpen;
+}
+
 bool OcclusionEndImpl(uint32_t& samples, uint32_t& total, uint32_t address);
 namespace
 {
@@ -10795,7 +10800,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             (unsigned long long)C().vsHash, (unsigned long long)C().psHash, initiator & 0x3F, list.size(), gpureg::Get(RB_BLENDCONTROL0),
             gpureg::Get(RB_COLOR_MASK) & 15, scissor.left, scissor.top, scissor.right, scissor.bottom, gpureg::Get(PA_CL_VTE_CNTL) & 0x3FF,
             int(WidePass()), int(g_drawSamplesResolve), gpureg::Get(RB_SURFACE_INFO) & 0x3FFF,
-            g_occlusionOpen ? " [in occlusion query]" : GetShader(C().vsHash, C().vsCode, false).info.memExport ? " [memexport]" : "", tex.c_str());
+            !C().worker && g_occlusionOpen ? " [in occlusion query]" : GetShader(C().vsHash, C().vsCode, false).info.memExport ? " [memexport]" : "", tex.c_str());
         Log("    host: scissor %ld,%ld-%ld,%ld viewport %g,%g %gx%g depth %p colour %p (bases %03X %03X)", hostScissor.left, hostScissor.top,
             hostScissor.right, hostScissor.bottom, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, static_cast<void*>(C().depth.Get()),
             static_cast<void*>(C().color.Get()), C().depthBase, C().colorBase);
@@ -10937,7 +10942,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // its own: the samples it covers, the console's Total (a game fades a light flare by the share that
     // passed). From pgr4-native's occlusion pairs. REGPU_NO_OCCLUSION_COVERAGE=1: not drawn (Total = ZPass).
     static LiveSwitch noCoverage("REGPU_NO_OCCLUSION_COVERAGE");
-    ID3D12PipelineState* coveragePso = g_occlusionOpen && !noCoverage && !motion && g_occlusionCount + 2 <= kOcclusionPerFrame
+    // (A draw worker's draw is never inside the command processor's query: gpu.cpp seg::g_query.)
+    ID3D12PipelineState* coveragePso = !C().worker && g_occlusionOpen && !noCoverage && !motion && g_occlusionCount + 2 <= kOcclusionPerFrame
         ? GetPipeline(vs, ps, edramMode == 5, cullable, false, stripCut && directIndex, true) : nullptr;
     {
         const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
