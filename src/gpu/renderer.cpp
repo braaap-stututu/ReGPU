@@ -933,6 +933,9 @@ struct FrameResources
     size_t vkBuffersUsed = 0;
     vk::Buffer vkRing;                              // the upload ring (ring / ringCpu / ringSize)
     VkDescriptorSet vkSet0[kSamplerBanks] = {};     // set 0 over vkRing, guest memory and each sampler bank
+    VkDeviceSize vkSet0GphysBytes = 0;
+    VkBuffer vkSet0Gphys = VK_NULL_HANDLE;          // what those sets bind as gphys (t1): guest memory, the vertex arena or
+                                                    // the ring (the copy path), as D3D12's per-frame t1 view
     uint64_t vkTimeline = 0;                        // the queue timeline value of this slot's last submission (fence)
     std::vector<std::function<void()>> vkGarbage;   // garbage: destroyed when this slot's frame has completed
 };
@@ -1860,6 +1863,17 @@ const bool g_perfTiming = getenv("REGPU_PERF") != nullptr;
 // The last draw state set on the command list: draws skip setting what has not changed
 // (each D3D12 call costs driver time, and most draws share their neighbours' state).
 // Invalidated wherever the list is reset or the root signature changes.
+// An index buffer binding (D3D12_INDEX_BUFFER_VIEW's job): a range of a Vulkan buffer.
+struct IndexView
+{
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    uint32_t bytes = 0;
+    VkIndexType type = VK_INDEX_TYPE_UINT16;
+    bool operator==(const IndexView&) const = default;
+    uint32_t IndexSize() const { return type == VK_INDEX_TYPE_UINT32 ? 4u : 2u; }
+};
+
 struct DrawState
 {
     D3D12_VIEWPORT viewport{ -1, -1, -1, -1, -1, -1 };
@@ -1871,16 +1885,11 @@ struct DrawState
     bool texturesBound = false;               // Vulkan: sets 1-3 bound in this command buffer
     VkDescriptorSet set0 = VK_NULL_HANDLE;    // Vulkan: the set 0 last bound (with its offsets)
     uint32_t set0Offsets[3] = { ~0u, ~0u, ~0u };
-    struct VkIndexBinding
-    {
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkDeviceSize offset = 0;
-        VkIndexType type = VK_INDEX_TYPE_UINT16;
-    } vkIndexBuffer;
+
     D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     bool motionTargets = false; // the motion target is bound as the second render target
     bool motionRoot = false;    // the motion root signature is set
-    D3D12_INDEX_BUFFER_VIEW indexBuffer{};
+    IndexView indexBuffer{};
     void Invalidate() { *this = DrawState{}; }
 };
 thread_local DrawState g_drawState;
@@ -2792,6 +2801,45 @@ void SamplerAnisotropy(int aniso, int (&out)[vk::kSamplerCount])
             out[i] = std::clamp(aniso, 0, 16);
 }
 
+// This slot's set 0s, over its ring and `gphys` (t1), made again when either changed; the old ones go with this slot's
+// frame (D3D12 wrote the per-frame table's two views each frame).
+void UpdateSlotSets(FrameResources& f, VkBuffer gphys, VkDeviceSize gphysBytes, bool ringChanged)
+{
+    if (!ringChanged && gphys == f.vkSet0Gphys && f.vkSet0[0])
+        return;
+    if (f.vkSet0[0])
+    {
+        VkDescriptorSet oldSets[kSamplerBanks];
+        memcpy(oldSets, f.vkSet0, sizeof(oldSets));
+        f.vkGarbage.push_back([oldSets] {
+            for (VkDescriptorSet set : oldSets)
+                vk::FreeSet0(*g_r.vkd, g_r.vkBindings, set);
+        });
+    }
+    for (UINT bank = 0; bank < kSamplerBanks; bank++)
+        f.vkSet0[bank] = vk::CreateSet0(*g_r.vkd, g_r.vkBindings, f.vkRing.buffer, f.vkRing.size, gphys, gphysBytes, g_r.vkSamplers[bank]);
+    f.vkSet0Gphys = gphys;
+    f.vkSet0GphysBytes = gphysBytes;
+}
+
+// This slot's Vulkan upload ring made again (a larger size, or the other memory: REGPU_GPU_UPLOAD_RING), with its set 0s;
+// the old ones go with this slot's frame. f.ringCpu points into it: every CPU write to the ring lands there.
+void RecreateVkRing(FrameResources& f, UINT64 size, bool vram)
+{
+    vk::Device& d = *g_r.vkd;
+    vk::Buffer old = f.vkRing;
+    f.vkGarbage.push_back([old]() mutable { vk::Destroy(*g_r.vkd, old); });
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    f.vkRing = vk::CreateBuffer(d, size, usage, vram ? vk::Memory::UploadVram : vk::Memory::Upload, "upload ring");
+    if (!f.vkRing)
+        Fatal("renderer: no memory for the %llu MB upload ring", (unsigned long long)(size >> 20));
+    // (gphys stays what it was, except the ring itself on the copy path: the frame start sets it again.)
+    const bool ringAsGphys = f.vkSet0Gphys == old.buffer || !f.vkSet0Gphys;
+    UpdateSlotSets(f, ringAsGphys ? f.vkRing.buffer : f.vkSet0Gphys, ringAsGphys ? f.vkRing.size : f.vkSet0GphysBytes, true);
+    f.ringCpu = f.vkRing.mapped;
+}
+
 // The Vulkan half of Init (step 6 of the conversion): what Init makes on D3D12, made on Vulkan. Both exist until every
 // user of the D3D12 objects is converted.
 void InitVulkan()
@@ -2814,7 +2862,6 @@ void InitVulkan()
         "guest physical memory");
     Log("renderer: Vulkan: guest physical memory %s", g_r.vkPhysical ? "read in place (host memory import)" : "copied (no host memory import)");
     g_r.vkNullBuffer = vk::CreateBuffer(d, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vk::Memory::Device, "null buffer");
-    const vk::Buffer& guest = g_r.vkPhysical ? g_r.vkPhysical : g_r.vkNullBuffer;
 
     const VkBufferUsageFlags ringUsage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
@@ -2828,8 +2875,9 @@ void InitVulkan()
         f.vkRing = vk::CreateBuffer(d, kRingSize, ringUsage, vk::Memory::Upload, "upload ring");
         if (!f.vkRing)
             Fatal("renderer: no memory for the %llu MB upload ring", (unsigned long long)(kRingSize >> 20));
-        for (UINT bank = 0; bank < kSamplerBanks; bank++)
-            f.vkSet0[bank] = vk::CreateSet0(d, g_r.vkBindings, f.vkRing.buffer, f.vkRing.size, guest.buffer, guest.size, g_r.vkSamplers[bank]);
+        // gphys: guest memory in place, else the ring (the copy path, as D3D12 bound its ring as t1 then).
+        UpdateSlotSets(f, g_r.vkPhysical ? g_r.vkPhysical.buffer : f.vkRing.buffer, g_r.vkPhysical ? g_r.vkPhysical.size : f.vkRing.size, true);
+        f.ringCpu = f.vkRing.mapped; // every CPU write to the ring goes to the Vulkan one
     }
     // The main command buffer, from slot 0 (realList), recorded through vkRecorder.
     VkCommandBufferAllocateInfo ai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
@@ -3373,7 +3421,7 @@ void EvictSurfaces()
 
 // Binds the surfaces for the current RB_COLOR_INFO / RB_DEPTH_INFO bases
 // (the list must be open).
-ID3D12Resource* VertexCacheBeginFrame(); // the vertex arena for t1 this frame, or none (VertexArena)
+const vk::Buffer* VertexCacheBeginFrame(); // the vertex arena for t1 this frame, or none (VertexArena)
 void FlushVertexCopies();
 extern bool g_vertexCacheThisFrame;
 FrameResources& Frame();
@@ -4341,6 +4389,9 @@ void BeginFrameIfNeeded()
         std::swap(f.ringCpu, f.ringAltCpu);
         std::swap(f.ringSize, f.ringAltSize);
         f.ringInVram = !f.ringInVram;
+        // (Vulkan: one ring per slot, made again in the other memory. The auto mode's trials switch every few frames:
+        // keep both there once measured.)
+        RecreateVkRing(f, f.ringSize, f.ringInVram);
         if (frameIndex == 0 && !ringAuto.on)
             Log("renderer: upload ring in %s", f.ringInVram ? "VRAM (GPU upload heap)" : "system memory");
         if (!keepBoth && !ringAuto.on)
@@ -4361,6 +4412,7 @@ void BeginFrameIfNeeded()
         else
             f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
         f.ringSize = want;
+        RecreateVkRing(f, want, f.ringInVram);
         Log("renderer: upload ring grown to %llu MB", (unsigned long long)(want >> 20));
     }
     f.ringUsed = 0;
@@ -4378,18 +4430,13 @@ void BeginFrameIfNeeded()
         raw.Buffer.NumElements = UINT(f.ringSize / 4);
         raw.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
         g_r.device->CreateShaderResourceView(f.ring.Get(), &raw, Cpu(g_r.srvHeap.Get(), f.descriptorBase, g_r.srvStride));
-        if (ID3D12Resource* arena = VertexCacheBeginFrame())
-        {
-            raw.Buffer.NumElements = UINT(arena->GetDesc().Width / 4);
-            g_r.device->CreateShaderResourceView(arena, &raw, Cpu(g_r.srvHeap.Get(), f.descriptorBase + 1, g_r.srvStride));
-        }
-        else if (g_r.physical)
-        {
-            raw.Buffer.NumElements = UINT(g_r.physical->GetDesc().Width / 4);
-            g_r.device->CreateShaderResourceView(g_r.physical.Get(), &raw, Cpu(g_r.srvHeap.Get(), f.descriptorBase + 1, g_r.srvStride));
-        }
+        // Vulkan: t1 (gphys) is the vertex arena this frame, guest memory in place, or the ring (the copy path).
+        if (const vk::Buffer* arena = VertexCacheBeginFrame())
+            UpdateSlotSets(f, arena->buffer, arena->size, false);
+        else if (g_r.vkPhysical)
+            UpdateSlotSets(f, g_r.vkPhysical.buffer, g_r.vkPhysical.size, false);
         else
-            g_r.device->CreateShaderResourceView(f.ring.Get(), &raw, Cpu(g_r.srvHeap.Get(), f.descriptorBase + 1, g_r.srvStride));
+            UpdateSlotSets(f, f.vkRing.buffer, f.vkRing.size, false);
     }
     f.descriptorsUsed = 2;
     EvictBindless();
@@ -4775,14 +4822,15 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
 struct IndexArena
 {
     static constexpr uint64_t kBytes = 128ull << 20;
-    ComPtr<ID3D12Resource> buffer;
+    vk::Buffer buffer;
     uint64_t used = 0;
     std::unordered_map<uint32_t, std::vector<uint64_t>> free; // offsets by size class (log2)
     struct Entry
     {
         uint64_t offset = 0, hash = 0, checkedFrame = ~0ull;
         uint32_t sizeClass = 0;
-        D3D12_GPU_VIRTUAL_ADDRESS staged = 0; // this frame's copy in the upload ring (frame stagedFrame)
+        VkBuffer stagedBuffer = VK_NULL_HANDLE; // this frame's copy in the upload ring (frame stagedFrame)
+        VkDeviceSize stagedOffset = 0;
         uint64_t stagedFrame = ~0ull;
         bool changing = false; // seen changing: checked at every draw, not once a frame
     };
@@ -4792,7 +4840,7 @@ struct IndexArena
     // on the arena mid-frame would drain the GPU each time new geometry streams in).
     struct Copy
     {
-        ID3D12Resource* ring;
+        VkBuffer ring;
         uint64_t from, to, bytes;
     };
     std::vector<Copy> pending;
@@ -4805,16 +4853,14 @@ void FlushIndexCopies()
     IndexArena& arena = g_indexArena;
     if (arena.pending.empty())
         return;
-    D3D12_RESOURCE_BARRIER b{};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = arena.buffer.Get();
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_INDEX_BUFFER;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    C().list->ResourceBarrier(1, &b);
+    // Index reads of earlier draws before the copies overwrite their ranges, and the copies before later reads.
+    vk::Barriers before, after;
+    before.AddGlobal(VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    before.Record(*C().vkList);
     for (const auto& c : arena.pending)
-        C().list->CopyBufferRegion(arena.buffer.Get(), c.to, c.ring, c.from, c.bytes);
-    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-    C().list->ResourceBarrier(1, &b);
+        C().vkList->CopyBuffer(arena.buffer.buffer, c.to, c.ring, c.from, c.bytes);
+    after.AddGlobal(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT, VK_ACCESS_2_INDEX_READ_BIT);
+    after.Record(*C().vkList);
     arena.pending.clear();
 }
 
@@ -4830,7 +4876,7 @@ void FlushIndexCopies()
 struct VertexArena
 {
     static constexpr uint64_t kBytes = 512ull << 20;
-    ComPtr<ID3D12Resource> buffer;
+    vk::Buffer buffer;
     uint64_t used = 0;
     std::unordered_map<uint32_t, std::vector<uint64_t>> free; // offsets by size class (log2)
     struct Entry
@@ -4855,7 +4901,7 @@ struct VertexArena
 // Decided at each frame's start (t1 is bound then).
 bool g_vertexCacheThisFrame = false;
 
-ID3D12Resource* VertexCacheBeginFrame()
+const vk::Buffer* VertexCacheBeginFrame()
 {
     VertexArena& arena = g_vertexArena;
     g_vertexCacheThisFrame = false;
@@ -4865,7 +4911,7 @@ ID3D12Resource* VertexCacheBeginFrame()
         return nullptr;
     const regpu::Host& host = regpu::GetHost();
     const bool watch = host.watchArm && host.watchClean && host.watchSeq;
-    if (g_r.physical && (arena.watchFailed || !watch))
+    if (g_r.vkPhysical && (arena.watchFailed || !watch))
     {
         static bool logged = false;
         if (!logged)
@@ -4875,11 +4921,11 @@ ID3D12Resource* VertexCacheBeginFrame()
     }
     if (!arena.buffer)
     {
-        arena.buffer = CreateBuffer(VertexArena::kBytes, D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        arena.buffer = vk::CreateBuffer(*g_r.vkd, VertexArena::kBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            vk::Memory::Device, "vertex arena");
         Log("vertex arena: %s", arena.buffer ? "512 MB on the GPU for large vertex buffers" : "couldn't be created");
     }
-    g_vertexCacheThisFrame = arena.buffer != nullptr;
+    g_vertexCacheThisFrame = bool(arena.buffer);
     // Every 3600 frames: how much it hashed and copied.
     if (arena.buffer && ++arena.frames == 3600)
     {
@@ -4889,7 +4935,7 @@ ID3D12Resource* VertexCacheBeginFrame()
             watch ? "" : " (no write watch: hashed)");
         arena.hashed = arena.uploaded = arena.hits = arena.frames = 0;
     }
-    return arena.buffer.Get();
+    return arena.buffer ? &arena.buffer : nullptr;
 }
 
 void FlushVertexCopies()
@@ -4897,16 +4943,15 @@ void FlushVertexCopies()
     VertexArena& arena = g_vertexArena;
     if (arena.pending.empty())
         return;
-    D3D12_RESOURCE_BARRIER b{};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = arena.buffer.Get();
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    C().list->ResourceBarrier(1, &b);
+    // Shader reads of earlier draws before the copies, and the copies before later reads (D3D12's transitions).
+    constexpr VkPipelineStageFlags2 shaders = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    vk::Barriers before, after;
+    before.AddGlobal(shaders, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    before.Record(*C().vkList);
     for (const auto& c : arena.pending)
-        C().list->CopyBufferRegion(arena.buffer.Get(), c.to, c.ring, c.from, c.bytes);
-    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-    C().list->ResourceBarrier(1, &b);
+        C().vkList->CopyBuffer(arena.buffer.buffer, c.to, c.ring, c.from, c.bytes);
+    after.AddGlobal(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, shaders, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    after.Record(*C().vkList);
     arena.pending.clear();
 }
 
@@ -5033,7 +5078,7 @@ uint64_t VertexCacheLocked(uint32_t address, uint32_t bytes, bool& arenaHit)
     arena.uploaded += bytes;
     e.staged = offset;
     e.stagedFrame = g_r.frame;
-    arena.pending.push_back({ Frame().ring.Get(), offset, e.offset, bytes });
+    arena.pending.push_back({ Frame().vkRing.buffer, offset, e.offset, bytes });
     e.hash = hash;
     return offset;
 }
@@ -5070,7 +5115,7 @@ uint64_t VertexCache(uint32_t address, uint32_t bytes, bool& arenaHit)
 
 // The view of the guest index buffer at physical address `base` (count indices), swapped
 // into the arena; false when it cannot be cached (the draw fetches indices itself).
-bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view, uint64_t hash);
+bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, IndexView& view, uint64_t hash);
 thread_local bool g_indexChanging = false; // set by GetIndexBufferLocked: the entry is checked at every draw
 // Each thread remembers this frame's index buffers (checked once per frame), except ones seen changing.
 // ---- Hyper mesh decimation and vertex-cache order (from the FM2 port's hyper-prototype, MIT; FM3 port session 43).
@@ -5105,8 +5150,8 @@ struct Mesh
     std::atomic<int> state{ 0 }; // 0 queued, 1 ready, 2 left as it is
     std::vector<uint32_t> indices; // the result: vertex IDs as in the source
     uint64_t hash = 0, checkedFrame = ~0ull;
-    ComPtr<ID3D12Resource> buffer;
-    D3D12_INDEX_BUFFER_VIEW view{};
+    vk::Buffer buffer;
+    IndexView view{};
     uint32_t count = 0;
 };
 struct Job
@@ -5226,7 +5271,7 @@ bool Position(const uint8_t* v, uint32_t format, uint32_t endian, float* xyz)
 #endif
 
 // Replaces view and drawCount with the mesh's own index buffer when it has one ready.
-void Apply(const TranslatedShader& vs, uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view, uint32_t& drawCount)
+void Apply(const TranslatedShader& vs, uint32_t base, uint32_t count, bool is32, uint32_t endian, IndexView& view, uint32_t& drawCount)
 {
     if (!DecimatePercent() && !Vcache())
         return;
@@ -5332,15 +5377,13 @@ void Apply(const TranslatedShader& vs, uint32_t base, uint32_t count, bool is32,
     if (!m.buffer)
     {
         const UINT64 size = UINT64(m.indices.size()) * (is32 ? 4 : 2);
-        m.buffer = CreateBuffer((size + 255) & ~255ull, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        m.buffer = vk::CreateBuffer(*g_r.vkd, (size + 255) & ~255ull, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, vk::Memory::Upload, "decimated indices");
         if (!m.buffer)
         {
             m.state = 2;
             return;
         }
-        uint8_t* p = nullptr;
-        const D3D12_RANGE none{ 0, 0 };
-        m.buffer->Map(0, &none, reinterpret_cast<void**>(&p));
+        uint8_t* p = m.buffer.mapped;
         for (size_t i = 0; i < m.indices.size(); i++)
             if (is32)
                 memcpy(p + i * 4, &m.indices[i], 4);
@@ -5349,8 +5392,7 @@ void Apply(const TranslatedShader& vs, uint32_t base, uint32_t count, bool is32,
                 const uint16_t h = uint16_t(m.indices[i]);
                 memcpy(p + i * 2, &h, 2);
             }
-        m.buffer->Unmap(0, nullptr);
-        m.view = { m.buffer->GetGPUVirtualAddress(), UINT(size), is32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT };
+        m.view = { m.buffer.buffer, 0, uint32_t(size), is32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16 };
         m.count = uint32_t(m.indices.size());
         m.indices = {};
     }
@@ -5361,11 +5403,11 @@ void Apply(const TranslatedShader& vs, uint32_t base, uint32_t count, bool is32,
 }
 } // namespace hyperdec
 
-bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view)
+bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, IndexView& view)
 {
-    thread_local FrameMap<D3D12_INDEX_BUFFER_VIEW> known;
+    thread_local FrameMap<IndexView> known;
     const uint64_t key = uint64_t(base) << 32 ^ uint64_t(count) << 3 ^ uint64_t(is32) << 2 ^ endian;
-    static SharedFrameMap<D3D12_INDEX_BUFFER_VIEW> shared;
+    static SharedFrameMap<IndexView> shared;
     if (const auto* v = known.Find(key, g_r.frame))
     {
         view = *v;
@@ -5456,7 +5498,7 @@ void NoteInPlace(uint32_t address, uint32_t bytes, bool index, uint64_t vs)
         overwrite::g_ranges[slot].push_back({ address, bytes, FullHash(GuestPtr<uint8_t>(GpuPhysToGuest(address)), bytes), vs, index });
 }
 
-bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view, uint64_t hash)
+bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, IndexView& view, uint64_t hash)
 {
     IndexArena& arena = g_indexArena;
     const uint32_t bytes = count * (is32 ? 4 : 2);
@@ -5472,7 +5514,8 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
     }
     if (!arena.buffer)
     {
-        arena.buffer = CreateBuffer(IndexArena::kBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+        arena.buffer = vk::CreateBuffer(*g_r.vkd, IndexArena::kBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            vk::Memory::Device, "index arena");
         if (!arena.buffer)
             return false;
     }
@@ -5503,7 +5546,7 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
         }
         e.sizeClass = sizeClass;
     }
-    view = { arena.buffer->GetGPUVirtualAddress() + e.offset, bytes, is32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT };
+    view = { arena.buffer.buffer, e.offset, bytes, is32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16 };
     // An index buffer seen changing is checked at every draw: one rewritten between two draws of a frame
     // (FH1's skid marks, many on screen) otherwise drew later draws with the earlier indices, triangles
     // stretched to far-off vertices. REGPU_INDEX_CHECK_ONCE=1: once a frame for all, as before.
@@ -5512,7 +5555,7 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
     if (e.checkedFrame == g_r.frame && (!e.changing || checkOnce))
     {
         if (e.stagedFrame == g_r.frame)
-            view.BufferLocation = e.staged;
+            view.buffer = e.stagedBuffer, view.offset = e.stagedOffset;
         return true;
     }
     e.checkedFrame = g_r.frame;
@@ -5524,7 +5567,7 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
     if (!inserted && hash == e.hash)
     {
         if (e.stagedFrame == g_r.frame)
-            view.BufferLocation = e.staged;
+            view.buffer = e.stagedBuffer, view.offset = e.stagedOffset;
         return true;
     }
     if (!inserted)
@@ -5558,10 +5601,12 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
             memcpy(dst + i * 2, &v, 2);
         }
     // This frame draws from the upload ring; the arena gets the copy at the end of the frame.
-    e.staged = Frame().ring->GetGPUVirtualAddress() + offset;
+    e.stagedBuffer = Frame().vkRing.buffer;
+    e.stagedOffset = offset;
     e.stagedFrame = g_r.frame;
-    view.BufferLocation = e.staged;
-    arena.pending.push_back({ Frame().ring.Get(), offset, e.offset, bytes });
+    view.buffer = e.stagedBuffer;
+    view.offset = e.stagedOffset;
+    arena.pending.push_back({ Frame().vkRing.buffer, offset, e.offset, bytes });
     e.hash = hash;
     return true;
 }
@@ -15737,7 +15782,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     bool directIndex = (g_r.physical || g_vertexCacheThisFrame) && !noDirectIndex && !indexOverrun && !indexRewritten &&
         (indexSource == 0 || indexSource == 2) && (prim == 4 || prim == 13 || (prim == 6 && (!restartOn || stripCut)));
     LiveSwitch &noIndexed = g_sw_REGPU_NO_INDEXED;
-    D3D12_INDEX_BUFFER_VIEW indexView{};
+    IndexView indexView{};
     uint32_t indexedCount = 0;
     bool indexedTried = false;
     if (directIndex && g_vertexCacheThisFrame && indexSource == 0)
@@ -17172,7 +17217,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             h = Mix(h, vc->vf[k][2] ? vc->vf[k][0] : ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(address)), std::min<uint32_t>(bytes, 1u << 20), 64));
         }
         d.part[kVertices] = h;
-        d.part[kIndices] = Mix(Mix(Mix(Mix(0, indexedCount), indexView.BufferLocation), uint64_t(reinterpret_cast<uintptr_t>(indexEntry))),
+        d.part[kIndices] = Mix(Mix(Mix(Mix(0, indexedCount), uint64_t(reinterpret_cast<uintptr_t>(indexView.buffer)) ^ indexView.offset), uint64_t(reinterpret_cast<uintptr_t>(indexEntry))),
             indexEntry ? indexEntry->offset : 0);
         h = 0;
         for (uint32_t m = ps.info.usedTextureSlots | vs.info.usedTextureSlots; m; m &= m - 1)
@@ -17616,28 +17661,22 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // indexed draw before: ~2,000 IASetIndexBuffer a frame in FM3, each a driver call on the replay thread).
         // REGPU_NO_WIDE_INDEX_VIEWS=1 (live): one view per draw's indices, as before.
         UINT startIndex = 0;
-        D3D12_INDEX_BUFFER_VIEW bindView = indexView;
+        IndexView bindView = indexView;
         if (LiveSwitch &noWide = g_sw_REGPU_NO_WIDE_INDEX_VIEWS; indexedCount && !noWide)
         {
-            const UINT size = indexView.Format == DXGI_FORMAT_R32_UINT ? 4u : 2u;
-            auto widen = [&](ID3D12Resource* buffer, UINT64 bytes) {
-                if (!buffer)
-                    return false;
-                const D3D12_GPU_VIRTUAL_ADDRESS base = buffer->GetGPUVirtualAddress();
-                const UINT64 end = base + std::min<UINT64>(bytes, 0xFFFFFFF0ull);
-                if (indexView.BufferLocation < base || indexView.BufferLocation + indexView.SizeInBytes > end || (indexView.BufferLocation - base) % size)
-                    return false;
-                startIndex = UINT((indexView.BufferLocation - base) / size);
-                bindView = { base, UINT(end - base), indexView.Format };
-                return true;
-            };
-            if (!widen(g_indexArena.buffer.Get(), IndexArena::kBytes))
-                widen(f.ring.Get(), f.ringSize);
+            // The whole buffer bound from 0, the draw's place as its first index (a buffer is all one binding).
+            const UINT size = indexView.IndexSize();
+            if (indexView.offset % size == 0)
+            {
+                startIndex = UINT(indexView.offset / size);
+                bindView = { indexView.buffer, 0, indexView.bytes + uint32_t(indexView.offset), indexView.type };
+            }
         }
-        if (indexedCount && memcmp(&bindView, &g_drawState.indexBuffer, sizeof(bindView)) != 0)
+        if (indexedCount && !(bindView.buffer == g_drawState.indexBuffer.buffer && bindView.offset == g_drawState.indexBuffer.offset &&
+                                bindView.type == g_drawState.indexBuffer.type))
         {
             g_drawState.indexBuffer = bindView;
-            C().list->IASetIndexBuffer(&bindView);
+            C().vkList->BindIndexBuffer(bindView.buffer, bindView.offset, bindView.type);
         }
         auto issue = [&] {
             // REGPU_GPU_PASSES=2: this draw's pipeline statistics (begun and ended in the same list).
