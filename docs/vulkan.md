@@ -14,6 +14,9 @@ D3D12 renderer's: where a D3D12 object was, a Vulkan one is.
 - **Used where the driver has them:** `VK_EXT_conditional_rendering` (REGPU_DRAW_CULL's predication; without it the
   draws are drawn), `VK_EXT_external_memory_host` (guest memory read in place; without it vertex data is copied),
   `VK_KHR_push_descriptor`, `VK_EXT_memory_budget`, `VK_NVX_binary_import` + `VK_NVX_image_view_handle` (DLSS),
+  `VK_EXT_primitive_topology_list_restart` (strips with the cut index on list-class pipelines),
+  `VK_KHR_compute_shader_derivatives` / NV, `VK_EXT_mutable_descriptor_type`, subgroup size control, 8-bit integers and
+  integer dot products (FidelityFX's FSR 3/4 and XeSS create their pipelines on ReGPU's device and need these),
   storage image reads and writes without a format (the post filters and passes), precise occlusion queries, pipeline
   statistics queries.
 - **At build time:** DXC with SPIR-V output (the Vulkan SDK's `Bin/dxc.exe`, or `REGPU_DXC_EXE`) compiles ReGPU's
@@ -68,10 +71,24 @@ Each builds as its own target and must pass with `REGPU_VK_VALIDATION=2` and no 
 | `regpu_vkdraw` | A draw through the translated shaders' bindings: set 0's constants, gmem, gphys and a bindless texture. |
 | `regpu_vkpasses` | A compute and a graphics pass from HLSL, their layouts from SPIR-V, transient sets, read back. |
 
+## Checked with a game (FM3, 20 Nov 2026)
+
+FM3 (the `regpu-vulkan` branch of its port) on an RX 7900 XTX against its D3D12 build:
+- **Validation:** none on the race grid and menus under synchronization validation; none with FXAA, SMAA, CMAA 2,
+  SSAA, FSR 1/3 or XeSS; two messages from inside FSR 4's own shaders (not ReGPU's).
+- **Image:** the race grid matches (mean difference under 1/255; the rest is animated crowd and sub-pixel edges).
+- **Speed:** level. 4K 4x MSAA with CMAA 2: 230 fps and 4.18 ms of GPU a frame against 232 fps and 4.14 ms; without the
+  filter 278 against 284 fps. Per pass (`REGPU_GPU_PASSES=1`), the main scene pass is ~5% slower and spread over many
+  shaders (the driver's SPIR-V against its DXIL compile of the same HLSL); CMAA 2 is slightly faster. At 1080p both
+  hold the 360 fps cap with the draw thread equally busy.
+- **Measuring:** the light performance log's "GPU ms/frame" (timestamps around each frame) and `REGPU_GPU_PASSES=1`
+  (per pass) / `REGPU_GPU_SHADERS=1` (per draw, by shaders) work as on D3D12. Compare the same settings on both sides:
+  a profile with a different `aa=` makes one look slower.
+
 ## Not done yet
 
 - **VR (OpenXR):** its session is still the D3D12 one (`XR_KHR_D3D12_enable`); builds take the stub (`REGPU_VR` logs
   that it is not available) until it moves to `XR_KHR_vulkan_enable2`.
 - **DLSS and XeSS** were converted without their SDKs on the converting machine: build them once with the SDKs.
 - **Linux:** the renderer is Vulkan, but the window, the overlay text (GDI), threads and a few file paths are Win32.
-- **Run with a game:** see the plan's status.
+- **Not run yet with a game:** races in motion, VR, DLSS (no NVIDIA GPU here), FSR 4 beyond its start.
