@@ -150,6 +150,39 @@ std::vector<uint8_t> g_file(0x8000 * 4);       // the worker's register file (re
 bool g_enabled = false;
 std::atomic<bool> g_started{ false };
 
+// Wake-ups only for a thread that waits: each side counts itself in before it sleeps, and the other notifies only
+// when someone is counted (a notify is a call into the OS wait table every time: per record on the command
+// processor ~4% of its time, per batch on the draw thread ~2%; on a 4-thread CPU that time is the draw thread's).
+// The count's locked add and the publisher's seq_cst store each order the following load (x86), so a waiter either
+// sees the new value in wait()'s compare or is seen by the publisher. REGPU_ALWAYS_NOTIFY=1: every time (start-time).
+alignas(64) std::atomic<int> g_headWaiters{ 0 };
+alignas(64) std::atomic<int> g_tailWaiters{ 0 };
+const bool g_alwaysNotify = getenv("REGPU_ALWAYS_NOTIFY") != nullptr;
+void WaitHead(uint64_t old)
+{
+    g_headWaiters.fetch_add(1, std::memory_order_seq_cst);
+    g_head.wait(old, std::memory_order_seq_cst);
+    g_headWaiters.fetch_sub(1, std::memory_order_relaxed);
+}
+void WaitTail(uint64_t old)
+{
+    g_tailWaiters.fetch_add(1, std::memory_order_seq_cst);
+    g_tail.wait(old, std::memory_order_seq_cst);
+    g_tailWaiters.fetch_sub(1, std::memory_order_relaxed);
+}
+void PublishHead(uint64_t head)
+{
+    g_head.store(head, std::memory_order_seq_cst);
+    if (g_alwaysNotify || g_headWaiters.load(std::memory_order_seq_cst))
+        g_head.notify_one();
+}
+void PublishTail(uint64_t tail)
+{
+    g_tail.store(tail, std::memory_order_seq_cst);
+    if (g_alwaysNotify || g_tailWaiters.load(std::memory_order_seq_cst))
+        g_tail.notify_all();
+}
+
 // Space for a record of `words` payload words; returns where to write it.
 uint32_t* Begin(uint32_t type, uint32_t words)
 {
@@ -159,17 +192,16 @@ uint32_t* Begin(uint32_t type, uint32_t words)
     {
         const uint64_t pad = kWords - head % kWords;
         while (head + pad - g_tail.load(std::memory_order_acquire) > kWords)
-            g_tail.wait(g_tail.load(std::memory_order_acquire), std::memory_order_acquire);
+            WaitTail(g_tail.load(std::memory_order_acquire));
         g_ring[head % kWords] = (kPad << 24) | uint32_t(pad - 1);
         head += pad;
-        g_head.store(head, std::memory_order_release);
-        g_head.notify_one();
+        PublishHead(head);
     }
     while (head + need - g_tail.load(std::memory_order_acquire) > kWords)
     {
         const uint64_t tail = g_tail.load(std::memory_order_acquire);
         if (head + need - tail > kWords)
-            g_tail.wait(tail, std::memory_order_acquire);
+            WaitTail(tail);
     }
     uint32_t* p = &g_ring[head % kWords];
     p[0] = (type << 24) | words;
@@ -178,9 +210,7 @@ uint32_t* Begin(uint32_t type, uint32_t words)
 
 void End(uint32_t words)
 {
-    const uint64_t head = g_head.load(std::memory_order_relaxed) + words + 1;
-    g_head.store(head, std::memory_order_release);
-    g_head.notify_one();
+    PublishHead(g_head.load(std::memory_order_relaxed) + words + 1);
 }
 
 // Waits until the worker has done everything logged so far.
@@ -194,7 +224,7 @@ void Drain()
         g_drainWaits++;
     const uint64_t head = g_head.load(std::memory_order_relaxed);
     for (uint64_t tail; (tail = g_tail.load(std::memory_order_acquire)) != head;)
-        g_tail.wait(tail, std::memory_order_acquire);
+        WaitTail(tail);
 }
 
 bool Active() { return g_enabled && g_started.load(std::memory_order_relaxed); }
@@ -232,8 +262,10 @@ void LogRegs(uint32_t index, const uint32_t* valuesBE, uint32_t count)
     p[0] = index + first;
     memcpy(p + 1, valuesBE + first, size_t(n) * 4);
     End(n + 1);
+    // (The clock only every 4096 runs: read per run it was ~2.5% of the command processor.)
     static auto lastLog = std::chrono::steady_clock::now();
-    if (std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(30))
+    static uint32_t sinceCheck = 0;
+    if ((++sinceCheck & 4095) == 0 && std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(30))
     {
         lastLog = std::chrono::steady_clock::now();
         Log("gpu: register words written %llu, sent to the draw thread %llu (%.0f%%)", (unsigned long long)g_regWords,
@@ -529,7 +561,7 @@ void SubmitShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwo
             if (lastAddress[t] == guestAddress && last[t].size() == dwords && memcmp(last[t].data(), microcodeBE, size_t(dwords) * 4) == 0)
             {
                 skipped++;
-                if (std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(30))
+                if ((skipped & 1023) == 0 && std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(30))
                 {
                     lastLog = std::chrono::steady_clock::now();
                     Log("gpu: shader loads: %llu, %llu repeats not sent (%.0f%%)", (unsigned long long)loads, (unsigned long long)skipped,
@@ -644,11 +676,11 @@ void WorkerLoop()
             if (timeIdle)
             {
                 const auto w0 = std::chrono::steady_clock::now();
-                work::g_head.wait(head, std::memory_order_acquire);
+                work::WaitHead(head);
                 RendererDrawThreadIdle(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
             }
             else
-                work::g_head.wait(head, std::memory_order_acquire);
+                work::WaitHead(head);
         }
         // Everything published so far, then let the command processor know.
         while (tail != head)
@@ -707,12 +739,10 @@ void WorkerLoop()
             // or it must catch up): every record would cost a wake-up each.
             if (type == work::kWriteBack || type == work::kStore || type == work::kSwap || (tail & 0x3FFF) < words + 1)
             {
-                work::g_tail.store(tail, std::memory_order_release);
-                work::g_tail.notify_all();
+                work::PublishTail(tail);
             }
         }
-        work::g_tail.store(tail, std::memory_order_release);
-        work::g_tail.notify_all();
+        work::PublishTail(tail);
     }
 }
 

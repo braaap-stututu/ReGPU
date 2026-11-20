@@ -2770,6 +2770,7 @@ LiveSwitch g_sw_REGPU_TEXTURE_CHECK_EVERY4("REGPU_TEXTURE_CHECK_EVERY4");
 LiveSwitch g_sw_REGPU_TEXTURE_CHECK_STAGGER("REGPU_TEXTURE_CHECK_STAGGER");
 LiveSwitch g_sw_REGPU_TRACE_CONSTANTS_USED("REGPU_TRACE_CONSTANTS_USED");
 LiveSwitch g_sw_REGPU_CONSTANT_REUSE("REGPU_CONSTANT_REUSE");
+LiveSwitch g_sw_REGPU_NO_WIDE_INDEX_VIEWS("REGPU_NO_WIDE_INDEX_VIEWS");
 LiveSwitch g_sw_REGPU_TRACE_CONSTANT_BYTES("REGPU_TRACE_CONSTANT_BYTES");
 LiveSwitch g_sw_REGPU_TRACE_MIDSIZE("REGPU_TRACE_MIDSIZE");
 LiveSwitch g_sw_REGPU_TRACE_TEXCHANGE("REGPU_TRACE_TEXCHANGE");
@@ -14339,10 +14340,33 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             g_drawState.topology = topology;
             C().list->IASetPrimitiveTopology(topology);
         }
-        if (indexedCount && memcmp(&indexView, &g_drawState.indexBuffer, sizeof(indexView)) != 0)
+        // Index buffers live in the index arena or this frame's upload ring: bound as a view of the whole buffer,
+        // with the draw's place as its start index, consecutive draws share one binding (a new view almost every
+        // indexed draw before: ~2,000 IASetIndexBuffer a frame in FM3, each a driver call on the replay thread).
+        // REGPU_NO_WIDE_INDEX_VIEWS=1 (live): one view per draw's indices, as before.
+        UINT startIndex = 0;
+        D3D12_INDEX_BUFFER_VIEW bindView = indexView;
+        if (LiveSwitch &noWide = g_sw_REGPU_NO_WIDE_INDEX_VIEWS; indexedCount && !noWide)
         {
-            g_drawState.indexBuffer = indexView;
-            C().list->IASetIndexBuffer(&indexView);
+            const UINT size = indexView.Format == DXGI_FORMAT_R32_UINT ? 4u : 2u;
+            auto widen = [&](ID3D12Resource* buffer, UINT64 bytes) {
+                if (!buffer)
+                    return false;
+                const D3D12_GPU_VIRTUAL_ADDRESS base = buffer->GetGPUVirtualAddress();
+                const UINT64 end = base + std::min<UINT64>(bytes, 0xFFFFFFF0ull);
+                if (indexView.BufferLocation < base || indexView.BufferLocation + indexView.SizeInBytes > end || (indexView.BufferLocation - base) % size)
+                    return false;
+                startIndex = UINT((indexView.BufferLocation - base) / size);
+                bindView = { base, UINT(end - base), indexView.Format };
+                return true;
+            };
+            if (!widen(g_indexArena.buffer.Get(), IndexArena::kBytes))
+                widen(f.ring.Get(), f.ringSize);
+        }
+        if (indexedCount && memcmp(&bindView, &g_drawState.indexBuffer, sizeof(bindView)) != 0)
+        {
+            g_drawState.indexBuffer = bindView;
+            C().list->IASetIndexBuffer(&bindView);
         }
         auto issue = [&] {
             // REGPU_GPU_PASSES=2: this draw's pipeline statistics (begun and ended in the same list).
@@ -14378,7 +14402,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             if (exp == 1)
                 ;
             else if (indexedCount)
-                C().list->DrawIndexedInstanced(exp == 2 ? std::min<UINT>(indexedCount, 3) : indexedCount, 1, 0, 0, 0);
+                C().list->DrawIndexedInstanced(exp == 2 ? std::min<UINT>(indexedCount, 3) : indexedCount, 1, startIndex, 0, 0);
             else
                 C().list->DrawInstanced(exp == 2 ? std::min<UINT>(directIndex ? directVertices : UINT(list.size()), 3) : (directIndex ? directVertices : UINT(list.size())), 1, 0, 0);
             if (stat)
