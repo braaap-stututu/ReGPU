@@ -77,3 +77,6 @@ int PlainMulPixelLevel();
 // REGPU_FETCH_SPECIALIZE (renderer.cpp SpecVariant): the lean TFetch2D as TFetch2DK(slot, coord, denorm, bias, texel,
 // filt, info, w), its fetch-constant words (tinfo.x, tinfo.w) as arguments: a variant passes them as literals.
 const std::string& SpecializedFetchFunction();
+// L62 (FM3 port, session 34): the full TFetch path as TFetchK(slot, coord, denorm, vertexStage, bias, texel, info, w)
+// (with TFetchRawK); part of SpecializedFetchFunction's text.
+std::string SpecializedFullFetchFunction();

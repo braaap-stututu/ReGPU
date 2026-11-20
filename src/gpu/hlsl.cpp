@@ -1340,9 +1340,49 @@ const std::string& SpecializedFetchFunction()
             "        const bool wrapK = (infoK & 3u) == 0u || (infoK & 3u) == 3u;\n"
             "        infoK = (infoK & ~3u) | (filt == 0 ? (wrapK ? 3u : 2u) : (wrapK ? 0u : 1u));\n"
             "    }\n");
-        return f;
+        // A 3D or cube texture behind the 2D fetch: the specialised full path too.
+        replaceAll("return TFetch(slot, coord, denorm, false, bias, texel);", "return TFetchK(slot, coord, denorm, false, bias, texel, infoK, wK);");
+        const std::string full = SpecializedFullFetchFunction();
+        return full.empty() ? std::string() : full + f;
     }();
     return text;
+}
+
+// TFetchK / TFetchRawK (L62, session 34, FM3 port): the full TFetch path (cube, 3D and 2D fetches outside the lean
+// 2D path: FM3's car paint reads its two reflection cubes this way) with the fetch-constant words as arguments, made
+// from the preamble's own TFetch and TFetchRaw text. With literal words only the constant's own branch is left.
+std::string SpecializedFullFetchFunction()
+{
+    const std::string pre = kPreamble;
+    auto cut = [&pre](const char* from, const char* to) {
+        const size_t start = pre.find(from), end = start == std::string::npos ? start : pre.find(to, start);
+        return start == std::string::npos || end == std::string::npos ? std::string() : pre.substr(start, end - start);
+    };
+    std::string raw = cut("float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)\n{", "float4 CubeOp(");
+    std::string fetch = cut("float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)\n{", "// The lean 2D path");
+    if (raw.empty() || fetch.empty())
+        return {};
+    auto replaceAll = [](std::string& f, const std::string& a, const std::string& b) {
+        size_t n = 0;
+        for (size_t at = f.find(a); at != std::string::npos; at = f.find(a, at + b.size()))
+            f.replace(at, a.size(), b), n++;
+        return n;
+    };
+    const std::string args = "(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)";
+    const std::string argsK = "(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel, uint infoK, uint wK)";
+    replaceAll(raw, "float4 TFetchRaw" + args, "float4 TFetchRawK" + argsK);
+    replaceAll(fetch, "float4 TFetch" + args, "float4 TFetchK" + argsK);
+    if (!replaceAll(fetch, "TFetchRaw(slot, coord, denorm, vertexStage, bias, texel)", "TFetchRawK(slot, coord, denorm, vertexStage, bias, texel, infoK, wK)"))
+        return {};
+    for (std::string* f : { &raw, &fetch })
+    {
+        replaceAll(*f, "tinfo[slot].x", "infoK");
+        replaceAll(*f, "tinfo[slot].w", "wK");
+    }
+    // (A literal selector, as in TFetch2DK.)
+    replaceAll(fetch, "r[c] = sel < 4u ? v[sel] : (sel == 5u ? 1.0 : 0.0);",
+        "r[c] = sel == 0u ? v.x : sel == 1u ? v.y : sel == 2u ? v.z : sel == 3u ? v.w : (sel == 5u ? 1.0 : 0.0);");
+    return raw + fetch;
 }
 
 bool BakedVertexFetch()
@@ -1652,6 +1692,30 @@ TranslatedShader TranslateShader(const Shader& shader)
             const std::string ret = "    return oC0;\n}\n";
             if (const size_t r = h.rfind(ret); r != std::string::npos)
                 h.replace(r, ret.size(), "    float4 oC[1] = { oC0 };\n    return oC[0];\n}\n");
+        }
+    }
+    // REGPU_EXP_MIN16=1 (FM3 port session 34, a measurement only, read at translation; its shaders cache apart by their
+    // HLSL): a pixel shader's registers and ALU temporaries as min16float (FXC's minimum-precision hint, which a driver
+    // may run at 16 bits). An upper bound on what 16-bit math (I7) could give: coordinates lose precision too, so the
+    // picture may be wrong.
+    static const bool min16 = [] { const char* v = getenv("REGPU_EXP_MIN16"); return v && *v && strcmp(v, "0") != 0; }();
+    if (shader.pixel && min16)
+    {
+        const size_t mainAt = h.find(e.exportsDepth ? "struct PSOut" : "float4 main(VSOut input)");
+        if (mainAt != std::string::npos)
+        {
+            auto replaceFrom = [&h](size_t from, const std::string& a, const std::string& b) {
+                for (size_t at = h.find(a, from); at != std::string::npos; at = h.find(a, at + b.size()))
+                    h.replace(at, a.size(), b);
+            };
+            replaceFrom(mainAt, "    float4 r", "    min16float4 r");
+            replaceFrom(mainAt, "float4 v = float4(0, 0, 0, 0);", "min16float4 v = 0;");
+            replaceFrom(mainAt, "float s = ps;", "min16float s = ps;");
+            replaceFrom(mainAt, "float ps = 0;", "min16float ps = 0;");
+            h.insert(mainAt,
+                "min16float4 Mul9(min16float4 a, min16float4 b) { return (a == 0 || b == 0) ? (min16float4)0 : a * b; }\n"
+                "min16float Mul9(min16float a, min16float b) { return (a == 0 || b == 0) ? (min16float)0 : a * b; }\n"
+                "min16float Dot9(min16float4 a, min16float4 b) { min16float4 m = Mul9(a, b); return m.x + m.y + m.z + m.w; }\n");
         }
     }
     result.hlsl = h;
