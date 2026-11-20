@@ -1229,6 +1229,17 @@ float Mul9(float a, float b) { return a * b; }
 float Dot9(float4 a, float4 b) { return dot(a, b); })";
 
 // REGPU_VR=stereo (read once): the vertex shaders take the eye offset (see the viewport transform below).
+// Triple screen (REGPU_TRIPLE, FM3 port session 39): the main view's perspective geometry turned about the eye for a side
+// screen and narrowed from the game's wide frustum to the screen's own (vdepth.y turn, z k, w the screen's P00).
+bool TripleShaders()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_TRIPLE");
+        return v && *v && strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
 bool StereoShaders()
 {
     static const bool on = [] {
@@ -1639,6 +1650,21 @@ TranslatedShader TranslateShader(const Shader& shader)
         // main view). Only in stereo mode, so the shaders (and their cache entries) stay as they were otherwise.
         if (StereoShaders())
             h += "    if (!flat) r.pos.x += vdepth.y;\n";
+        // Triple screen: clip (x, w) back to the eye's view (x_v = x k / P00, z_v = w), turned by vdepth.y, projected
+        // with the screen's P00; y narrowed by k (both frustums 16:9); depth kept for the turned view (z += w' - w: exact
+        // for a projection with z = w + B, close for far >> near).
+        if (TripleShaders())
+            h += "    if (!flat && vdepth.z != 0.0)\n"
+                 "    {\n"
+                 "        float ts, tc;\n"
+                 "        sincos(vdepth.y, ts, tc);\n"
+                 "        const float x0 = r.pos.x, w0 = r.pos.w;\n"
+                 "        const float w1 = ts * x0 * vdepth.z / vdepth.w + tc * w0;\n"
+                 "        r.pos.x = vdepth.z * tc * x0 - vdepth.w * ts * w0;\n"
+                 "        r.pos.y *= vdepth.z;\n"
+                 "        r.pos.z += w1 - w0;\n"
+                 "        r.pos.w = w1;\n"
+                 "    }\n";
         h += "    if (!flat) r.pos.xy *= vwide.xy;\n"
              "    float w = r.pos.w;\n"
              "    // (VTX_W0_FMT set means w is the true W0, the normal case.)\n"

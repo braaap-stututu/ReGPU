@@ -3,6 +3,8 @@
 #include "settings.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
 #include "debug.h"
 #include "memory.h"
@@ -40,6 +42,20 @@ void Start()
 void Config::RenderSize(uint32_t& w, uint32_t& h) const
 {
     ShownSize(w, h);
+    // Triple screen (REGPU_TRIPLE, FM3 port session 39): the resolution is the three screens together; each screen's
+    // pass renders at a third of its width (no supersampling).
+    static const bool triple = [] {
+        const char* v = getenv("REGPU_TRIPLE");
+        return v && *v && strcmp(v, "0") != 0;
+    }();
+    if (triple)
+    {
+        // Each screen 16:9 (the title's frame): a third of the width, the height fitted to it.
+        w = (w / 3) & ~1u;
+        h = std::min<uint32_t>(h, w * 9 / 16) & ~1u;
+        w = std::min<uint32_t>(w, h * 16 / 9) & ~1u;
+        return;
+    }
     if (ssaa > 1.0f)
     {
         w = uint32_t(std::lround(double(w) * ssaa)) & ~1u;

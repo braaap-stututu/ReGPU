@@ -671,10 +671,14 @@ bool Mode()
 {
     static const bool on = [] {
         const char* v = getenv("REGPU_VR");
-        return v && strcmp(v, "stereo") == 0;
+        return (v && strcmp(v, "stereo") == 0) || TripleMode();
     }();
     return on;
 }
+// Triple screen (regpu::triple::SubmitFrame): the newest frame's fields of view and turn, and when they came.
+std::atomic<float> g_tripleGameFov{ 0 }, g_tripleScreenFov{ 0 }, g_tripleAngleIn{ 0 };
+std::atomic<int64_t> g_tripleAt{ 0 };
+float g_tripleK = 0, g_tripleP00 = 0, g_tripleTurn = 0; // this frame's (BeforeDraw)
 bool g_checked = false; // this frame's first main-view draw seen (and the frame's choice made)
 bool g_armed = false;   // recording this frame for the second eye
 float g_clip = 0;       // P00 * half the eye distance: the left eye's clip x offset (the right eye's negated)
@@ -702,6 +706,29 @@ void BeforeDraw()
     if (!Mode() || g_checked || !RendererMainViewNow())
         return;
     g_checked = true;
+    if (TripleMode())
+    {
+        // A frame whose camera reported its fields of view in the last 100 ms (else drawn once, untouched).
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+        const float gameFov = g_tripleGameFov.load(), screenFov = g_tripleScreenFov.load();
+        if (now - g_tripleAt.load() > 100 || gameFov <= 0.1f || gameFov >= 3.1f || screenFov <= 0.05f || screenFov > gameFov)
+        {
+            RendererSetTripleView(0, 0, 0, false);
+            return;
+        }
+        static LiveSwitch flip("REGPU_TRIPLE_FLIP");
+        const float ts = tanf(screenFov * 0.5f);
+        g_tripleK = tanf(gameFov * 0.5f) / ts;
+        g_tripleP00 = 1.0f / (ts * (16.0f / 9.0f));
+        g_tripleTurn = g_tripleAngleIn.load() * (flip ? -1.0f : 1.0f);
+        g_startFile = work::g_file;
+        for (int t = 0; t < 2; t++)
+            g_startShader[t] = g_shader[t], g_startShaderAddress[t] = g_shaderAddress[t];
+        g_log.clear();
+        g_armed = true;
+        RendererSetTripleView(0, g_tripleK, g_tripleP00, false); // the game's own pass: the centre screen
+        return;
+    }
     float p00 = 0, half = 0;
     if (!regpu::xr::StereoFrame(p00, half))
         return;
@@ -729,32 +756,14 @@ void Append(const uint32_t* record, uint32_t words)
     g_log.insert(g_log.end(), record, record + words);
 }
 
-// At the swap, before the frame is presented: the second eye.
-void AtSwap(uint32_t frontBuffer)
+// The recorded frame drawn again from its first main-view draw's state (fences, ordered stores and occlusion queries
+// with their draws are skipped: the guest saw them once).
+void Replay()
 {
-    const bool armed = g_armed;
-    g_armed = false;
-    g_checked = false;
-    if (!armed)
-    {
-        RendererSetStereoEye(0);
-        return;
-    }
-    RendererStereoCaptureEye(g_firstEye, frontBuffer);
-    // REGPU_VR_NO_SECOND_EYE=1 (live): the records are kept but not drawn again (the second eye's cost; which pass the
-    // desktop shows).
-    static LiveSwitch noSecond("REGPU_VR_NO_SECOND_EYE");
-    if (noSecond)
-    {
-        RendererSetStereoEye(0);
-        return;
-    }
-    g_endFile = work::g_file;
     memcpy(work::g_file.data(), g_startFile.data(), g_startFile.size());
     for (int t = 0; t < 2; t++)
         if (!g_startShader[t].empty())
             FrameOnShaderLoad(ShaderType(t), g_startShader[t].data(), uint32_t(g_startShader[t].size()), g_startShaderAddress[t]);
-    RendererSetStereoEye(EyeClip(1 - g_firstEye));
     RendererSetStereoReplay(true);
     bool inQuery = false;
     for (size_t i = 0; i < g_log.size();)
@@ -777,12 +786,66 @@ void AtSwap(uint32_t frontBuffer)
         case work::kQuery:
             inQuery = a[0] == 0;
             break;
-        default: // fences, ordered stores: the guest saw them once
+        default:
             break;
         }
         i += size_t(words) + 1;
     }
     RendererSetStereoReplay(false);
+}
+
+// Triple screen at the swap: the centre (the game's pass) captured, then the left and right screens drawn again turned.
+void TripleAtSwap(uint32_t frontBuffer)
+{
+    RendererTripleCapture(1, frontBuffer);
+    g_endFile = work::g_file;
+    // REGPU_TRIPLE_CENTRE_ONLY=1 (live): the side screens not drawn (their cost; the centre alone, black sides).
+    static LiveSwitch centreOnly("REGPU_TRIPLE_CENTRE_ONLY");
+    if (!centreOnly)
+        for (int side : { 0, 2 })
+        {
+            RendererSetTripleView(side == 0 ? -g_tripleTurn : g_tripleTurn, g_tripleK, g_tripleP00, true);
+            Replay();
+            RendererTripleCapture(side, frontBuffer);
+        }
+    RendererSetTripleView(0, 0, 0, false);
+    memcpy(work::g_file.data(), g_endFile.data(), g_endFile.size());
+    g_frames++;
+    g_words += g_log.size();
+    if (g_frames == 1 || g_frames % 3600 == 0)
+        Log("triple: frame %llu: %zu KB of records drawn again for each side screen (k %.3f, turn %.1f deg)", (unsigned long long)g_frames,
+            g_log.size() * 4 / 1024, g_tripleK, g_tripleTurn * 57.2958f);
+}
+
+// At the swap, before the frame is presented: the second eye.
+void AtSwap(uint32_t frontBuffer)
+{
+    const bool armed = g_armed;
+    g_armed = false;
+    g_checked = false;
+    if (!armed)
+    {
+        RendererSetStereoEye(0);
+        RendererSetTripleView(0, 0, 0, false);
+        return;
+    }
+    if (TripleMode())
+    {
+        TripleAtSwap(frontBuffer);
+        return;
+    }
+    RendererStereoCaptureEye(g_firstEye, frontBuffer);
+    // REGPU_VR_NO_SECOND_EYE=1 (live): the records are kept but not drawn again (the second eye's cost; which pass the
+    // desktop shows).
+    static LiveSwitch noSecond("REGPU_VR_NO_SECOND_EYE");
+    if (noSecond)
+    {
+        RendererSetStereoEye(0);
+        return;
+    }
+    g_endFile = work::g_file;
+    RendererSetStereoEye(EyeClip(1 - g_firstEye));
+    Replay();
     RendererSetStereoEye(0);
     memcpy(work::g_file.data(), g_endFile.data(), g_endFile.size()); // (the same values: the records ran in full)
     RendererStereoCaptureEye(1 - g_firstEye, frontBuffer);
@@ -2123,6 +2186,14 @@ void PaceSwap(uint64_t frame)
 
 // (For the presenter's pacing, render/presenter.cpp.)
 uint32_t RegpuFrameCap() { return FrameCap(); }
+
+void regpu::triple::SubmitFrame(float gameFovY, float screenFovY, float angle)
+{
+    stereo::g_tripleGameFov = gameFovY;
+    stereo::g_tripleScreenFov = screenFovY;
+    stereo::g_tripleAngleIn = angle;
+    stereo::g_tripleAt = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+}
 
 void regpu::SetFrameLimit(uint32_t maxFps, bool vsync)
 {
