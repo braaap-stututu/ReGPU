@@ -129,6 +129,22 @@ void RaiseInterrupt(uint32_t source, uint32_t cpu)
     g_gpu.interruptCv.notify_one();
 }
 
+// REGPU_VBLANK_ON_WAIT=1 (live): a memory-polling WAIT_REG_MEM that doesn't hold after a few microseconds wakes the
+// vblank thread, which raises the next vblank at once instead of at its tick. A title that presents on vblank
+// boundaries (the swap waits for a flag its vblank handler clears: PGR3 port, session 4, twice a frame at
+// presentation interval 2, ~140 us each at 4000 Hz) then waits only for the interrupt's round trip. For uncapped
+// play (the title must keep time by its clock, not by vblanks: the extra vblanks run it no faster); off by default.
+bool VblankOnWait()
+{
+    static LiveSwitch on("REGPU_VBLANK_ON_WAIT");
+    return on;
+}
+HANDLE VblankKickEvent()
+{
+    static const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    return event;
+}
+
 // ---- Draw worker ---------------------------------------------------------------------
 // The command processor (this file's CommandProcessorLoop) parses the command stream and
 // keeps the guest's view (registers, read pointer, waits) current; draws are translated on
@@ -1527,12 +1543,21 @@ uint32_t ExecutePacket(uint32_t ptr)
         // spin, then yield, then sleep.
         const auto start = Clock::now();
         static const int spinMs = getenv("REGPU_CP_SPIN_MS") ? atoi(getenv("REGPU_CP_SPIN_MS")) : 100;
+        auto lastKick = start - std::chrono::seconds(1);
         for (int tries = 0;; tries++)
         {
             const uint32_t value = (info & 0x10) ? ReadBack(arg(1)) : Reg(arg(1));
             if (WaitCompare(info & 7, value & arg(3), arg(2)))
                 break;
             const auto waited = Clock::now() - start;
+            // (REGPU_VBLANK_ON_WAIT: after ~5 us, and again every 50 us while it still waits: a swap at interval 2
+            // needs two vblanks.)
+            if ((info & 0x10) && waited > std::chrono::microseconds(5) && Clock::now() - lastKick > std::chrono::microseconds(50) &&
+                VblankOnWait())
+            {
+                lastKick = Clock::now();
+                SetEvent(VblankKickEvent());
+            }
             if (waited > std::chrono::seconds(2))
             {
                 LOG_ONCE("gpu: WAIT_REG_MEM on %08X never satisfied; continuing", arg(1));
@@ -2073,7 +2098,23 @@ void VblankLoop()
         const int64_t hostUs = g_vblankUs.load(std::memory_order_relaxed);
         next += std::chrono::microseconds(hostUs ? hostUs : defaultUs);
         static LiveSwitch coarse("REGPU_COARSE_SLEEP"); // A/B: the old 1 ms sleeps
-        if (coarse)
+        if (VblankOnWait())
+        {
+            // The tick or a kick from the command processor (VblankOnWait), whichever comes first; after a kick the
+            // next tick is a full period away. (No spinning: the kicks set the pace when it matters.)
+            thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            const auto left = std::chrono::duration_cast<std::chrono::microseconds>(next - Clock::now()).count();
+            if (left > 0)
+            {
+                LARGE_INTEGER due;
+                due.QuadPart = -int64_t(left) * 10;
+                SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0);
+                const HANDLE handles[2] = { timer, VblankKickEvent() };
+                if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0 + 1)
+                    next = Clock::now();
+            }
+        }
+        else if (coarse)
             std::this_thread::sleep_until(next);
         else
             PreciseSleepUntil(next, 200);
