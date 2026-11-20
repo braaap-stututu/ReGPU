@@ -23,6 +23,10 @@ struct Config
     uint32_t maxFps = 60;                // frame cap
     bool enhance = false;                // enhanced lighting post pass (experimental)
     uint32_t msaa = 1;                   // samples per pixel: 1 (off), 2, 4 or 8
+    // The backend that draws: Direct3D 12 (the default), or Vulkan (experimental, the FM2 port's renderer, in builds
+    // with REGPU_VULKAN; otherwise Direct3D 12 anyway). REGPU_RENDERER=vulkan or d3d12 overrides it.
+    enum class Renderer : uint32_t { D3D12, Vulkan };
+    Renderer renderer = Renderer::D3D12;
     // Upscaling: the 3D scene renders smaller and is upscaled before post-processing and the
     // HUD, which stay at full resolution. Fsr3, Fsr4 and Dlss need REGPU_FSR3 / REGPU_DLSS builds. The temporal ones
     // (Fsr3, Fsr4, Dlss) run only on frames with a 3D scene of their own, and need MSAA off: with one chosen the scene

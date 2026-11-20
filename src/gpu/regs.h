@@ -14,6 +14,8 @@ constexpr uint32_t AluConstants = 0x4000;
 constexpr uint32_t FetchConstants = 0x4800;
 constexpr uint32_t BoolConstants = 0x4900;
 constexpr uint32_t LoopConstants = 0x4908;
+// Draw registers the shared index expansion reads (gpu/indices.cpp).
+constexpr uint32_t VGT_INDX_OFFSET = 0x2102, VGT_MULTI_PRIM_IB_RESET_INDX = 0x2103, PA_SU_SC_MODE_CNTL = 0x2205;
 
 // The live register file, big-endian. XenonRecomp ports have no MMIO, so the guest reads and
 // writes it as plain memory at kBase. Under ReXGlue that range is MMIO (regpu::driver::Read/

@@ -46,7 +46,7 @@ bool MakeRing(const Context& context, DrawRing& ring, VkDeviceSize size, VkBuffe
 VkDeviceSize Align(VkDeviceSize value, VkDeviceSize alignment) { return (value + alignment - 1) & ~(alignment - 1); }
 }
 
-bool DrawInit(Context& context, DrawContext& draw, VkBuffer gphys, VkSampler samplers[4], VkDescriptorSet bindless2D,
+bool DrawInit(Context& context, DrawContext& draw, VkBuffer gphys, VkSampler samplers[8], VkDescriptorSet bindless2D,
     VkDescriptorSet bindlessCube, VkDeviceSize constantsBytes, VkDeviceSize listBytes)
 {
     if (!MakeRing(context, draw.constants, constantsBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
@@ -63,7 +63,7 @@ bool DrawInit(Context& context, DrawContext& draw, VkBuffer gphys, VkSampler sam
     VkDescriptorPoolSize sizes[3] = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 },
-        { VK_DESCRIPTOR_TYPE_SAMPLER, 8 },
+        { VK_DESCRIPTOR_TYPE_SAMPLER, 16 },
     };
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     poolInfo.maxSets = 2;
@@ -87,12 +87,12 @@ bool DrawInit(Context& context, DrawContext& draw, VkBuffer gphys, VkSampler sam
 
     VkDescriptorBufferInfo guestMemory{ draw.guestMemory.buffer, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo guestPhysical{ gphys, 0, VK_WHOLE_SIZE };
-    VkDescriptorImageInfo samplerInfo[4]{};
-    for (int i = 0; i < 4; i++)
+    VkDescriptorImageInfo samplerInfo[8]{};
+    for (int i = 0; i < 8; i++)
         samplerInfo[i] = { samplers[i], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
 
-    VkWriteDescriptorSet writes[8]{};
-    for (int i = 0; i < 8; i++)
+    VkWriteDescriptorSet writes[12]{};
+    for (int i = 0; i < 12; i++)
     {
         writes[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
         writes[i].dstSet = draw.set0;
@@ -110,12 +110,12 @@ bool DrawInit(Context& context, DrawContext& draw, VkBuffer gphys, VkSampler sam
         else
             writes[i].pImageInfo = &samplerInfo[i - 4];
     }
-    vkUpdateDescriptorSets(context.device, 8, writes, 0, nullptr);
+    vkUpdateDescriptorSets(context.device, 12, writes, 0, nullptr);
     // The local set is the same chain with gphys aliasing the upload ring.
     for (VkWriteDescriptorSet& write : writes)
         write.dstSet = draw.set0Local;
     writes[3].pBufferInfo = &guestMemory;
-    vkUpdateDescriptorSets(context.device, 8, writes, 0, nullptr);
+    vkUpdateDescriptorSets(context.device, 12, writes, 0, nullptr);
     return true;
 }
 
@@ -184,7 +184,7 @@ bool DrawList(const Context& context, DrawContext& draw, VkCommandBuffer cmd, Vk
     gpu::VSConstants& vs, const gpu::PSConstants& ps, const uint32_t* list, uint32_t count, const VkRect2D& scissor,
     const std::vector<uint32_t>* fetchConstants, const ConstantUse* use)
 {
-    static const bool profile = getenv("FM2_PERF") != nullptr;
+    static const bool profile = getenv("REGPU_PERF") != nullptr;
     auto before = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto mark = [&](double& sink) {
         if (!profile)
@@ -215,10 +215,10 @@ bool DrawList(const Context& context, DrawContext& draw, VkCommandBuffer cmd, Vk
     // records a whole frame and submits at swap, so a buffer the guest rewrites after the draw is
     // recorded would otherwise be read at its new contents. The 1-1.4 MiB car body buffer also
     // needs a snapshot: reading it late gives stable positions with stale normals and extreme lighting.
-    // FM2_VK_DIRECT_FETCH_KB: at or above this size a vertex buffer is read in place from guest memory
+    // REGPU_VK_DIRECT_FETCH_KB: at or above this size a vertex buffer is read in place from guest memory
     // instead of being copied, apart from that car-buffer range. Set it very high to copy everything.
-    static const uint32_t directFetchBytes = getenv("FM2_VK_DIRECT_FETCH_KB")
-        ? uint32_t(atoi(getenv("FM2_VK_DIRECT_FETCH_KB"))) * 1024u
+    static const uint32_t directFetchBytes = getenv("REGPU_VK_DIRECT_FETCH_KB")
+        ? uint32_t(atoi(getenv("REGPU_VK_DIRECT_FETCH_KB"))) * 1024u
         : 16u * 1024u;
     // Without an imported guest window an in-place read would resolve against the upload ring and return zeros,
     // so everything is copied: the test at the copy site skips buffers of kDirectFetchBytes or more, hence a
@@ -305,11 +305,10 @@ bool DrawList(const Context& context, DrawContext& draw, VkCommandBuffer cmd, Vk
             if (k < 96)
                 memcpy(rv + offsetof(VSConstants, vf) + k * sizeof(vs.vf[0]), vs.vf[k], sizeof(vs.vf[0]));
         put(rv, &vs, offsetof(VSConstants, info), offsetof(VSConstants, vfl) + layouts * sizeof(vs.vfl[0]));
-        put(rv, &vs, offsetof(VSConstants, vsquash), sizeof(VSConstants));
+        put(rv, &vs, offsetof(VSConstants, vuser), sizeof(VSConstants));
         put(rp, &ps, 0, std::min<size_t>(use->psFloats, 256) * sizeof(ps.c[0]));
         put(rp, &ps, offsetof(PSConstants, b), offsetof(PSConstants, tinfo) + slots * sizeof(ps.tinfo[0]));
         put(rp, &ps, offsetof(PSConstants, tbias), offsetof(PSConstants, tbias) + slots * sizeof(ps.tbias[0]));
-        put(rp, &ps, offsetof(PSConstants, forceLod), sizeof(PSConstants));
     }
     else
     {
@@ -336,8 +335,10 @@ bool DrawList(const Context& context, DrawContext& draw, VkCommandBuffer cmd, Vk
     const uint32_t offsets[2] = { uint32_t(vsOffset), uint32_t(psOffset) };
     const VkDescriptorSet cube = draw.bindlessCube ? draw.bindlessCube : textures;
     const VkDescriptorSet base = RingFetchOnly(vs, fetchConstants) ? draw.set0Local : draw.set0;
-    const VkDescriptorSet sets[3] = { base, textures, cube };
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.layout, 0, 3, sets, 2, offsets);
+    // Set 3 (3D textures): the 2D set stands in; the shader reads it only for a 3D fetch, which this backend never
+    // sets up (tinfo.w is 1 or 3).
+    const VkDescriptorSet sets[4] = { base, textures, cube, textures };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.layout, 0, 4, sets, 2, offsets);
     mark(draw.perfBindMs);
     g_cmdDrawCount++;
     vkCmdDraw(cmd, count, 1, 0, 0);
@@ -386,8 +387,8 @@ bool DrawIndexed(const Context& context, DrawContext& draw, VkCommandBuffer cmd,
     }
     const uint32_t offsets[2] = { uint32_t(vsOffset), uint32_t(psOffset) };
     // Set 2 is the cube array; a draw that has none still binds the 2D set there.
-    VkDescriptorSet sets[3] = { draw.set0, textures, draw.bindlessCube ? draw.bindlessCube : textures };
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.layout, 0, 3, sets, 2, offsets);
+    VkDescriptorSet sets[4] = { draw.set0, textures, draw.bindlessCube ? draw.bindlessCube : textures, textures };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.layout, 0, 4, sets, 2, offsets);
     if (indexed)
     {
         vkCmdBindIndexBuffer(cmd, draw.indices.buffer, indexOffset, VK_INDEX_TYPE_UINT32);

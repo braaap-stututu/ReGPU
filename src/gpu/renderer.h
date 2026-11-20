@@ -113,3 +113,23 @@ void RendererSetTile(const RendererTile& tile);
 // Runs translate(i), i in [0, n), on the draw workers (and this thread), each into its own
 // command list, and executes them in order after everything recorded so far.
 void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translate);
+
+// For the Vulkan backend (gpu/vk), which shares the overlay, the display gamma and the compile counters.
+// The overlay's text as RGBA8 pixels (false when nothing is shown), and drawn into a CPU frame's top-left corner.
+bool RendererOverlayPixels(const uint8_t*& rgba, uint32_t& width, uint32_t& height, uint32_t& visibleHeight, uint64_t& version);
+void RendererOverlayImage(uint32_t width, uint32_t height, std::vector<uint8_t>& rgba);
+// The display gamma ramp as 17 points; false when the title set none (or the identity).
+bool RendererDisplayGamma(float points[17]);
+struct RendererCompileReport
+{
+    uint32_t shadersBuilt = 0, shadersCached = 0, pipelinesBuilt = 0, pipelinesCached = 0;
+    uint32_t running = 0;
+    const char* what = nullptr;
+    bool waited = false;
+    uint32_t warmDone = 0, warmTotal = 0, staticDone = 0, staticTotal = 0;
+};
+void RendererReportCompiles(const RendererCompileReport& report);
+// The anisotropic filtering regpu::SetAnisotropy asked for (0: none or the fetch's own).
+uint32_t RendererAnisotropy();
+// A debug capture finished (FM2's debug server waited on it; ReGPU's reads the log): nothing to do.
+inline void RendererMarkCaptureComplete() {}

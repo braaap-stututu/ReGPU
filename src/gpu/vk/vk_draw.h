@@ -47,7 +47,7 @@ struct DrawContext
     VkDescriptorBufferInfo constantsInfo{};     // both dynamic offsets point into this buffer
     // Guest vertex buffers already copied into the ring this frame: (base << 32 | size) -> ring offset.
     std::unordered_map<uint64_t, uint64_t> vertexUploads;
-    // FM2_PERF: where a DrawList call spends its time, summed over the frame.
+    // REGPU_PERF: where a DrawList call spends its time, summed over the frame.
     double perfPreFetchMs = 0, perfFetchLoopMs = 0, perfVertexMs = 0, perfConstantsMs = 0, perfBindMs = 0, perfCallMs = 0;
     uint64_t constantOverflows = 0, guestOverflows = 0;
     VkPipeline pipeline = VK_NULL_HANDLE;
@@ -60,7 +60,7 @@ struct DrawContext
 
 // constantsBytes should hold a frame's per-draw blocks (6352 and 5184 bytes);
 // listBytes a frame's expanded lists and snapshotted vertex data.
-bool DrawInit(Context& context, DrawContext& draw, VkBuffer gphys, VkSampler samplers[4], VkDescriptorSet bindless2D,
+bool DrawInit(Context& context, DrawContext& draw, VkBuffer gphys, VkSampler samplers[8], VkDescriptorSet bindless2D,
     VkDescriptorSet bindlessCube, VkDeviceSize constantsBytes, VkDeviceSize listBytes);
 void DrawDestroy(Context& context, DrawContext& draw);
 

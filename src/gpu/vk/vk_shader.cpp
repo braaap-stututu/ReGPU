@@ -28,9 +28,9 @@ std::string TempPath(const char* ext)
     char dir[512] = {};
 #if defined(_WIN32)
     const char* tmp = getenv("TEMP");
-    snprintf(dir, sizeof dir, "%s\\fm2vkXXXXXX", tmp ? tmp : ".");
+    snprintf(dir, sizeof dir, "%s\\regpuvkXXXXXX", tmp ? tmp : ".");
 #else
-    snprintf(dir, sizeof dir, "/tmp/fm2vkXXXXXX");
+    snprintf(dir, sizeof dir, "/tmp/regpuvkXXXXXX");
     if (int fd = mkstemp(dir); fd >= 0)
         close(fd);
 #endif
@@ -61,7 +61,7 @@ bool CompileDxcInProcess(const std::string& hlsl, bool pixel, bool disableOptimi
             library = LoadLibraryW(L"dxcompiler.dll");
         return library ? reinterpret_cast<CreateInstance>(GetProcAddress(library, "DxcCreateInstance")) : nullptr;
     }();
-    if (!create || getenv("FM2_VK_DXC_PROCESS"))
+    if (!create || getenv("REGPU_VK_DXC_PROCESS"))
     {
         unavailable = true;
         return false;
@@ -78,8 +78,8 @@ bool CompileDxcInProcess(const std::string& hlsl, bool pixel, bool disableOptimi
         L"-fvk-b-shift", L"0", L"0", L"-fvk-t-shift", L"100", L"0", L"-fvk-s-shift", L"200", L"0", L"-fvk-u-shift", L"300", L"0",
     };
     if (!pixel)
-        arguments.insert(arguments.end(), { L"-D", L"FM2_VERTEX_STAGE" });
-    if (disableOptimizations || getenv("FM2_VK_SHADER_OD"))
+        arguments.insert(arguments.end(), { L"-D", L"REGPU_VERTEX_STAGE" });
+    if (disableOptimizations || getenv("REGPU_VK_SHADER_OD"))
         arguments.push_back(L"-Od");
     DxcBuffer source{ hlsl.data(), hlsl.size(), CP_UTF8 };
     IDxcResult* result = nullptr;
@@ -186,8 +186,8 @@ bool CompileHlsl(const std::string& hlsl, bool pixel, uint64_t key, const std::f
             return false;
         f.write(hlsl.data(), std::streamsize(hlsl.size()));
     }
-    const char* dxc = getenv("FM2_DXC");
-    // FM2_DXC is often set to a Unix path (the build passes /home/.../dxc). The Windows-side shell cannot execute
+    const char* dxc = getenv("REGPU_DXC");
+    // REGPU_DXC is often set to a Unix path (the build passes /home/.../dxc). The Windows-side shell cannot execute
     // that, the compile fails and nothing draws, so on Windows a Unix value is ignored with a warning and the bundled
     // dxc or the one on PATH is used. The native Linux test binaries execute a Unix path directly.
 #if defined(_WIN32)
@@ -197,7 +197,7 @@ bool CompileHlsl(const std::string& hlsl, bool pixel, uint64_t key, const std::f
         if (!warned)
         {
             warned = true;
-            fprintf(stderr, "vk: FM2_DXC=%s is a Unix path and cannot be executed from here; using bundled dxc or PATH\n", dxc);
+            fprintf(stderr, "vk: REGPU_DXC=%s is a Unix path and cannot be executed from here; using bundled dxc or PATH\n", dxc);
         }
         dxc = nullptr;
     }
@@ -227,15 +227,15 @@ bool CompileHlsl(const std::string& hlsl, bool pixel, uint64_t key, const std::f
     // Sized for the worst case (the flags plus two TEMP paths), and truncation is detected rather than silently
     // handing the shell a command cut mid-flag.
     char command[4096];
-    // FM2_VK_SHADER_OD turns the optimiser off. A translated pixel shader is a state machine
+    // REGPU_VK_SHADER_OD turns the optimiser off. A translated pixel shader is a state machine
     // in a [loop] with a guard, and dxc's optimiser is the last thing between it and the same
     // result the Direct3D 12 compiler gives; this is how to tell a miscompile from a translation.
-    const char* optimise = getenv("FM2_VK_SHADER_OD") || disableOptimizations ? " -Od" : "";
+    const char* optimise = getenv("REGPU_VK_SHADER_OD") || disableOptimizations ? " -Od" : "";
     const int written = snprintf(command, sizeof command,
         "%s -HV 2018 -T %s -E main -spirv -fvk-use-dx-layout -fspv-target-env=vulkan1.2%s%s"
         " -fvk-b-shift 0 0 -fvk-t-shift 100 0 -fvk-s-shift 200 0 -fvk-u-shift 300 0"
         " -Fo \"%s\" \"%s\" 2>&1",
-        dxcCommand.c_str(), pixel ? "ps_6_0" : "vs_6_0", pixel ? "" : " -D FM2_VERTEX_STAGE", optimise, spvPath.c_str(),
+        dxcCommand.c_str(), pixel ? "ps_6_0" : "vs_6_0", pixel ? "" : " -D REGPU_VERTEX_STAGE", optimise, spvPath.c_str(),
         hlslPath.c_str());
     if (written < 0 || size_t(written) >= sizeof command)
     {

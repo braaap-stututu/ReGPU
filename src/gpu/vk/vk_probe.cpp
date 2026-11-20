@@ -1,4 +1,4 @@
-// FM2_VULKAN_PROBE=1: open the Vulkan device the native renderer would use and say what it is,
+// REGPU_VULKAN_PROBE=1: open the Vulkan device the native renderer would use and say what it is,
 // then exit. The way to tell whether a machine (or a Wine prefix) can run the backend at all,
 // before any of the renderer is wired up.
 #include <cstdio>

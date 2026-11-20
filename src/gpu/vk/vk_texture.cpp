@@ -68,7 +68,7 @@ namespace
 // Bindless slot writes are collected and applied in ONE vkUpdateDescriptorSets before the next queue submission
 // (g_beforeSubmit): a call per new texture cost about 1.5 ms each on the NVIDIA driver against the 65536-entry
 // update-after-bind set (23 first-use textures: 35 ms of one frame; 4.7 ms for the same frame on RADV).
-// FM2_VK_IMMEDIATE_SLOT_WRITES=1 writes each slot at once instead.
+// REGPU_VK_IMMEDIATE_SLOT_WRITES=1 writes each slot at once instead.
 struct PendingSlotWrite
 {
     VkDevice device;
@@ -114,7 +114,7 @@ void FlushSlotWrites(const Context& context)
 
 bool WriteSlot(Context& context, TextureCache& cache, uint32_t index, const Image& image)
 {
-    static const bool immediate = getenv("FM2_VK_IMMEDIATE_SLOT_WRITES") != nullptr;
+    static const bool immediate = getenv("REGPU_VK_IMMEDIATE_SLOT_WRITES") != nullptr;
     if (!immediate)
     {
         g_beforeSubmit = FlushSlotWrites;
@@ -242,7 +242,7 @@ void UploadBlocks(Context& context, const Image& image, uint32_t width, uint32_t
         b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     });
-    static const bool trace = getenv("FM2_VK_TRACE_BC") != nullptr;
+    static const bool trace = getenv("REGPU_VK_TRACE_BC") != nullptr;
     if (trace)
     {
         fprintf(stderr, "vk: BC upload %ux%u level %u, submit %d\n", levelWidth, levelHeight, level, int(uploadOk));

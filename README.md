@@ -37,6 +37,9 @@ add_subdirectory(thirdparty/ReGPU)
 target_link_libraries(game PRIVATE regpu)
 ```
 
+An experimental Vulkan backend builds with `REGPU_VULKAN=ON` and runs with `Config::renderer` or
+`REGPU_RENDERER=vulkan`: see [`docs/vulkan.md`](docs/vulkan.md).
+
 Options: `REGPU_FSR3` (with the FidelityFX signed DLLs), `REGPU_DLSS` and `REGPU_DLSS_DIR`.
 
 `REGPU_FSR1_CS` takes a pre-built `fsr1_cs.h` (the header `tools/embed_hlsl.py` writes into the build's

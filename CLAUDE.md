@@ -97,5 +97,6 @@ Same scene, same settings, both sides: if the console shows it too, it isn't a R
 | `src/gpu/texture.cpp` | Texture formats, tiling, decoding |
 | `src/gpu/frame.cpp`, `shader_scan.cpp` | Shader uploads, finding shaders in memory ahead of use |
 | `src/render/presenter.cpp` | Window, swap chain, frame pacing |
+| `src/gpu/vk/` | The Vulkan backend (experimental, `REGPU_VULKAN`): see [`docs/vulkan.md`](docs/vulkan.md) |
 | `src/debug.cpp` | The debug server (`tools/regpuctl.py`) |
 | `tools/` | regpuctl, XBDM tools, shader disassembler (`xenos_dis.cpp`), frame comparison |

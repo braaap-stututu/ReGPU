@@ -655,10 +655,14 @@ uint32_t TextureBCKind(uint32_t format)
 
 bool CopyTextureBlocks(const TextureFetch& fetch, uint8_t* dst, uint32_t dstRowPitch)
 {
+    return CopyTextureBlocks(fetch, GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address())), dst, dstRowPitch);
+}
+
+bool CopyTextureBlocks(const TextureFetch& fetch, const uint8_t* source, uint8_t* dst, uint32_t dstRowPitch)
+{
     FormatInfo info;
     if (fetch.Type() != 2 || !TextureBCKind(fetch.Format()) || !Info(fetch.Format(), info))
         return false;
-    const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
     const uint32_t bs = info.blockSize;
     const uint32_t blocksX = (fetch.Width() + bs - 1) / bs, blocksY = (fetch.Height() + bs - 1) / bs;
     const uint32_t blockBytes = 1u << info.log2Bytes;

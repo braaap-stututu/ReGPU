@@ -17,6 +17,11 @@ uint32_t DisplayRefreshHz();
 void PresenterSubmitFrame(uint64_t frame);
 // Shows a CPU-side RGBA8 image (scaled 1:1 into the 1280x720 back buffer).
 void PresenterSubmitImage(uint32_t width, uint32_t height, std::vector<uint8_t> rgba);
+// The Vulkan backend (gpu/vk): an image of any size, returning the previous one's storage; its own window and frames.
+std::vector<uint8_t> PresenterExchangeImage(uint32_t width, uint32_t height, std::vector<uint8_t> rgba);
+void* PresenterClaimWindow();
+void PresenterReleaseWindow();
+void PresenterCountFrame();
 // Keyboard input goes to the game only while the window has focus.
 bool PresenterHasFocus();
 

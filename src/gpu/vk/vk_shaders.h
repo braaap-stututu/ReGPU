@@ -36,6 +36,10 @@ struct ShaderSet
 
 void ShaderSetDestroy(Context& context, ShaderSet& set);
 
+// The translator's HLSL as the Vulkan pipeline layout binds it: the bindless arrays sized, and ReGPU's eight samplers
+// (s0-s7) as one array binding (gSamplers[8]).
+std::string AdaptHlsl(const std::string& hlsl);
+
 // Returns the shader for `hash`, translating and compiling it if this is the first time.
 // The microcode must be the bytes the hash was taken over (Fnv over the used dwords, xor the
 // shader type) — the renderer's cache key.
@@ -43,8 +47,8 @@ const VkShader* ShaderGet(Context& context, ShaderSet& set, uint64_t hash, const
     bool pixel);
 
 // Starts the background warm-up: low-priority threads that translate and compile the game's shaders into set.cacheDir
-// ahead of their first use (see vk_shaders.cpp). ShaderGet stays synchronous. FM2_VK_NO_SHADER_WARM=1 turns it off,
-// FM2_VK_SHADER_WARM_THREADS sets the thread count. Call once, after cacheDir is set.
+// ahead of their first use (see vk_shaders.cpp). ShaderGet stays synchronous. REGPU_VK_NO_SHADER_WARM=1 turns it off,
+// REGPU_VK_SHADER_WARM_THREADS sets the thread count. Call once, after cacheDir is set.
 void ShaderWarmStart(const ShaderSet& set);
 // The static set's progress, for the first-boot screen: true while it is still being listed or compiled. `compiled`
 // counts shaders that really went through the compiler (zero on a boot whose cache is complete).

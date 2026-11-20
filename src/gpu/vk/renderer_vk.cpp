@@ -1,6 +1,6 @@
 // The native renderer's entry points, Vulkan side: the same seam the Direct3D 12 renderer
 // implements (gpu/renderer.h), so the command processor, the lookahead and the presenter do
-// not know which backend is running. The saved renderer setting selects it; FM2_RENDERER overrides it for tests.
+// not know which backend is running. The saved renderer setting selects it; REGPU_RENDERER overrides it for tests.
 //
 // The backend owns Vulkan device initialization, guest shader conversion, draw submission,
 // EDRAM surfaces and resolves. The existing D3D12 presenter displays the resulting frames.
@@ -19,7 +19,6 @@
 #include <vector>
 #include <mutex>
 
-#include "gpu/boot_screen.h"
 #include "gpu/constants.h"
 #include "gpu/indices.h"
 #include "gpu/texture.h"
@@ -101,7 +100,7 @@ struct State
     std::unordered_map<uint32_t, ResolvedTexture> resolved;
     std::vector<uint32_t> retiredTextures;
     std::unordered_map<uint32_t, ResolvedTexture> presentable;
-    VkSampler samplers[4]{};
+    VkSampler samplers[8]{}; // hlsl.cpp's s0-s7 (vk_shaders.cpp: gSamplers[8])
     VkBuffer gphys = VK_NULL_HANDLE;
     std::unordered_map<vk::StateKey, VkPipeline, StateKeyHash> pipelines;
     // Pipeline builds, for the compile pop-up and the periodic cache save: built by the driver, or quick enough to
@@ -166,9 +165,9 @@ struct State
     bool frameGpuStarted = false;
 
     // Upload DXT textures as block-compressed images and let the GPU sample them, like D3D12.
-    // FM2_VK_NO_BC=1 selects the CPU decoder fallback.
+    // REGPU_VK_NO_BC=1 selects the CPU decoder fallback.
     bool bcUploads = false;
-    // FM2_PERF: where the frame time goes (see the perf_vk report in RendererVkOnSwap).
+    // REGPU_PERF: where the frame time goes (see the perf_vk report in RendererVkOnSwap).
     bool perf = false;
     double perfDrawsMs = 0, perfSubmitMs = 0, perfPresentMs = 0;
     double perfEndMs = 0, perfQueueMs = 0, perfWaitMs = 0;
@@ -211,9 +210,9 @@ std::mutex g_asyncMutex;
 bool UseAsyncPresent()
 {
     // On by default: the synchronous path ends every frame with vkQueueWaitIdle; this replaces it with a wait on the
-    // previous frame's fence. FM2_VK_SYNC_PRESENT=1 selects the synchronous path. Headless keeps it off: there is no
+    // previous frame's fence. REGPU_VK_SYNC_PRESENT=1 selects the synchronous path. Headless keeps it off: there is no
     // present to overlap there.
-    static const bool enabled = !getenv("FM2_VK_SYNC_PRESENT") && !getenv("FM2_HEADLESS");
+    static const bool enabled = !getenv("REGPU_VK_SYNC_PRESENT") && !getenv("REGPU_HEADLESS");
     return enabled;
 }
 
@@ -281,7 +280,7 @@ const GpuTimingApi& TimingApi()
     return api;
 }
 
-// FM2_VK_PHASE_GPU_TIMES (with FM2_VK_FRAME_GPU_TIMES): GPU time of an undisturbed frame, split at its resolves.
+// REGPU_VK_PHASE_GPU_TIMES (with REGPU_VK_FRAME_GPU_TIMES): GPU time of an undisturbed frame, split at its resolves.
 // The marks only add timestamps where the pass is already closed.
 struct PhaseMark
 {
@@ -292,7 +291,7 @@ struct PhaseMark
     uint32_t vertices = 0;
 };
 constexpr uint32_t kPhaseMarks = 4096;
-bool g_phasePerDraw = false; // FM2_VK_PHASE_GPU_TIMES=2: also a mark after every draw, inside the open pass
+bool g_phasePerDraw = false; // REGPU_VK_PHASE_GPU_TIMES=2: also a mark after every draw, inside the open pass
 VkQueryPool g_phasePool = VK_NULL_HANDLE;
 std::vector<PhaseMark> g_phaseMarks[2];
 uint32_t g_phaseSlot = 0;
@@ -311,10 +310,10 @@ void PhaseMarkWrite(uint8_t kind, uint32_t base = 0, uint32_t width = 0, uint32_
 
 void PhaseBegin()
 {
-    static const bool enabled = getenv("FM2_VK_PHASE_GPU_TIMES") != nullptr;
+    static const bool enabled = getenv("REGPU_VK_PHASE_GPU_TIMES") != nullptr;
     if (!enabled)
         return;
-    g_phasePerDraw = atoi(getenv("FM2_VK_PHASE_GPU_TIMES")) == 2;
+    g_phasePerDraw = atoi(getenv("REGPU_VK_PHASE_GPU_TIMES")) == 2;
     const GpuTimingApi& api = TimingApi();
     if (!g_phasePool)
     {
@@ -400,7 +399,7 @@ void PhaseEnd(uint32_t slot)
 
 void FrameGpuTimesBegin()
 {
-    static const bool enabled = getenv("FM2_VK_FRAME_GPU_TIMES") != nullptr;
+    static const bool enabled = getenv("REGPU_VK_FRAME_GPU_TIMES") != nullptr;
     if (!enabled || g.frameGpuStarted)
         return;
     const GpuTimingApi& api = TimingApi();
@@ -476,11 +475,11 @@ constexpr uint32_t kWidth = 1280, kHeight = 720;
 // 3D content was landing in a band at the top.
 uint32_t g_tallInfo = ~0u, g_tallHeight = 0;
 
-// FM2_VK_TRACE_BINDS: one line per distinct (ps, slot, address) with its size. Called from both bind paths - the
+// REGPU_VK_TRACE_BINDS: one line per distinct (ps, slot, address) with its size. Called from both bind paths - the
 // memo-served one is the majority of a frame.
 static void TraceBind(uint32_t slot, const TextureFetch& fetch, uint64_t psHash)
 {
-    static const bool traceBinds = getenv("FM2_VK_TRACE_BINDS") != nullptr;
+    static const bool traceBinds = getenv("REGPU_VK_TRACE_BINDS") != nullptr;
     if (!traceBinds)
         return;
     static uint32_t seen[256] = {};
@@ -666,7 +665,7 @@ struct DisplayGamma
 
 const DisplayGamma* DisplayGammaCurve()
 {
-    static LiveSwitch off("FM2_NO_GAMMA");
+    static LiveSwitch off("REGPU_NO_GAMMA");
     static DisplayGamma curve;
     static std::array<float, 17> cached{};
     static bool active = false;
@@ -1121,7 +1120,7 @@ const State::ResolvedTexture* ResolvedFor(const TextureFetch& fetch)
     if (it == g.resolved.end() || !it->second.valid)
         return nullptr;
     State::ResolvedTexture& texture = it->second;
-    static LiveSwitch noStaleCheck("FM2_VK_NO_STALE_RESOLVES");
+    static LiveSwitch noStaleCheck("REGPU_VK_NO_STALE_RESOLVES");
     if (!noStaleCheck && texture.frame != ~0ull && texture.frame + 8 < g.frame)
     {
         if (!texture.stale && g.frame - texture.memChecked >= 32)
@@ -1155,7 +1154,7 @@ uint32_t UploadBcTexture(const TextureFetch& base, const uint8_t* source, uint32
             break;
         levels.push_back(next);
     }
-    static const bool trace = getenv("FM2_VK_TRACE_BC") != nullptr;
+    static const bool trace = getenv("REGPU_VK_TRACE_BC") != nullptr;
     if (trace)
         Log("bc_vk: upload %08x %ux%u format %u, %zu levels, create %d, index %u", base.Address(), base.Width(), base.Height(),
             base.Format(), levels.size(), int(create), index);
@@ -1288,8 +1287,8 @@ void BindTextureUncached(gpu::PSConstants& pc, uint32_t slot)
         if (!clamp)
             pc.tinfo[slot][0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
         // Mirrored addressing (1 repeating, odd modes from 3 once), folded by the shader - as the Direct3D 12 path sets it.
-        pc.tinfo[slot][0] |= (clampX == 1 ? 1u << 20 : 0u) | (clampY == 1 ? 1u << 21 : 0u) | (clampX >= 3 && (clampX & 1) ? 1u << 22 : 0u) |
-            (clampY >= 3 && (clampY & 1) ? 1u << 23 : 0u);
+        pc.tinfo[slot][0] |= (clampX == 1 ? 1u << 28 : 0u) | (clampY == 1 ? 1u << 29 : 0u) | (clampX >= 3 && (clampX & 1) ? 1u << 30 : 0u) |
+            (clampY >= 3 && (clampY & 1) ? 1u << 31 : 0u);
         if (clampX >= 6 && clampY >= 6)
             pc.tinfo[slot][0] |= (1u << 16) | ((fetch.dwords[5] & 3) == 1 ? 1u << 17 : 0u);
         uint32_t swizzle = fetch.Swizzle();
@@ -1363,8 +1362,8 @@ void BindTextureUncached(gpu::PSConstants& pc, uint32_t slot)
         if (!clamp)
             pc.tinfo[slot][0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
         // Mirrored addressing (1 repeating, odd modes from 3 once), folded by the shader - as the Direct3D 12 path sets it.
-        pc.tinfo[slot][0] |= (clampX == 1 ? 1u << 20 : 0u) | (clampY == 1 ? 1u << 21 : 0u) | (clampX >= 3 && (clampX & 1) ? 1u << 22 : 0u) |
-            (clampY >= 3 && (clampY & 1) ? 1u << 23 : 0u);
+        pc.tinfo[slot][0] |= (clampX == 1 ? 1u << 28 : 0u) | (clampY == 1 ? 1u << 29 : 0u) | (clampX >= 3 && (clampX & 1) ? 1u << 30 : 0u) |
+            (clampY >= 3 && (clampY & 1) ? 1u << 31 : 0u);
         if (clampX >= 6 && clampY >= 6)
             pc.tinfo[slot][0] |= (1u << 16) | ((fetch.dwords[5] & 3) == 1 ? 1u << 17 : 0u);
         uint32_t swizzle = fetch.Swizzle();
@@ -1441,7 +1440,7 @@ void BindTextureUncached(gpu::PSConstants& pc, uint32_t slot)
     uint32_t index = 0;
     auto cached = g.textures.find(key);
     const bool known = cached != g.textures.end();
-    // Block-compressed uploads (unless FM2_VK_NO_BC): the same images the Direct3D 12 backend samples.
+    // Block-compressed uploads (unless REGPU_VK_NO_BC): the same images the Direct3D 12 backend samples.
     // Block-aligned sizes only, as that path requires, because a block copy cannot express a
     // partial block row.
     if (g.bcUploads && fetch.Width() % 4 == 0 && fetch.Height() % 4 == 0 && !ResolvedFor(fetch) && TextureBCKind(fetch.Format()) >= 1 &&
@@ -1546,8 +1545,8 @@ void BindTextureUncached(gpu::PSConstants& pc, uint32_t slot)
     if (!clamp)
         pc.tinfo[slot][0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
     // Mirrored addressing (1 repeating, odd modes from 3 once), folded by the shader - as the Direct3D 12 path sets it.
-    pc.tinfo[slot][0] |= (clampX == 1 ? 1u << 20 : 0u) | (clampY == 1 ? 1u << 21 : 0u) | (clampX >= 3 && (clampX & 1) ? 1u << 22 : 0u) |
-        (clampY >= 3 && (clampY & 1) ? 1u << 23 : 0u);
+    pc.tinfo[slot][0] |= (clampX == 1 ? 1u << 28 : 0u) | (clampY == 1 ? 1u << 29 : 0u) | (clampX >= 3 && (clampX & 1) ? 1u << 30 : 0u) |
+        (clampY >= 3 && (clampY & 1) ? 1u << 31 : 0u);
     if (clampX >= 6 && clampY >= 6)
         pc.tinfo[slot][0] |= (1u << 16) | ((fetch.dwords[5] & 3) == 1 ? 1u << 17 : 0u);
     pc.tinfo[slot][1] = fetch.Width();
@@ -1585,8 +1584,8 @@ void BindTexture(gpu::PSConstants& pc, uint32_t slot)
     memcpy(memo.tbias, pc.tbias[slot], sizeof(memo.tbias));
 }
 
-// FM2_VK_FULL_CONSTANT_BLOCKS=1: both constant blocks are filled and copied whole for every draw, as before (A/B).
-const bool g_fullConstantBlocks = getenv("FM2_VK_FULL_CONSTANT_BLOCKS") != nullptr;
+// REGPU_VK_FULL_CONSTANT_BLOCKS=1: both constant blocks are filled and copied whole for every draw, as before (A/B).
+const bool g_fullConstantBlocks = getenv("REGPU_VK_FULL_CONSTANT_BLOCKS") != nullptr;
 
 // What the pair of shaders reads of the blocks. The float count is the translator's (highest constant read + 1, all
 // 256 when one is indexed by a register), the one the Direct3D 12 path copies by.
@@ -1671,17 +1670,19 @@ void BuildConstants(const vk::VkShader* vs, const vk::VkShader* ps, gpu::VSConst
     // Loop constants, for both stages.
     for (uint32_t i = 0; i < 32; i++)
         vc.l[i] = pc.l[i] = gpureg::Get(gpureg::LoopConstants + i);
-    // Forced absolute LOD: -1 means implicit. Left at zero it would force mip 0 on every fetch.
-    static const float forceLod = getenv("FM2_FORCE_LOD") ? float(atof(getenv("FM2_FORCE_LOD"))) : -1.0f;
-    pc.forceLod[0] = forceLod;
-    pc.forceLod[1] = pc.forceLod[2] = pc.forceLod[3] = 0.0f;
     // Colour exponent bias (RB_COLOR_INFO bits 20-25, signed) and the 16_16 targets' -32..32 range (pinfo.z bit 3).
     {
-        static const bool noColorExpBias = getenv("FM2_NO_COLOR_EXP_BIAS") != nullptr;
+        static const bool noColorExpBias = getenv("REGPU_NO_COLOR_EXP_BIAS") != nullptr;
         const uint32_t colorInfo = gpureg::Get(0x2001 /* RB_COLOR_INFO */);
         pc.info[3] = noColorExpBias ? 0u : uint32_t(int32_t(colorInfo << 6) >> 26);
         const uint32_t colorFormat16 = (colorInfo >> 16) & 0xF;
         pc.info[2] = !noColorExpBias && (colorFormat16 == 4 || colorFormat16 == 5) ? 8u : 0u;
+    }
+    // As the Direct3D 12 path (renderer.cpp): the pixel position register holds the whole pixel (pinfo.z bit 16,
+    // REGPU_OLD_PIXEL_POS=1: the centre) and point-sampled coordinates are snapped (bit 17, REGPU_NO_POINT_SNAP=1: not).
+    {
+        static LiveSwitch oldPixelPos("REGPU_OLD_PIXEL_POS"), noPointSnap("REGPU_NO_POINT_SNAP");
+        pc.info[2] |= (oldPixelPos ? 0u : 1u << 16) | (noPointSnap ? 0u : 1u << 17);
     }
     pc.info2[0] = RegFloat(0x210E /* RB_ALPHA_REF */);
     // Pixel position back to game pixels: the guest's pass, over the host target (1.0 at native).
@@ -1736,7 +1737,12 @@ void BuildConstants(const vk::VkShader* vs, const vk::VkShader* ps, gpu::VSConst
 
 bool VulkanRendererEnabled()
 {
-    static const bool enabled = GetSettings().renderer == Settings::Renderer::Vulkan;
+    // Config::renderer (the host's choice); REGPU_RENDERER=vulkan or d3d12 overrides it for tests.
+    static const bool enabled = [] {
+        if (const char* v = getenv("REGPU_RENDERER"); v && *v)
+            return _stricmp(v, "vulkan") == 0;
+        return GetSettings().renderer == regpu::Config::Renderer::Vulkan;
+    }();
     return enabled;
 }
 
@@ -1808,15 +1814,15 @@ void CompileHousekeeping()
 
 namespace
 {
-// FM2_VK_SAMPLE=1: a sampling profile of the render thread, for a build that has no profiler to hand (Wine, no perf).
+// REGPU_VK_SAMPLE=1: a sampling profile of the render thread, for a build that has no profiler to hand (Wine, no perf).
 // A second thread suspends this one about 2000 times a second, notes its instruction pointer and resumes it; at
 // 5000 samples (and every 5000 after) the histogram goes to out/vk_samples.txt as "count address" with addresses
 // relative to the executable's base (-1 = outside it: the driver, ntdll, the C runtime). Resolve them with
-// llvm-symbolizer --obj=fm2.exe. The FM2_PERF timers cost 17% of the frame and are not a substitute.
+// llvm-symbolizer --obj=fm2.exe. The REGPU_PERF timers cost 17% of the frame and are not a substitute.
 void StartSampler()
 {
 #if defined(_WIN32)
-    if (!getenv("FM2_VK_SAMPLE"))
+    if (!getenv("REGPU_VK_SAMPLE"))
         return;
     HANDLE thread = nullptr;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &thread, 0, FALSE, DUPLICATE_SAME_ACCESS))
@@ -1833,7 +1839,7 @@ void StartSampler()
         // them: enough to see who calls a hot leaf (memcpy, getenv).
         std::vector<std::array<uint64_t, 10>> stacks;
         uint64_t total = 0;
-        const double startAfter = getenv("FM2_VK_SAMPLE_AFTER") ? atof(getenv("FM2_VK_SAMPLE_AFTER")) : 0.0;
+        const double startAfter = getenv("REGPU_VK_SAMPLE_AFTER") ? atof(getenv("REGPU_VK_SAMPLE_AFTER")) : 0.0;
         const auto begin = std::chrono::steady_clock::now();
         for (;;)
         {
@@ -1925,9 +1931,9 @@ void StartSampler()
 // cache - as the Direct3D 12 path does (PrecompileAll). Compiling them behind a running game left a multi-second
 // frame at the first menu. A boot whose cache is already complete only checks it (a few seconds, nothing
 // shown): every shader is checked rather than a sample, because an interrupted first boot leaves the head of the list
-// cached and the rest not. FM2_VK_NO_BOOT_COMPILE=1 skips the wait (the warm-up
+// cached and the rest not. REGPU_VK_NO_BOOT_COMPILE=1 skips the wait (the warm-up
 // threads carry on in the background).
-// The window's swap chain (vk_swapchain.h). When there is none - headless, FM2_VK_NO_SWAPCHAIN, the synchronous
+// The window's swap chain (vk_swapchain.h). When there is none - headless, REGPU_VK_NO_SWAPCHAIN, the synchronous
 // present path, or a device that cannot present to the window - every frame is read back and handed to the presenter
 // instead, which is also how a capture gets its pixels.
 vk::Swapchain g_swapchain;
@@ -1937,7 +1943,7 @@ bool g_readbackWanted = false;
 
 void CreateWindowSwapchain()
 {
-    if (getenv("FM2_VK_NO_SWAPCHAIN") || getenv("FM2_HEADLESS") || !UseAsyncPresent())
+    if (getenv("REGPU_VK_NO_SWAPCHAIN") || getenv("REGPU_HEADLESS") || !UseAsyncPresent())
         return;
     void* const window = PresenterClaimWindow();
     if (!window)
@@ -2005,7 +2011,7 @@ bool PresentCpuImage(const uint8_t* rgba, uint32_t width, uint32_t height)
 
 void FirstBootShaderWait()
 {
-    if (getenv("FM2_VK_NO_BOOT_COMPILE") || getenv("FM2_HEADLESS"))
+    if (getenv("REGPU_VK_NO_BOOT_COMPILE") || getenv("REGPU_HEADLESS"))
         return;
     const auto start = std::chrono::steady_clock::now();
     auto lastShown = std::chrono::steady_clock::time_point{};
@@ -2022,7 +2028,7 @@ void FirstBootShaderWait()
         if ((compiled || waited > 1.0) && now - lastShown > std::chrono::milliseconds(100))
         {
             lastShown = now;
-            if (BootScreenCompose(total ? L"COMPILING SHADERS" : L"PREPARING SHADERS", done, total, screen) &&
+            if (false /* no boot screen picture in ReGPU (FM2's used its game textures) */ &&
                 screen.size() == size_t(kWidth) * kHeight * 4)
             {
                 shown = true;
@@ -2074,29 +2080,29 @@ bool Init()
     if (g.initialised)
         return !g.failed;
     g.initialised = true;
-    g.perf = getenv("FM2_PERF") && atoi(getenv("FM2_PERF")) != 0;
+    g.perf = getenv("REGPU_PERF") && atoi(getenv("REGPU_PERF")) != 0;
     g.perfWindow = std::chrono::steady_clock::now();
     // Echo the environment the renderer actually received. Cold path, one line per run.
     {
-        const char* const perfEnv = getenv("FM2_PERF");
-        const char* const drawsEnv = getenv("FM2_VK_DRAWS");
-        const char* const rendererEnv = getenv("FM2_RENDERER");
-        const char* const tourEnv = getenv("FM2_TOUR");
-        Log("renderer_vk: env FM2_PERF=%s FM2_VK_DRAWS=%s FM2_RENDERER=%s FM2_TOUR=%s",
+        const char* const perfEnv = getenv("REGPU_PERF");
+        const char* const drawsEnv = getenv("REGPU_VK_DRAWS");
+        const char* const rendererEnv = getenv("REGPU_RENDERER");
+        const char* const tourEnv = getenv("REGPU_TOUR");
+        Log("renderer_vk: env REGPU_PERF=%s REGPU_VK_DRAWS=%s REGPU_RENDERER=%s REGPU_TOUR=%s",
             perfEnv ? perfEnv : "unset", drawsEnv ? drawsEnv : "unset",
             rendererEnv ? rendererEnv : "unset", tourEnv ? "set" : "unset");
     }
     // One root for both caches, so neither can be left behind on the old vendor: vk::Init appends
     // <vendorID>-<deviceID> to the pipeline cache name, and the shader root below joins the same
-    // root. FM2_VK_CACHE_DIR moves BOTH.
-    const std::filesystem::path cacheRoot = getenv("FM2_VK_CACHE_DIR")
-        ? std::filesystem::path(getenv("FM2_VK_CACHE_DIR"))
-        : UserDir() / "cache" / "vulkan";
+    // root. REGPU_VK_CACHE_DIR moves BOTH.
+    const std::filesystem::path cacheRoot = getenv("REGPU_VK_CACHE_DIR")
+        ? std::filesystem::path(getenv("REGPU_VK_CACHE_DIR"))
+        : RegpuUserDir() / "cache" / "vulkan";
     if (!vk::Init(g.context, cacheRoot))
     {
         Log("renderer_vk: no Vulkan device");
 #if defined(_WIN32)
-        if (!getenv("FM2_HEADLESS") && !getenv("FM2_TOUR"))
+        if (!getenv("REGPU_HEADLESS") && !getenv("REGPU_TOUR"))
             MessageBoxA(nullptr,
                 "Vulkan could not start. Install or update your graphics driver, or select Direct3D 12 in the launcher. See out\\play.log for details.",
                 "Forza Motorsport 2 ReGPU", MB_OK | MB_ICONERROR);
@@ -2107,14 +2113,14 @@ bool Init()
     Log("renderer_vk: %s, Vulkan renderer ready", g.context.props.deviceName);
     // Shader caches are per device, and the device is known only after vk::Init.
     g.shaders.cacheDir = cacheRoot / (std::to_string(g.context.props.vendorID) + "-" + std::to_string(g.context.props.deviceID));
-    if (!getenv("FM2_VK_NO_BC"))
+    if (!getenv("REGPU_VK_NO_BC"))
     {
         VkPhysicalDeviceFeatures2 query{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
         vkGetPhysicalDeviceFeatures2(g.context.physical, &query);
         g.bcUploads = query.features.textureCompressionBC == VK_TRUE;
         Log("renderer_vk: block-compressed uploads %s", g.bcUploads ? "on" : "unavailable, using decoded uploads");
     }
-    if (!vk::TextureCacheInit(g.context, g.textures0, getenv("FM2_SMALL_DESCRIPTOR_LAYOUT") ? uint32_t(atoi(getenv("FM2_SMALL_DESCRIPTOR_LAYOUT"))) : 1u << 16))
+    if (!vk::TextureCacheInit(g.context, g.textures0, getenv("REGPU_SMALL_DESCRIPTOR_LAYOUT") ? uint32_t(atoi(getenv("REGPU_SMALL_DESCRIPTOR_LAYOUT"))) : 1u << 16))
     {
         g.failed = true;
         return false;
@@ -2133,17 +2139,19 @@ bool Init()
     }
     VkSamplerCreateInfo info{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
     info.maxLod = 32.0f;
-    static LiveSwitch noAniso("FM2_NO_ANISO");
-    for (uint32_t i = 0; i < 4; i++)
+    static LiveSwitch noAniso("REGPU_NO_ANISO");
+    for (uint32_t i = 0; i < 8; i++)
     {
-        // The launcher's anisotropic filtering setting (0 off, 2-16), as the Direct3D 12 path reads it. It matters now that
-        // pixel shaders sample with mips: 16x is a real cost on an integrated GPU.
-        const uint32_t wanted = GetSettings().anisotropy;
-        const bool anisotropic = i == 0 && !noAniso && wanted >= 2 && g.context.props.limits.maxSamplerAnisotropy > 1.0f;
+        // regpu::SetAnisotropy (0 off, 2-16) for the linear wrapping sampler, as the Direct3D 12 path does. It matters now
+        // that pixel shaders sample with mips: 16x is a real cost on an integrated GPU. s4-s7 are linear wrap at a fixed
+        // 2x, 4x, 8x and 16x (a fetch's own anisotropy, REGPU_ANISO_FROM_FETCH).
+        const uint32_t wanted = i >= 4 ? 2u << (i - 4) : RendererAnisotropy();
+        const bool anisotropic = (i == 0 || i >= 4) && !noAniso && wanted >= 2 && g.context.props.limits.maxSamplerAnisotropy > 1.0f;
         info.anisotropyEnable = anisotropic ? VK_TRUE : VK_FALSE;
         info.maxAnisotropy = anisotropic ? std::min(float(std::min(wanted, 16u)), g.context.props.limits.maxSamplerAnisotropy) : 1.0f;
-        info.magFilter = info.minFilter = i < 2 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-        info.mipmapMode = i < 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        const bool linear = i < 2 || i >= 4;
+        info.magFilter = info.minFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        info.mipmapMode = linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
         info.addressModeU = info.addressModeV = info.addressModeW = i == 1 || i == 2 ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
             : VK_SAMPLER_ADDRESS_MODE_REPEAT;
         if (vkCreateSampler(g.context.device, &info, nullptr, &g.samplers[i]) != VK_SUCCESS)
@@ -2165,9 +2173,9 @@ bool Init()
     // The guest's physical memory window, wrapped rather than copied: the vertex shaders read
     // vertex data straight out of it (gpu/memory.h maps the guest's 4 GB at g_base).
     // Importing the whole 512 MB window can fail with VK_ERROR_OUT_OF_DEVICE_MEMORY on an integrated GPU, and the
-    // import is what makes vertex data readable at all. FM2_VK_GP_MB shrinks the window.
+    // import is what makes vertex data readable at all. REGPU_VK_GP_MB shrinks the window.
     {
-        static const char* gpMb = getenv("FM2_VK_GP_MB");
+        static const char* gpMb = getenv("REGPU_VK_GP_MB");
         VkDeviceSize window = 0x20000000ull;
         if (gpMb)
         {
@@ -2191,8 +2199,8 @@ bool Init()
     }
     CreateWindowSwapchain();
     FirstBootShaderWait();
-    const VkDeviceSize listBytes = getenv("FM2_VK_GUEST_RING_MB")
-        ? std::clamp<VkDeviceSize>(strtoull(getenv("FM2_VK_GUEST_RING_MB"), nullptr, 10), 16, 1024) << 20
+    const VkDeviceSize listBytes = getenv("REGPU_VK_GUEST_RING_MB")
+        ? std::clamp<VkDeviceSize>(strtoull(getenv("REGPU_VK_GUEST_RING_MB"), nullptr, 10), 16, 1024) << 20
         : 384u << 20;
     if (!vk::DrawInit(g.context, g.draw, g.gphys, g.samplers, g.textures0.set, g.cubes.set, 128u << 20, listBytes))
     {
@@ -2511,12 +2519,12 @@ void RendererVkOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t
     (type == 0 ? g.vsHash : g.psHash) = hash;
 }
 
-LiveSwitch g_vkShaderCopyAlways("FM2_SHADER_COPY_ALWAYS");
+LiveSwitch g_vkShaderCopyAlways("REGPU_SHADER_COPY_ALWAYS");
 
 void RendererVkSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t usedDwords, uint64_t hash)
 {
     std::vector<uint32_t>& code = type == 0 ? g.vsCode : g.psCode;
-    // The same shader as loaded (see RendererSetShader): no copy. FM2_SHADER_COPY_ALWAYS=1 copies (A/B).
+    // The same shader as loaded (see RendererSetShader): no copy. REGPU_SHADER_COPY_ALWAYS=1 copies (A/B).
     uint64_t& current = type == 0 ? g.vsHash : g.psHash;
     if (current == hash && code.size() == usedDwords && !g_vkShaderCopyAlways)
         return;
@@ -2528,10 +2536,10 @@ void RendererVkSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t us
 void RendererVkOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
     // Read once, not per draw: a getenv() in the per-draw path is measurable.
-    static const char* env_FM2_VK_DIRECT_FETCH_KB = getenv("FM2_VK_DIRECT_FETCH_KB");
-    static const char* env_FM2_VK_DRAWS = getenv("FM2_VK_DRAWS");
-    static const char* env_FM2_VK_HDR_RESOLVES = getenv("FM2_VK_HDR_RESOLVES");
-    static const char* env_FM2_VK_SYNC_PRESENT = getenv("FM2_VK_SYNC_PRESENT");
+    static const char* env_REGPU_VK_DIRECT_FETCH_KB = getenv("REGPU_VK_DIRECT_FETCH_KB");
+    static const char* env_REGPU_VK_DRAWS = getenv("REGPU_VK_DRAWS");
+    static const char* env_REGPU_VK_HDR_RESOLVES = getenv("REGPU_VK_HDR_RESOLVES");
+    static const char* env_REGPU_VK_SYNC_PRESENT = getenv("REGPU_VK_SYNC_PRESENT");
     g.drawsEntered++; // every draw the guest hands us, before any filtering
     std::unique_lock asyncLock(g_asyncMutex, std::defer_lock);
     if (UseAsyncPresent())
@@ -2542,7 +2550,7 @@ void RendererVkOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (!Init())
         return;
     FrameGpuTimesBegin();
-    // FM2_PERF: the renderer's own per-draw cost — the one part of a frame this backend owns.
+    // REGPU_PERF: the renderer's own per-draw cost — the one part of a frame this backend owns.
     ScopedMs timed(g.perf ? &g.perfDrawsMs : nullptr);
     if (g.perf)
         g.perfDraws++;
@@ -2618,7 +2626,7 @@ void RendererVkOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         else
             vk::SurfaceShaderRead(g.context, *source, g.cmd);
-        static const bool hdrResolves = env_FM2_VK_HDR_RESOLVES == nullptr || atoi(env_FM2_VK_HDR_RESOLVES) != 0;
+        static const bool hdrResolves = env_REGPU_VK_HDR_RESOLVES == nullptr || atoi(env_REGPU_VK_HDR_RESOLVES) != 0;
         const uint32_t destFormat = (info >> 7) & 0x3F;
         const VkFormat format = depth ? VK_FORMAT_R32_SFLOAT
             : hdrResolves && destFormat != 6 ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
@@ -2630,8 +2638,8 @@ void RendererVkOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // Host-size targets: the image is the guest size times this pass's render scale (the ratio HostScissor used to
         // place the draws in the surface), so a resolve is a 1:1 copy and what samples it - the next pass, and finally
         // the window - sees every pixel that was rendered. Guest-size targets box-filtered 1920x1080 down to 1280x720
-        // and the window stretched it back up. FM2_VK_GUEST_SIZE_RESOLVES=1 restores that.
-        static const bool guestSizeResolves = getenv("FM2_VK_GUEST_SIZE_RESOLVES") != nullptr;
+        // and the window stretched it back up. REGPU_VK_GUEST_SIZE_RESOLVES=1 restores that.
+        static const bool guestSizeResolves = getenv("REGPU_VK_GUEST_SIZE_RESOLVES") != nullptr;
         const double hostScaleX = double(source->width) / double(std::max(1u, PassWidth()));
         const double hostScaleY = double(source->height) / double(std::max(1u, PassHeight()));
         const uint32_t hostWidth = guestSizeResolves ? width : std::clamp<uint32_t>(uint32_t(std::lround(width * hostScaleX)), 1, 8192);
@@ -2781,8 +2789,8 @@ void RendererVkOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 props.limits.maxImageDimension2D, double(props.limits.maxSamplerAnisotropy));
         }
     }
-    // FM2_VK_DRAWS=0 runs the seam and the shader service against the real game without drawing.
-    static const bool drawEnabled = !env_FM2_VK_DRAWS || atoi(env_FM2_VK_DRAWS) != 0;
+    // REGPU_VK_DRAWS=0 runs the seam and the shader service against the real game without drawing.
+    static const bool drawEnabled = !env_REGPU_VK_DRAWS || atoi(env_REGPU_VK_DRAWS) != 0;
     if (!g.vsHash || !g.psHash)
         return;
     const uint64_t vsHash = g.vsHash, psHash = g.psHash;
@@ -2807,15 +2815,15 @@ void RendererVkOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (!g.reportedConfig)
     {
         g.reportedConfig = true;
-        Log("renderer_vk: config sync-present %s | direct-fetch %u KB", env_FM2_VK_SYNC_PRESENT ? "ON" : "off",
-            env_FM2_VK_DIRECT_FETCH_KB ? uint32_t(atoi(env_FM2_VK_DIRECT_FETCH_KB)) : 16u);
+        Log("renderer_vk: config sync-present %s | direct-fetch %u KB", env_REGPU_VK_SYNC_PRESENT ? "ON" : "off",
+            env_REGPU_VK_DIRECT_FETCH_KB ? uint32_t(atoi(env_REGPU_VK_DIRECT_FETCH_KB)) : 16u);
     }
     if (!drawEnabled)
     {
         if (!g.reportedDraws)
         {
             g.reportedDraws = true;
-            Log("renderer_vk: shaders compile and cache (%u compiled, %u failed); draws are disabled by FM2_VK_DRAWS=0",
+            Log("renderer_vk: shaders compile and cache (%u compiled, %u failed); draws are disabled by REGPU_VK_DRAWS=0",
                 g.shaders.compiled, g.shaders.failed);
         }
         return;
@@ -2842,7 +2850,7 @@ void RendererVkOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     ScopedMs setupTimed(g.perf ? &g.perfSetupMs : nullptr);
     const uint32_t prim = initiator & 0x3F, indexSource = (initiator >> 6) & 3, indexCount = initiator >> 16;
     const bool restartOn = (gpureg::Get(gpureg::PA_SU_SC_MODE_CNTL) >> 21) & 1;
-    static LiveSwitch noDirectIndex("FM2_NO_DIRECT_INDEX");
+    static LiveSwitch noDirectIndex("REGPU_NO_DIRECT_INDEX");
     const bool directIndex = g.gphys && !noDirectIndex && (indexSource == 0 || indexSource == 2) &&
         (prim == 4 || prim == 13 || (prim == 6 && !restartOn));
     const uint32_t directVertices = prim == 4 ? indexCount / 3 * 3 : prim == 13 ? indexCount / 4 * 6 : (indexCount >= 3 ? (indexCount - 2) * 3 : 0);
@@ -2897,7 +2905,7 @@ void RendererVkOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         BuildConstants(vs, ps, vc, pc, constantUse);
         // Polygon offset (window-space depth), as main's D3D12 path: without it a decal z-fights the surface under it.
         {
-            static const bool noPolyOffset = getenv("FM2_NO_POLY_OFFSET") != nullptr;
+            static const bool noPolyOffset = getenv("REGPU_NO_POLY_OFFSET") != nullptr;
             const uint32_t sc = gpureg::Get(gpureg::PA_SU_SC_MODE_CNTL), polyPrim = initiator & 0x3F;
             const bool tri = polyPrim == 4 || polyPrim == 5 || polyPrim == 6;
             const bool enabled = tri ? (sc & (3u << 11)) != 0 : ((sc >> 13) & 1) != 0;
@@ -2908,7 +2916,7 @@ void RendererVkOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 if ((gpureg::Get(0x2002) >> 16) & 1)
                     offset *= 0.5f;
             }
-            vc.vpoly[0] = offset;
+            vc.vdepth[0] = offset;
         }
     }
     ScopedMs postConstTimed(g.perf ? &g.perfPostConstMs : nullptr);
@@ -2994,7 +3002,7 @@ void RendererVkOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // The record span has its own bucket as well as being part of the draw cost.
         postConstTimed.Stop();
         ScopedMs recordTimed(g.perf ? &g.perfRecordMs : nullptr);
-        // The draw's shader identity, for FM2_VK_DEBUG_PS and FM2_VK_DEBUG_VS.
+        // The draw's shader identity, for REGPU_VK_DEBUG_PS and REGPU_VK_DEBUG_VS.
         g.draw.psHashDebug = psHash;
         g.draw.vsHashDebug = vsHash;
         recorded = vk::DrawList(g.context, g.draw, g.cmd, pipeline, g.textures0.set, vc, pc, list.data(), drawCount, scissor,
@@ -3031,7 +3039,7 @@ void RendererVkOnSwap(uint64_t frame, uint32_t frontBuffer)
     static auto previousSwap = swapNow;
     const double swapMs = std::chrono::duration<double, std::milli>(swapNow - previousSwap).count();
     previousSwap = swapNow;
-    static const double slowMs = getenv("FM2_SLOW_MS") ? atof(getenv("FM2_SLOW_MS")) : 25.0;
+    static const double slowMs = getenv("REGPU_SLOW_MS") ? atof(getenv("REGPU_SLOW_MS")) : 25.0;
     static double lastDrawMs = 0, lastShaderMs = 0, lastPipelineMs = 0, lastTextureMs = 0, lastResolveMs = 0, lastWaitMs = 0;
     static uint64_t lastUploadSubmits = 0, lastUploadBytes = 0, lastUploadFlushes = 0, lastImageCreates = 0;
     static double lastUploadRecordMs = 0, lastImageCreateMs = 0, lastSlotWriteMs = 0;
@@ -3074,16 +3082,16 @@ void RendererVkOnSwap(uint64_t frame, uint32_t frontBuffer)
             resolved->second.height == 720
         ? &resolved->second
         : nullptr;
-    // FM2_VK_DUMP_AT=<seconds>: dump once, at that point in time, so a Vulkan frame can be
-    // compared with a D3D12 one taken at the same moment (FM2_DUMP_AT).
-    static const double dumpAt = getenv("FM2_VK_DUMP_AT") ? atof(getenv("FM2_VK_DUMP_AT")) : -1.0;
+    // REGPU_VK_DUMP_AT=<seconds>: dump once, at that point in time, so a Vulkan frame can be
+    // compared with a D3D12 one taken at the same moment (REGPU_DUMP_AT).
+    static const double dumpAt = getenv("REGPU_VK_DUMP_AT") ? atof(getenv("REGPU_VK_DUMP_AT")) : -1.0;
     static const auto started = std::chrono::steady_clock::now();
     static bool dumpedOnce = false;
     const bool timeDump = dumpAt >= 0 && !dumpedOnce &&
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= dumpAt;
-    // FM2_VK_DUMP_FRAME=<n>: dump that exact frame. Comparing two builds needs the same frame,
+    // REGPU_VK_DUMP_FRAME=<n>: dump that exact frame. Comparing two builds needs the same frame,
     // not the same wall-clock moment — the two land in different scenes otherwise.
-    static const uint64_t dumpFrame = getenv("FM2_VK_DUMP_FRAME") ? strtoull(getenv("FM2_VK_DUMP_FRAME"), nullptr, 10) : 0;
+    static const uint64_t dumpFrame = getenv("REGPU_VK_DUMP_FRAME") ? strtoull(getenv("REGPU_VK_DUMP_FRAME"), nullptr, 10) : 0;
     // A capture asked for by the tour (out/capture.request) dumps this frame, so the two backends
     // can be put on the same screen instead of the same frame counter — the menus advance on their
     // own timers and frame numbers do not line up between them.
@@ -3113,7 +3121,7 @@ void RendererVkOnSwap(uint64_t frame, uint32_t frontBuffer)
         ClosePass();
         // Submit the frame and start the next one. The command buffer is reused: waiting keeps it
         // simple, and the first frames are not where the time goes. It is still a whole frame of
-        // GPU work serialised against the CPU, which is what FM2_PERF reports here.
+        // GPU work serialised against the CPU, which is what REGPU_PERF reports here.
         if (UseAsyncPresent())
             SubmitAsyncFrame(front);
         else
@@ -3129,7 +3137,7 @@ void RendererVkOnSwap(uint64_t frame, uint32_t frontBuffer)
     }
     // Windowed: hand the frame to the presenter (which still uploads and blits it on the D3D12
     // side — a real Vulkan swap chain is the platform layer's job, this is for looking at it now).
-    static const bool windowed = getenv("FM2_HEADLESS") == nullptr;
+    static const bool windowed = getenv("REGPU_HEADLESS") == nullptr;
     if (windowed && !UseAsyncPresent() && (front || last) && draws)
     {
         ScopedMs timed(g.perf ? &g.perfPresentMs : nullptr);
@@ -3194,7 +3202,7 @@ void RendererVkOnSwap(uint64_t frame, uint32_t frontBuffer)
             Log("renderer_vk: wrote %s", shotPath.c_str());
         }
     }
-    // FM2_PERF: every 60 frames, where the time went. This backend records a whole frame into one
+    // REGPU_PERF: every 60 frames, where the time went. This backend records a whole frame into one
     // command buffer and waits for it at the swap, so a frame is four things: the renderer's own
     // per-draw work, the submit with its wait, the present readback (windowed only), and the rest
     // of the game. Only the first three belong to this backend, so only those are worth fixing.

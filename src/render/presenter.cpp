@@ -54,8 +54,12 @@ struct Presenter
     std::mutex mutex;
     std::condition_variable cv;
     uint64_t pendingFrame = 0;
-    std::vector<uint8_t> image; // latest submitted RGBA8, kWidth x kHeight
+    std::vector<uint8_t> image; // latest submitted RGBA8, imageWidth x imageHeight
+    uint32_t imageWidth = 0, imageHeight = 0;
     ComPtr<ID3D12Resource> upload[kBuffers];
+    uint64_t uploadBytes[kBuffers] = {}; // each upload buffer's size (grown for larger submitted images)
+    // The Vulkan backend presents into the window itself (PresenterClaimWindow): the presenter then draws nothing.
+    std::atomic<bool> claimed{ false };
     uint64_t presentedFrame = 0;
     std::atomic<bool> ready{ false };
 };
@@ -474,7 +478,8 @@ void CreateWindowAndDevice()
     for (UINT i = 0; i < kBuffers; i++)
         Check(g_p.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                   IID_PPV_ARGS(&g_p.upload[i])),
-            "CreateCommittedResource(upload)");
+            "CreateCommittedResource(upload)"),
+            g_p.uploadBytes[i] = rd.Width;
 }
 
 void Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
@@ -500,30 +505,76 @@ void DrawFrame(uint64_t frame)
     g_p.list->Reset(g_p.allocators[i].Get(), nullptr);
     ID3D12Resource* backBuffer = g_p.backBuffers[i].Get();
 
+    // The submitted image is any size (the Vulkan backend sends the output size); it is centred in the back buffer and
+    // cropped to it. It used to be assumed 1280x720 and copied to the top-left corner of a larger swap chain.
     bool copied = false;
+    uint32_t imageW = 0, imageH = 0;
     {
         std::lock_guard lock(g_p.mutex);
-        if (g_p.image.size() == size_t(kWidth) * kHeight * 4)
+        imageW = g_p.imageWidth;
+        imageH = g_p.imageHeight;
+        // D3D12 wants the rows of a placed footprint 256-byte aligned.
+        const uint32_t rowPitch = (imageW * 4 + 255) & ~255u;
+        const uint64_t bytes = uint64_t(rowPitch) * imageH;
+        if (bytes && g_p.image.size() == size_t(imageW) * imageH * 4)
         {
-            void* mapped = nullptr;
-            g_p.upload[i]->Map(0, nullptr, &mapped);
-            memcpy(mapped, g_p.image.data(), g_p.image.size());
-            g_p.upload[i]->Unmap(0, nullptr);
-            copied = true;
+            if (g_p.uploadBytes[i] < bytes)
+            {
+                D3D12_HEAP_PROPERTIES hp{};
+                hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+                D3D12_RESOURCE_DESC rd{};
+                rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                rd.Width = bytes;
+                rd.Height = 1;
+                rd.DepthOrArraySize = 1;
+                rd.MipLevels = 1;
+                rd.SampleDesc.Count = 1;
+                rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                // This buffer's last use was waited for above (fenceValues[i]), so it can be replaced.
+                g_p.upload[i].Reset();
+                g_p.uploadBytes[i] = SUCCEEDED(g_p.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_p.upload[i]))) ? bytes : 0;
+            }
+            if (g_p.uploadBytes[i] >= bytes)
+            {
+                void* mapped = nullptr;
+                g_p.upload[i]->Map(0, nullptr, &mapped);
+                if (rowPitch == imageW * 4)
+                    memcpy(mapped, g_p.image.data(), g_p.image.size());
+                else
+                    for (uint32_t y = 0; y < imageH; y++)
+                        memcpy(static_cast<uint8_t*>(mapped) + size_t(y) * rowPitch, g_p.image.data() + size_t(y) * imageW * 4, size_t(imageW) * 4);
+                g_p.upload[i]->Unmap(0, nullptr);
+                copied = true;
+            }
         }
     }
 
     if (copied)
     {
-        Transition(backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+        const D3D12_RESOURCE_DESC backDesc = backBuffer->GetDesc();
+        const uint32_t backW = uint32_t(backDesc.Width), backH = backDesc.Height;
+        const uint32_t copyW = std::min(imageW, backW), copyH = std::min(imageH, backH);
+        if (copyW < backW || copyH < backH)
+        {
+            Transition(backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            rtv.ptr += SIZE_T(i) * g_p.rtvStride;
+            const float black[4] = { 0, 0, 0, 1 };
+            g_p.list->ClearRenderTargetView(rtv, black, 0, nullptr);
+            Transition(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+        }
+        else
+            Transition(backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION dst{};
         dst.pResource = backBuffer;
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         D3D12_TEXTURE_COPY_LOCATION src{};
         src.pResource = g_p.upload[i].Get();
         src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, kWidth, kHeight, 1, kWidth * 4 };
-        g_p.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, imageW, imageH, 1, (imageW * 4 + 255) & ~255u };
+        const D3D12_BOX box{ (imageW - copyW) / 2, (imageH - copyH) / 2, 0, (imageW - copyW) / 2 + copyW, (imageH - copyH) / 2 + copyH, 1 };
+        g_p.list->CopyTextureRegion(&dst, (backW - copyW) / 2, (backH - copyH) / 2, 0, &src, &box);
         Transition(backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
     }
     else
@@ -567,6 +618,8 @@ void RenderThread()
             if (frame == g_p.presentedFrame || g_rendererActive)
                 continue;
             g_p.presentedFrame = frame;
+            if (g_p.claimed)
+                continue;
         }
         DrawFrame(frame);
     }
@@ -686,14 +739,50 @@ void regpu::SetWindowSize(uint32_t width, uint32_t height)
 
 void PresenterSubmitImage(uint32_t width, uint32_t height, std::vector<uint8_t> rgba)
 {
-    if (width != kWidth || height != kHeight)
-        return;
+    PresenterExchangeImage(width, height, std::move(rgba));
+}
+
+// The Vulkan backend's frames, read back to the CPU (any size: centred in the back buffer). Returns the image shown
+// before, whose storage the caller reuses for its next frame (from the FM2 port).
+std::vector<uint8_t> PresenterExchangeImage(uint32_t width, uint32_t height, std::vector<uint8_t> rgba)
+{
+    if (!width || !height || rgba.size() != size_t(width) * height * 4)
+        return rgba;
     {
         std::lock_guard lock(g_p.mutex);
-        g_p.image = std::move(rgba);
+        g_p.image.swap(rgba);
+        g_p.imageWidth = width;
+        g_p.imageHeight = height;
         g_p.pendingFrame++;
     }
     g_p.cv.notify_one();
+    return rgba;
+}
+
+// The window for a Vulkan swap chain, or null when it can't have one: headless, or the D3D12 swap chain already
+// holds it (DXGI's flip model owns the window; the Vulkan backend then hands its frames over, PresenterExchangeImage).
+void* PresenterClaimWindow()
+{
+    if (getenv("REGPU_HEADLESS"))
+        return nullptr;
+    for (int i = 0; i < 2000 && !g_p.ready; i++) // the window is made on the presenter's thread
+        Sleep(5);
+    if (!g_p.ready || g_p.swapChain)
+        return nullptr;
+    g_p.claimed = true;
+    return g_p.surface ? g_p.surface : g_p.window;
+}
+
+void PresenterReleaseWindow()
+{
+    g_p.claimed = false;
+}
+
+// A frame shown by the Vulkan swap chain (counted with the presenter's own; the window title's frame rate).
+std::atomic<uint32_t> g_vkPresents{ 0 };
+void PresenterCountFrame()
+{
+    g_vkPresents++;
 }
 
 ID3D12Device* RenderDevice()

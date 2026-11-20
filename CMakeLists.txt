@@ -49,6 +49,19 @@ if(NOT REGPU_FSR1_CS AND NOT EXISTS "${REGPU_FFX}/upscalers/fsr3/include/gpu/fsr
 endif()
 
 file(GLOB_RECURSE REGPU_SOURCES CONFIGURE_DEPENDS src/*.cpp)
+# The Vulkan backend (src/gpu/vk, from the FM2 port's experimental renderer; REGPU_RENDERER=vulkan at run time). Vulkan
+# itself is loaded at run time (gpu/vk/vk_loader.h), so only the headers are needed. The shaders go to SPIR-V through
+# dxcompiler.dll (DirectXShaderCompiler, with dxil.dll), which the port ships beside its executable.
+option(REGPU_VULKAN "Build the Vulkan renderer backend (experimental)" OFF)
+set(REGPU_VULKAN_HEADERS "" CACHE PATH "Vulkan headers (the folder containing vulkan/vulkan.h); empty: find_package(Vulkan)")
+if(REGPU_VULKAN)
+    if(NOT REGPU_VULKAN_HEADERS)
+        find_package(Vulkan REQUIRED)
+        set(REGPU_VULKAN_HEADERS "${Vulkan_INCLUDE_DIR}")
+    endif()
+else()
+    list(FILTER REGPU_SOURCES EXCLUDE REGEX "src/gpu/vk/")
+endif()
 if(NOT REGPU_FSR3)
     list(REMOVE_ITEM REGPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/fsr3.cpp")
 endif()
@@ -108,6 +121,10 @@ else()
 endif()
 
 add_library(regpu STATIC ${REGPU_SOURCES})
+if(REGPU_VULKAN)
+    target_include_directories(regpu PRIVATE "${REGPU_VULKAN_HEADERS}")
+    target_compile_definitions(regpu PUBLIC REGPU_VULKAN=1)
+endif()
 target_include_directories(regpu PUBLIC include ${REGPU_GUEST_INCLUDES})
 target_compile_definitions(regpu PUBLIC ${REGPU_GUEST_DEFINES})
 target_include_directories(regpu PRIVATE src "${REGPU_GENERATED}")
@@ -161,3 +178,10 @@ target_link_libraries(regpu_texture_test PRIVATE regpu)
 add_executable(regpu_dis EXCLUDE_FROM_ALL tools/xenos_dis.cpp)
 target_include_directories(regpu_dis PRIVATE src)
 target_link_libraries(regpu_dis PRIVATE regpu d3dcompiler)
+
+# The Vulkan backend's smoke test: device and shader compile (tests/vkprobe.cpp). Copy dxcompiler.dll beside it.
+if(REGPU_VULKAN)
+    add_executable(regpu_vkprobe EXCLUDE_FROM_ALL tests/vkprobe.cpp)
+    target_link_libraries(regpu_vkprobe PRIVATE regpu)
+    target_include_directories(regpu_vkprobe PRIVATE src "${REGPU_VULKAN_HEADERS}")
+endif()

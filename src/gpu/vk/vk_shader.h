@@ -1,6 +1,6 @@
 #pragma once
 // HLSL to SPIR-V for the Vulkan backend, through dxc: dxcompiler.dll in process on Windows when it is available,
-// otherwise the dxc executable (FM2_DXC, the bundled dxc.exe, or PATH). Results are cached on disk under a name
+// otherwise the dxc executable (REGPU_DXC, the bundled dxc.exe, or PATH). Results are cached on disk under a name
 // that includes a hash of the final HLSL.
 #include <cstdint>
 #include <filesystem>

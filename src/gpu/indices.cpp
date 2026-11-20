@@ -57,8 +57,8 @@ bool BuildIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize, std:
         }
         // A draw whose count runs past the index buffer (DMA size) reads zero indices there, as the
         // indexed path's buffer view does: the vector is reused between draws, so those entries kept
-        // an earlier draw's indices (stray triangles). From the FM4 port. FM2_STALE_INDICES=1: as before (A/B).
-        static LiveSwitch staleIndices("FM2_STALE_INDICES");
+        // an earlier draw's indices (stray triangles). From the FM4 port. REGPU_STALE_INDICES=1: as before (A/B).
+        static LiveSwitch staleIndices("REGPU_STALE_INDICES");
         if (count > available && !staleIndices)
             for (uint32_t i = available; i < count; i++)
                 g[i] = offset;
@@ -132,9 +132,9 @@ bool BuildIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize, std:
             // The Xenos draws each rectangle as one primitive with the given triangle's facing. The second
             // triangle is ordered (first hypotenuse end, fourth corner, second end), which keeps that
             // winding: the other order faced the other way, so a draw with separate back-face stencil ops
-            // applied them to half of every rectangle. From the FM4 port. FM2_OLD_RECT_WINDING=1 (read
+            // applied them to half of every rectangle. From the FM4 port. REGPU_OLD_RECT_WINDING=1 (read
             // at start): the old order (A/B).
-            static const bool oldWinding = getenv("FM2_OLD_RECT_WINDING") != nullptr;
+            static const bool oldWinding = getenv("REGPU_OLD_RECT_WINDING") != nullptr;
             for (uint32_t role : oldWinding ? std::initializer_list<uint32_t>{ 1u, 2u, 0u } : std::initializer_list<uint32_t>{ 1u, 0u, 2u })
                 out.push_back(0x80000000u | (role << 29) | pos);
         }

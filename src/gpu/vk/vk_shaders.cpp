@@ -22,13 +22,42 @@
 #include "log.h"
 
 #include "gpu/shader_scan.h"
-#include "gpu/static_shaders.h"
+#include "regpu/regpu.h"
 #include "gpu/hlsl.h"
 #include "gpu/ucode.h"
 #include "gpu/vk/vk_shader.h"
 
 namespace vk
 {
+// The translator's HLSL as the Vulkan pipeline layout binds it (see vk_shaders.h).
+std::string AdaptHlsl(const std::string& hlsl)
+{
+    std::string source = hlsl;
+    for (const auto& [from, to] : { std::pair<const char*, const char*>{ "gtex[] :", "gtex[65536] :" }, { "gcube[] :", "gcube[65536] :" },
+             { "gvol[] :", "gvol[65536] :" } })
+        if (const size_t at = source.find(from); at != std::string::npos)
+            source.replace(at, strlen(from), to);
+    // ReGPU declares its eight samplers one by one (s0-s7); the Vulkan layout has them as one array binding.
+    {
+        static const char* const kSamplers[8] = { "sLinearWrap", "sLinearClamp", "sPointClamp", "sPointWrap", "sAniso2Wrap", "sAniso4Wrap",
+            "sAniso8Wrap", "sAniso16Wrap" };
+        const std::string first = std::string("SamplerState ") + kSamplers[0] + " : register(s0);";
+        if (const size_t at = source.find(first); at != std::string::npos)
+        {
+            const std::string last = std::string("SamplerState ") + kSamplers[7] + " : register(s7);";
+            const size_t end = source.find(last, at);
+            if (end != std::string::npos)
+            {
+                std::string decl = "SamplerState gSamplers[8] : register(s0);\n";
+                for (int i = 0; i < 8; i++)
+                    decl += std::string("#define ") + kSamplers[i] + " gSamplers[" + std::to_string(i) + "]\n";
+                source.replace(at, end + last.size() - at, decl);
+            }
+        }
+    }
+    return source;
+}
+
 void ShaderSetDestroy(Context& context, ShaderSet& set)
 {
     for (auto& [hash, shader] : set.shaders)
@@ -130,13 +159,13 @@ void ShaderWarmStart(const ShaderSet& set)
     (void)set; // the native test tools compile through the dxc executable and have no game data to scan
 #else
     // Only with the in-process compiler: the dxc.exe fallback shares one temporary file name.
-    if (getenv("FM2_VK_NO_SHADER_WARM") || getenv("FM2_VK_DXC_PROCESS") || set.cacheDir.empty() ||
+    if (getenv("REGPU_VK_NO_SHADER_WARM") || getenv("REGPU_VK_DXC_PROCESS") || set.cacheDir.empty() ||
         (!GetModuleHandleW(L"dxcompiler.dll") && !LoadLibraryW(L"dxcompiler.dll")) || g_warm.started.exchange(true))
         return;
     g_warm.cacheDir = set.cacheDir;
     const unsigned hardware = std::max(1u, std::thread::hardware_concurrency());
-    const unsigned threads = getenv("FM2_VK_SHADER_WARM_THREADS")
-        ? std::clamp<unsigned>(unsigned(atoi(getenv("FM2_VK_SHADER_WARM_THREADS"))), 1, 32)
+    const unsigned threads = getenv("REGPU_VK_SHADER_WARM_THREADS")
+        ? std::clamp<unsigned>(unsigned(atoi(getenv("REGPU_VK_SHADER_WARM_THREADS"))), 1, 32)
         : std::clamp<unsigned>(hardware / 2, 1, 16); // below normal priority: the game's own threads come first
     auto lowPriority = [] { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL); };
     for (unsigned i = 0; i < threads; i++)
@@ -169,15 +198,15 @@ void ShaderWarmStart(const ShaderSet& set)
     std::thread([lowPriority, threads] {
         lowPriority();
         std::vector<ScannedShader> found;
-        if (!getenv("FM2_NO_STATIC_SHADERS"))
+        if (!getenv("REGPU_NO_STATIC_SHADERS"))
         {
-            found = StaticShaders();
+            found = regpu::GetHost().staticShaders ? regpu::GetHost().staticShaders() : std::vector<ScannedShader>{};
             const size_t total = found.size();
             const size_t added = WarmEnqueue(found, false);
             Log("shader_vk: warm-up: %zu of %zu static shaders queued on %u threads", added, total, threads);
         }
         g_warm.staticListed = true;
-        const bool scan = getenv("FM2_NO_SHADER_SCAN") == nullptr;
+        const bool scan = getenv("REGPU_NO_SHADER_SCAN") == nullptr;
         uint32_t reported = 0;
         // The scan also finds load packets in the command buffer while the title is still writing them, and those
         // half-written shaders are different on every run: each start compiled some 50 of them and left their SPIR-V
@@ -190,11 +219,9 @@ void ShaderWarmStart(const ShaderSet& set)
             if (scan)
             {
                 found.clear();
+                // (ReGPU's scan reports a shader only once its bytes have held still: ShaderScanTake.)
                 for (ScannedShader& s : unconfirmed)
-                    if (memcmp(GuestPtr<uint32_t>(s.address), s.code.data(), s.code.size() * 4) == 0)
-                        found.push_back(std::move(s));
-                    else
-                        unstable++;
+                    found.push_back(std::move(s));
                 unconfirmed.clear();
                 WarmEnqueue(found, true);
                 ShaderScanNow(1);
@@ -249,8 +276,8 @@ const VkShader* ShaderBuild(Context* contextPtr, ShaderSet* setPtr, const std::f
     ShaderSet scratch;
     ShaderSet& set = warm ? scratch : *setPtr;
     // A debugging switch that edits shaders is set: the warm-up leaves the cache to the renderer.
-    static const bool debugSwitches = getenv("FM2_VK_DEBUG_PS_ALL") || getenv("FM2_VK_DEBUG_PS") || getenv("FM2_VK_DEBUG_VS") ||
-        getenv("FM2_VK_SHADER_OD");
+    static const bool debugSwitches = getenv("REGPU_VK_DEBUG_PS_ALL") || getenv("REGPU_VK_DEBUG_PS") || getenv("REGPU_VK_DEBUG_VS") ||
+        getenv("REGPU_VK_SHADER_OD");
     if (auto it = set.shaders.find(hash); it != set.shaders.end())
         return &it->second;
     if (warm && debugSwitches)
@@ -271,9 +298,9 @@ const VkShader* ShaderBuild(Context* contextPtr, ShaderSet* setPtr, const std::f
         return &entry;
     }
     shader.hlsl = translated.hlsl;
-    // FM2_DUMP_HLSL, as on the D3D12 path: keep each translated shader for reading (the Vulkan
+    // REGPU_DUMP_HLSL, as on the D3D12 path: keep each translated shader for reading (the Vulkan
     // backend translates in its own service, so the D3D12 side's dump never fired here).
-    if (!warm && getenv("FM2_DUMP_HLSL"))
+    if (!warm && getenv("REGPU_DUMP_HLSL"))
     {
         std::filesystem::create_directories("out/hlsl");
         char name[64];
@@ -309,16 +336,16 @@ const VkShader* ShaderBuild(Context* contextPtr, ShaderSet* setPtr, const std::f
 
     std::vector<uint32_t> spirv;
     std::string error;
-    // FM2_VK_DEBUG_PS=<hash>:<expr> / FM2_VK_DEBUG_PS_ALL=<expr>: replace a pixel shader's
-    // output, the Vulkan twin of the D3D12 path's FM2_DEBUG_PS (renderer.cpp). The expression
+    // REGPU_VK_DEBUG_PS=<hash>:<expr> / REGPU_VK_DEBUG_PS_ALL=<expr>: replace a pixel shader's
+    // output, the Vulkan twin of the D3D12 path's REGPU_DEBUG_PS (renderer.cpp). The expression
     // sees the shader's own locals — `input.o[6]`, `oC[0]`, `TFetch(...)` — so two backends can
     // be asked the same question about the same draw and the answers compared.
-    const bool debugAll = pixel && getenv("FM2_VK_DEBUG_PS_ALL");
-    const char* debugOne = pixel ? getenv("FM2_VK_DEBUG_PS") : nullptr;
+    const bool debugAll = pixel && getenv("REGPU_VK_DEBUG_PS_ALL");
+    const char* debugOne = pixel ? getenv("REGPU_VK_DEBUG_PS") : nullptr;
     const bool debugThis = debugOne && strtoull(debugOne, nullptr, 16) == hash;
     if (debugAll || debugThis)
     {
-        const char* expr = debugAll ? getenv("FM2_VK_DEBUG_PS_ALL") : strchr(debugOne, ':');
+        const char* expr = debugAll ? getenv("REGPU_VK_DEBUG_PS_ALL") : strchr(debugOne, ':');
         if (expr && expr[0] == ':')
             expr++;
         // "<hash>:@<block>:<statement>" inserts at the start of control-flow block <block>, the
@@ -359,11 +386,11 @@ const VkShader* ShaderBuild(Context* contextPtr, ShaderSet* setPtr, const std::f
             if (const size_t at = shader.hlsl.rfind("    return oC[0];"); at != std::string::npos)
                 shader.hlsl.replace(at, strlen("    return oC[0];"), std::string("    return ") + expr + ";");
     }
-    // FM2_VK_DEBUG_VS=<hash>:<statement> is the vertex-stage twin of D3D12's FM2_DEBUG_VS.
+    // REGPU_VK_DEBUG_VS=<hash>:<statement> is the vertex-stage twin of D3D12's REGPU_DEBUG_VS.
     // Append to the guest program, use @<block>:<statement> for a block, or @TEXT|STATEMENT to
     // insert after a source line. Separate statements with | to capture a value in one block.
-    // The D3D12 spelling FM2_DEBUG_VS is accepted too, so one command line asks both backends the same question.
-    const char* debugVertex = !pixel ? (getenv("FM2_VK_DEBUG_VS") ? getenv("FM2_VK_DEBUG_VS") : getenv("FM2_DEBUG_VS")) : nullptr;
+    // The D3D12 spelling REGPU_DEBUG_VS is accepted too, so one command line asks both backends the same question.
+    const char* debugVertex = !pixel ? (getenv("REGPU_VK_DEBUG_VS") ? getenv("REGPU_VK_DEBUG_VS") : getenv("REGPU_DEBUG_VS")) : nullptr;
     const bool debugVertexThis = debugVertex && strtoull(debugVertex, nullptr, 16) == hash;
     if (debugVertexThis)
         if (const char* statement = strchr(debugVertex, ':'))
@@ -397,17 +424,14 @@ const VkShader* ShaderBuild(Context* contextPtr, ShaderSet* setPtr, const std::f
     // A patched shader must not go into (or come out of) the disk cache under the guest's hash:
     // every probe would then compile the first patch and silently reuse it.
     const bool patched = debugAll || debugThis || debugVertexThis;
-    // FM2_VK_SHADER_OD=1, or a guest shader hash to change only that shader's optimisation.
-    const char* noOptimiseEnv = getenv("FM2_VK_SHADER_OD");
+    // REGPU_VK_SHADER_OD=1, or a guest shader hash to change only that shader's optimisation.
+    const char* noOptimiseEnv = getenv("REGPU_VK_SHADER_OD");
     const bool noOptimise = noOptimiseEnv && (atoi(noOptimiseEnv) == 1 || strtoull(noOptimiseEnv, nullptr, 16) == hash);
     // What is compiled: the translator's HLSL is the Direct3D 12 path's, byte for byte. Two things differ for SPIR-V.
-    // The register file becomes plain variables (RegistersAsVariables, as that path does before fxc): an indexable
-    // local array stays in memory on some drivers. And the bindless arrays get their real size, because an unsized
+    // (FM2's translator also rewrote the register file as plain variables here; ReGPU's keeps the array.) The bindless
+    // arrays get their real size, because an unsized
     // array would need the runtime-array capability for a set that is not variable-sized.
-    std::string source = RegistersAsVariables(shader.hlsl);
-    for (const auto& [from, to] : { std::pair<const char*, const char*>{ "gtex[] :", "gtex[65536] :" }, { "gcube[] :", "gcube[65536] :" } })
-        if (const size_t at = source.find(from); at != std::string::npos)
-            source.replace(at, strlen(from), to);
+    std::string source = AdaptHlsl(shader.hlsl);
     const uint64_t cacheKey = HashSource(source + (pixel ? "\nps_6_0" : "\nvs_6_0") + (noOptimise ? "\n-Od" : ""));
     if (warm)
     {

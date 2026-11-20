@@ -1,7 +1,7 @@
 #pragma once
 // Vulkan device plumbing for the native renderer: instance, device, queue, memory and the
 // one-shot command helpers everything else uses. No window and no swap chain yet: the
-// renderer renders to images and the presenter reads them back (FM2_HEADLESS), so the whole
+// renderer renders to images and the presenter reads them back (REGPU_HEADLESS), so the whole
 // backend is testable without a platform layer.
 #include <cstdint>
 #include <cstdio>
@@ -96,7 +96,7 @@ void UploadImage(const Context& context, const Image& image, const void* rgba, V
 // into a pooled staging buffer that stays alive until the GPU has finished; `record` receives that buffer. Queue
 // order makes the upload run before any later submission that samples the image, so nothing has to wait: a
 // vkQueueWaitIdle here stalls for the rest of the PREVIOUS frame's GPU time (12-17 ms for one 64x64 texture on an
-// integrated GPU, 22-42 ms on a discrete one). FM2_VK_SYNC_UPLOADS=1 restores the blocking behaviour for comparison.
+// integrated GPU, 22-42 ms on a discrete one). REGPU_VK_SYNC_UPLOADS=1 restores the blocking behaviour for comparison.
 // Uploads are batched: `record` also receives the offset of its bytes in the staging buffer, and nothing reaches the
 // queue until FlushUploads. EVERY vkQueueSubmit of commands that sample an uploaded image must flush first.
 bool SubmitUpload(const Context& context, VkImage target, const void* data, VkDeviceSize bytes,

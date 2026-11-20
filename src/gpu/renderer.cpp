@@ -68,6 +68,28 @@
 #include "regpu/driver.h"
 #include "png.h"
 #include "render/presenter.h"
+#if defined(REGPU_VULKAN)
+// Config::renderer = Vulkan (or REGPU_RENDERER=vulkan): the same seam, implemented in gpu/vk/renderer_vk.cpp (the FM2
+// port's Vulkan backend). The command processor calls these entry points either way.
+bool VulkanRendererEnabled();
+void RendererVkSavePipelineCache();
+void RendererVkOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords);
+void RendererVkSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t usedDwords, uint64_t hash);
+void RendererVkOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize);
+void RendererVkOnSwap(uint64_t frame, uint32_t frontBuffer);
+#define REGPU_VK_IF_ENABLED(call) \
+    if (VulkanRendererEnabled()) \
+    { \
+        call; \
+        return; \
+    }
+#else
+#define REGPU_VK_IF_ENABLED(call)
+inline bool VulkanRendererEnabled()
+{
+    return false;
+}
+#endif
 #include "gpu/renderer.h"
 #include "gpu/shader_scan.h"
 #include "gpu/resolve_pack.h"
@@ -12976,11 +12998,16 @@ void BootPresent(const std::vector<uint8_t>& rgba)
 
 void RendererPredictBegin()
 {
+    // The lookahead only queues Direct3D 12 pipelines: nothing would take them off the queue on Vulkan.
+    if (VulkanRendererEnabled())
+        return;
     PredictBeginImpl();
 }
 
 void RendererPredictShader(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
 {
+    if (VulkanRendererEnabled())
+        return;
     dwords = ucode::UsedDwords(microcodeBE, dwords);
     auto& hash = type == 0 ? g_predVs : g_predPs;
     auto& code = type == 0 ? g_predVsCode : g_predPsCode;
@@ -13001,6 +13028,8 @@ void RendererPredictShader(uint32_t type, const uint32_t* microcodeBE, uint32_t 
 
 void RendererPredictDraw(uint32_t initiator)
 {
+    if (VulkanRendererEnabled())
+        return;
     const uint32_t edramMode = gpureg::Get(RB_MODECONTROL) & 7;
     if ((edramMode != 4 && edramMode != 5) || !g_predVs || !g_predPs || !g_predVsDwords || !g_predPsDwords)
         return;
@@ -13044,10 +13073,15 @@ void RendererSaveCaches()
 {
     g_diskWriter.Flush();
     g_pipelineLibrary.MaybeSave(true);
+#if defined(REGPU_VULKAN)
+    if (VulkanRendererEnabled())
+        RendererVkSavePipelineCache();
+#endif
 }
 
 void RendererSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t usedDwords, uint64_t hash)
 {
+    REGPU_VK_IF_ENABLED(RendererVkSetShader(type, microcodeBE, usedDwords, hash))
     std::vector<uint32_t>& code = type == 0 ? C().vsCode : C().psCode;
     uint64_t& current = type == 0 ? C().vsHash : C().psHash;
     // Titles reload the bound shader before most draws: the same hash is the same used microcode, so
@@ -13061,6 +13095,7 @@ void RendererSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t used
 
 void RendererOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
 {
+    REGPU_VK_IF_ENABLED(RendererVkOnShaderLoad(type, microcodeBE, dwords))
     std::vector<uint32_t>& code = type == 0 ? C().vsCode : C().psCode;
     code.assign(microcodeBE, microcodeBE + ucode::UsedDwords(microcodeBE, dwords));
     (type == 0 ? C().vsHash : C().psHash) = Fnv(code.data(), code.size() * 4) ^ type;
@@ -14119,6 +14154,10 @@ void RendererFenceWait(uint64_t value, void* event)
 
 void RendererOcclusionBegin()
 {
+    // Not on Vulkan: this would start the whole Direct3D 12 renderer beside it for a query that never sees a draw.
+    // RendererOcclusionEnd then has no result, and the title gets the fixed answer (visible).
+    if (VulkanRendererEnabled())
+        return;
     if (!g_r.ok)
         Init();
     BeginFrameIfNeeded();
@@ -14197,6 +14236,8 @@ extern uint32_t g_logged;
 // (no result yet counts as visible: the caller answers 1000 samples).
 bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total, uint32_t address)
 {
+    if (VulkanRendererEnabled())
+        return false;
     const UINT order = g_occlusionOrder;
     const bool open = g_occlusionOpen;
     const bool known = OcclusionEndImpl(samples, total, address);
@@ -14259,6 +14300,8 @@ bool OcclusionEndImpl(uint32_t& samples, uint32_t& total, uint32_t address)
 // the D3D query around its draws in stream order (RendererOcclusionBegin for every start, EndOn at the end).
 bool RendererOcclusionAnswer(uint32_t& samples, uint32_t& total, uint32_t address, uint32_t kindOrder)
 {
+    if (VulkanRendererEnabled())
+        return false;
     return OcclusionLookup(samples, total, ~0u, { uint64_t(address) << 1 | 1, kindOrder }, false);
 }
 
@@ -14549,6 +14592,7 @@ void ScanVrTag()
 
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
+    REGPU_VK_IF_ENABLED(RendererVkOnDraw(initiator, dmaBase, dmaSize))
     ScanVrTag();
     if (StereoHudDraw())
     {
@@ -17952,6 +17996,7 @@ void RendererStereoCaptureEye(int eye, uint32_t frontBuffer)
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer);
 void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
 {
+    REGPU_VK_IF_ENABLED(RendererVkOnSwap(frameNumber, frontBuffer))
     const auto t0 = std::chrono::steady_clock::now();
     RendererOnSwapImpl(frameNumber, frontBuffer);
     const auto now = std::chrono::steady_clock::now();
@@ -19284,3 +19329,92 @@ std::string RendererDrawStats()
 }
 
 void regpu::SetGameWidescreen(bool on) { g_gameWidescreen.store(on, std::memory_order_relaxed); }
+
+// For the Vulkan backend (gpu/vk, renderer.h): the overlay, display gamma and compile counters it shares.
+bool RendererOverlayPixels(const uint8_t*& rgba, uint32_t& width, uint32_t& height, uint32_t& visibleHeight, uint64_t& version)
+{
+    static std::vector<uint32_t> pixels;
+    static std::string lastText;
+    static std::chrono::steady_clock::time_point lastRender{};
+    static uint64_t rendered = 0;
+    std::vector<std::string> lines;
+    if (!OverlayWanted(lines))
+        return false;
+    std::string text;
+    for (const auto& line : lines)
+        text += line + "\n";
+    const auto now = std::chrono::steady_clock::now();
+    if (pixels.empty() || (text != lastText && now - lastRender > std::chrono::milliseconds(200)))
+    {
+        RenderOverlayPixels(lines, pixels);
+        lastText = text;
+        lastRender = now;
+        rendered++;
+    }
+    rgba = reinterpret_cast<const uint8_t*>(pixels.data());
+    width = kOverlayW;
+    height = kOverlayH;
+    visibleHeight = kOverlayH;
+    version = rendered;
+    return pixels.size() == size_t(kOverlayW) * kOverlayH;
+}
+
+void RendererOverlayImage(uint32_t width, uint32_t height, std::vector<uint8_t>& rgba)
+{
+    if (rgba.size() != size_t(width) * height * 4)
+        return;
+    const uint8_t* source = nullptr;
+    uint32_t overlayWidth = 0, overlayHeight = 0, visibleHeight = 0;
+    uint64_t version = 0;
+    if (!RendererOverlayPixels(source, overlayWidth, overlayHeight, visibleHeight, version))
+        return;
+    const uint32_t copyWidth = std::min(overlayWidth, width > 24 ? width - 24 : 0);
+    const uint32_t copyHeight = std::min(visibleHeight, height > 24 ? height - 24 : 0);
+    for (uint32_t y = 0; y < copyHeight; y++)
+        memcpy(rgba.data() + (size_t(y + 24) * width + 24) * 4, source + size_t(y) * overlayWidth * 4, size_t(copyWidth) * 4);
+}
+
+bool RendererDisplayGamma(float points[17])
+{
+    if (!g_gammaSet.load(std::memory_order_relaxed))
+        return false;
+    bool identity = true;
+    for (uint32_t k = 0; k <= 16; k++)
+    {
+        const float at = k * 255.0f / 16.0f;
+        const uint32_t i = std::min(uint32_t(at), 254u);
+        const float t = at - float(i);
+        const float a = float((g_gammaTable[i].load(std::memory_order_relaxed) >> 10) & 0x3FF) / 1023.0f;
+        const float b = float((g_gammaTable[i + 1].load(std::memory_order_relaxed) >> 10) & 0x3FF) / 1023.0f;
+        points[k] = a + (b - a) * t;
+        identity &= std::fabs(points[k] - k / 16.0f) < 0.002f;
+    }
+    return !identity;
+}
+
+void RendererReportCompiles(const RendererCompileReport& r)
+{
+    g_stats.shadersBuilt = r.shadersBuilt;
+    g_stats.shadersCached = r.shadersCached;
+    g_stats.pipelinesBuilt = r.pipelinesBuilt;
+    g_stats.pipelinesLoaded = r.pipelinesCached;
+    {
+        std::lock_guard lock(g_stats.mutex);
+        if (r.running && !g_stats.busy.load())
+            g_stats.currentSince = std::chrono::steady_clock::now();
+        g_stats.current = r.what ? r.what : "";
+        g_stats.busy = int(r.running);
+    }
+    if (r.waited)
+        g_stats.lastColdMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    g_stats.warmDone = r.warmDone;
+    g_stats.warmTotal = r.warmTotal;
+    g_stats.staticDone = r.staticDone;
+    g_stats.staticTotal = r.staticTotal;
+}
+
+uint32_t RendererAnisotropy()
+{
+    const int request = g_anisoRequest.load(std::memory_order_relaxed);
+    return request >= 2 ? uint32_t(std::min(request, 16)) : 0u;
+}

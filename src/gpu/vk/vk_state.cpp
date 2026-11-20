@@ -113,8 +113,8 @@ bool CreatePipeline(const Context& context, const StateKey& key, VkShaderModule 
     multisample.alphaToCoverageEnable = alphaToMask ? VK_TRUE : VK_FALSE;
 
     VkPipelineDepthStencilStateCreateInfo depthStencil{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-    // FM2_NO_ZTEST turns the depth test off on both backends.
-    static const bool noDepth = getenv("FM2_NO_ZTEST") != nullptr;
+    // REGPU_NO_ZTEST turns the depth test off on both backends.
+    static const bool noDepth = getenv("REGPU_NO_ZTEST") != nullptr;
     depthStencil.depthTestEnable = !noDepth && ((depth >> 1) & 1) ? VK_TRUE : VK_FALSE;
     depthStencil.depthWriteEnable = (depth >> 2) & 1 ? VK_TRUE : VK_FALSE;
     depthStencil.depthCompareOp = Compare((depth >> 4) & 7);

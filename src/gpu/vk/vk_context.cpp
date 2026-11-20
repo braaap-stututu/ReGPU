@@ -49,7 +49,7 @@ bool NameContains(const char* name, const char* needle)
 bool SelectDevice(const std::vector<VkPhysicalDevice>& devices, uint32_t& selected)
 {
     selected = 0;
-    const char* pick = getenv("FM2_VK_DEVICE");
+    const char* pick = getenv("REGPU_VK_DEVICE");
     uint32_t chosen = 0;
     if (pick && *pick)
     {
@@ -67,7 +67,7 @@ bool SelectDevice(const std::vector<VkPhysicalDevice>& devices, uint32_t& select
                     { chosen = size_t(i); break; }
             }
         if (chosen == devices.size())
-            return Fail("FM2_VK_DEVICE", VK_ERROR_INITIALIZATION_FAILED);
+            return Fail("REGPU_VK_DEVICE", VK_ERROR_INITIALIZATION_FAILED);
     }
     selected = chosen;
     for (size_t i = 0; i < devices.size(); i++)
@@ -85,12 +85,12 @@ bool Init(Context& context, const std::filesystem::path& cacheDir)
     if (!vkldr::Load())
         return false;
     VkApplicationInfo app{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
-    app.pApplicationName = "fm2";
+    app.pApplicationName = "regpu";
     app.apiVersion = VK_API_VERSION_1_2;
     VkInstanceCreateInfo ici{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     ici.pApplicationInfo = &app;
     const char* validationLayer = "VK_LAYER_KHRONOS_validation";
-    if (getenv("FM2_VK_VALIDATION"))
+    if (getenv("REGPU_VK_VALIDATION"))
     {
         ici.enabledLayerCount = 1;
         ici.ppEnabledLayerNames = &validationLayer;
@@ -313,10 +313,11 @@ bool CreateRendererLayout(const Context& context, VkPipelineLayout& layout, VkDe
     bind(1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, both); // PSConstants
     bind(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 100, both); // gmem
     bind(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 101, both); // gphys (guest memory)
-    // The four guest samplers are ONE array binding (hlsl.cpp: SamplerState gSamplers[4] : register(s0)), indexed by
-    // the fetch's mode, so a fetch is one sample instruction instead of a branch to each of four.
+    // The eight samplers are ONE array binding: ReGPU's translator declares s0-s7 (linear wrap, linear clamp, point
+    // clamp, point wrap, then linear wrap at 2x, 4x, 8x and 16x anisotropy), which vk_shaders.cpp rewrites as
+    // SamplerState gSamplers[8] : register(s0) before compiling.
     bind(4, VK_DESCRIPTOR_TYPE_SAMPLER, 200, both);
-    sets0[4].descriptorCount = 4;
+    sets0[4].descriptorCount = 8;
     VkDescriptorSetLayoutCreateInfo i0{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     i0.bindingCount = 5;
     i0.pBindings = sets0;
@@ -328,7 +329,7 @@ bool CreateRendererLayout(const Context& context, VkPipelineLayout& layout, VkDe
     VkDescriptorSetLayoutBinding array{};
     array.binding = 0;
     array.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    array.descriptorCount = getenv("FM2_SMALL_DESCRIPTOR_LAYOUT") ? uint32_t(atoi(getenv("FM2_SMALL_DESCRIPTOR_LAYOUT"))) : 1u << 16;
+    array.descriptorCount = getenv("REGPU_SMALL_DESCRIPTOR_LAYOUT") ? uint32_t(atoi(getenv("REGPU_SMALL_DESCRIPTOR_LAYOUT"))) : 1u << 16;
     array.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorBindingFlags flags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
     VkDescriptorSetLayoutBindingFlagsCreateInfo bf{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO };
@@ -343,10 +344,11 @@ bool CreateRendererLayout(const Context& context, VkPipelineLayout& layout, VkDe
     if (vkCreateDescriptorSetLayout(context.device, &ia, nullptr, &arrayLayout) != VK_SUCCESS)
         return false;
 
-    VkDescriptorSetLayout sets[3] = { set0, arrayLayout, arrayLayout };
+    // Sets 1-3: the 2D, cube and 3D bindless arrays (hlsl.cpp gtex, gcube, gvol in spaces 1-3).
+    VkDescriptorSetLayout sets[4] = { set0, arrayLayout, arrayLayout, arrayLayout };
     VkPushConstantRange push{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16 };
     VkPipelineLayoutCreateInfo pli{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    pli.setLayoutCount = 3;
+    pli.setLayoutCount = 4;
     pli.pSetLayouts = sets;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &push;
@@ -472,7 +474,7 @@ namespace
 {
 // Image memory comes from 64 MB blocks instead of one vkAllocateMemory per image: on the NVIDIA driver each
 // allocation costs about a millisecond (17 first-use textures in a frame: 11.9 ms inside CreateImage, against
-// 0.03 ms each on RADV). Freed ranges are reused by the next image that fits. FM2_VK_NO_IMAGE_POOL=1 restores a
+// 0.03 ms each on RADV). Freed ranges are reused by the next image that fits. REGPU_VK_NO_IMAGE_POOL=1 restores a
 // dedicated allocation per image.
 struct ImagePoolBlock
 {
@@ -492,7 +494,7 @@ constexpr VkDeviceSize kImagePoolBlock = 64ull << 20, kImagePoolLargest = 8ull <
 
 bool ImagePoolAllocate(const Context& context, const VkMemoryRequirements& req, uint32_t type, Image& image)
 {
-    static const bool disabled = getenv("FM2_VK_NO_IMAGE_POOL") != nullptr;
+    static const bool disabled = getenv("REGPU_VK_NO_IMAGE_POOL") != nullptr;
     if (disabled || req.size > kImagePoolLargest || !req.alignment)
         return false;
     // A freed range first: the smallest one that fits, so sizes that recur (most do) are reused exactly.
@@ -590,8 +592,8 @@ Image CreateImage(const Context& context, uint32_t width, uint32_t height, VkFor
     // DEVICE_LOCAL, explicitly. Asking for no properties takes the FIRST compatible type, and on the NVIDIA driver that
     // is type 0: system memory (heap 1, not device-local), which accepts colour and depth images. Every render target,
     // depth buffer and texture would then live in system RAM and be reached over PCIe, at two to three times the frame
-    // time. RADV's first type is device-local. FM2_VK_IMAGE_SYSTEM_MEMORY=1 takes the first compatible type instead.
-    static const bool systemImages = getenv("FM2_VK_IMAGE_SYSTEM_MEMORY") != nullptr;
+    // time. RADV's first type is device-local. REGPU_VK_IMAGE_SYSTEM_MEMORY=1 takes the first compatible type instead.
+    static const bool systemImages = getenv("REGPU_VK_IMAGE_SYSTEM_MEMORY") != nullptr;
     ai.memoryTypeIndex = systemImages ? UINT32_MAX : FindMemory(context, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (ai.memoryTypeIndex == UINT32_MAX)
         ai.memoryTypeIndex = FindMemory(context, req.memoryTypeBits, 0);
@@ -843,7 +845,7 @@ void UploadsWaitForImage(const Context& context, VkImage image)
 bool SubmitUpload(const Context& context, VkImage target, const void* data, VkDeviceSize bytes,
     const std::function<void(VkCommandBuffer, VkBuffer, VkDeviceSize)>& record)
 {
-    static const bool synchronous = getenv("FM2_VK_SYNC_UPLOADS") != nullptr;
+    static const bool synchronous = getenv("REGPU_VK_SYNC_UPLOADS") != nullptr;
     WallMs timed(g_uploadRecordMs);
     if (!data || !bytes || !UploadFencesUsable(UploadFences(context)))
         return false;
