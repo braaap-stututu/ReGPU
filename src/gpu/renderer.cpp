@@ -4224,6 +4224,10 @@ struct IndexArena
         D3D12_GPU_VIRTUAL_ADDRESS staged = 0; // this frame's copy in the upload ring (frame stagedFrame)
         uint64_t stagedFrame = ~0ull;
         bool changing = false; // seen changing: checked at every draw, not once a frame
+        bool watched = false;  // its pages write-watched since its copy (GetIndexBuffer: no hash while clean)
+        uint64_t copiedSeq = 0;
+        uint32_t rearms = 0;          // re-armed with the same indices (its pages written by other data)
+        uint64_t unwatchedUntil = 0;  // ... too often: hashed, not watched, until this frame
     };
     std::unordered_map<uint64_t, Entry> entries;
     bool full = false;
@@ -4509,7 +4513,7 @@ uint64_t VertexCache(uint32_t address, uint32_t bytes, bool& arenaHit)
 
 // The view of the guest index buffer at physical address `base` (count indices), swapped
 // into the arena; false when it cannot be cached (the draw fetches indices itself).
-bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view, uint64_t hash);
+bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view);
 thread_local bool g_indexChanging = false; // set by GetIndexBufferLocked: the entry is checked at every draw
 // Each thread remembers this frame's index buffers (checked once per frame), except ones seen changing.
 // ---- Hyper mesh decimation and vertex-cache order (from the FM2 port's hyper-prototype, MIT; FM3 port session 43).
@@ -4820,12 +4824,11 @@ bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D
     const uint32_t bytes = count * (is32 ? 4 : 2);
     if (!bytes || bytes > (16u << 20))
         return false;
-    static LiveSwitch sampledIndexHash("REGPU_INDEX_SAMPLED_HASH");
-    const uint8_t* src = GuestPtr<uint8_t>(GpuPhysToGuest(base));
-    const uint64_t hash = sampledIndexHash ? ContentHash(src, bytes) : FullHash(src, bytes);
+    // (The indices are hashed, when they must be, under the lock with the entry's one lookup (PGR3 session 5: the
+    // watch's separate lookup was ~1.8% of the draw thread); the draw thread translates draws alone by default.)
     std::lock_guard textureLock(g_textureMutex);
     g_indexChanging = false;
-    if (!GetIndexBufferLocked(base, count, is32, endian, view, hash))
+    if (!GetIndexBufferLocked(base, count, is32, endian, view))
         return false;
     if (!g_indexChanging)
     {
@@ -4836,7 +4839,7 @@ bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D
     return true;
 }
 
-bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view, uint64_t hash)
+bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view)
 {
     IndexArena& arena = g_indexArena;
     const uint32_t bytes = count * (is32 ? 4 : 2);
@@ -4897,12 +4900,61 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
     }
     e.checkedFrame = g_r.frame;
     const uint8_t* src = GuestPtr<uint8_t>(GpuPhysToGuest(base));
+    // Write-watched (PGR3 port, session 5; the vertex arena's Host::watchArm/watchClean): an index buffer copied into the
+    // arena has its pages made read-only, and while none of them was written since, its indices are not hashed again
+    // (the full hash of every index buffer once a frame was ~3% of PGR3's draw thread in races). Buffers seen changing
+    // are hashed at every draw, as before. REGPU_NO_INDEX_WATCH=1 (live): hashed once a frame, as before.
+    static LiveSwitch sampledIndexHash("REGPU_INDEX_SAMPLED_HASH");
+    static LiveSwitch noIndexWatch("REGPU_NO_INDEX_WATCH");
+    const regpu::Host& watchHost = regpu::GetHost();
+    bool clean = !inserted && !noIndexWatch && !sampledIndexHash && e.watched && !e.changing && watchHost.watchClean &&
+        watchHost.watchClean(base & 0x1FFFFFFF, bytes, e.copiedSeq);
+    uint64_t hash = clean ? 0 : sampledIndexHash ? ContentHash(src, bytes) : FullHash(src, bytes);
+    // REGPU_INDEX_VERIFY=1 (diagnostic, live): a buffer the watch calls unchanged is hashed anyway; one that changed with
+    // no write seen is logged (the first 20) and copied.
+    if (static LiveSwitch verify("REGPU_INDEX_VERIFY"); verify && clean && !inserted)
+    {
+        static std::atomic<uint64_t> checked{ 0 };
+        if (const uint64_t now = FullHash(src, bytes); now != e.hash)
+        {
+            static int logged = 0;
+            if (logged++ < 20)
+                Log("index watch: %08X (%u bytes, frame %llu) changed with no write seen", base, bytes, (unsigned long long)g_r.frame);
+            clean = false;
+            hash = now;
+        }
+        if (++checked % 200000 == 0)
+            Log("index watch: %llu clean answers verified", (unsigned long long)checked.load());
+    }
     // (hash: every index, not a sample, made by GetIndexBuffer before the lock: a game that streams new
     // geometry into the same address and size can change only words between the samples, and the old
     // indices drew on (FM2 port, report #4: black wedges of track). REGPU_INDEX_SAMPLED_HASH=1 samples
     // every 256 bytes as before (A/B).)
-    if (!inserted && hash == e.hash)
+    // (Watching: pages made read-only before the copy, so a write after it faults and is seen; armed again when a write
+    // left the indices as they were. Not for buffers seen changing: they would fault on every write.)
+    const regpu::Host& host = regpu::GetHost();
+    static LiveSwitch noWatch("REGPU_NO_INDEX_WATCH");
+    auto arm = [&] {
+        e.watched = false;
+        if (!noWatch && !e.changing && host.watchArm && host.watchSeq && g_r.frame >= e.unwatchedUntil)
+        {
+            e.copiedSeq = host.watchSeq() + 1;
+            e.watched = host.watchArm(base & 0x1FFFFFFF, bytes);
+        }
+    };
+    if (!inserted && (clean || hash == e.hash))
     {
+        // (Pages written by other data each frame would fault and be armed again each frame: after 4 such in a row the
+        // buffer is hashed for 600 frames instead.)
+        if (!clean && e.hash)
+        {
+            if (e.watched && ++e.rearms >= 4)
+                e.rearms = 0, e.unwatchedUntil = g_r.frame + 600, e.watched = false;
+            else
+                arm();
+        }
+        else if (clean)
+            e.rearms = 0;
         if (e.stagedFrame == g_r.frame)
             view.BufferLocation = e.staged;
         return true;
@@ -4912,6 +4964,7 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
         e.changing = true;
         g_indexChanging = !checkOnce;
     }
+    arm();
     // Swap into the upload ring (as the vertex shader would read them), then copy.
     const UINT64 offset = RingAlloc((bytes + 15) & ~15u, 16, RingIndexBuffer);
     if (offset == ~0ull)
