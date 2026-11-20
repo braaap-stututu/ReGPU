@@ -175,14 +175,31 @@ std::atomic<bool> g_started{ false };
 alignas(64) std::atomic<int> g_headWaiters{ 0 };
 alignas(64) std::atomic<int> g_tailWaiters{ 0 };
 const bool g_alwaysNotify = getenv("REGPU_ALWAYS_NOTIFY") != nullptr;
+// REGPU_HANDOFF_SPIN=<n> (start-time, read at static init: set it in the process environment): each side first spins
+// n pauses (~15 ns each on Zen 4) for the other before it sleeps. A drain (8 a frame in PGR3) costs two wake-ups, the
+// command processor's and then the draw thread's, ~10-20 us each; spinning catches most of them awake (PGR3 port,
+// session 4). Default 2000; 0 = sleep at once, as before.
+const int g_handoffSpin = getenv("REGPU_HANDOFF_SPIN") ? std::max(0, atoi(getenv("REGPU_HANDOFF_SPIN"))) : 2000;
 void WaitHead(uint64_t old)
 {
+    for (int i = 0; i < g_handoffSpin; i++)
+    {
+        if (g_head.load(std::memory_order_acquire) != old)
+            return;
+        _mm_pause();
+    }
     g_headWaiters.fetch_add(1, std::memory_order_seq_cst);
     g_head.wait(old, std::memory_order_seq_cst);
     g_headWaiters.fetch_sub(1, std::memory_order_relaxed);
 }
 void WaitTail(uint64_t old)
 {
+    for (int i = 0; i < g_handoffSpin; i++)
+    {
+        if (g_tail.load(std::memory_order_acquire) != old)
+            return;
+        _mm_pause();
+    }
     g_tailWaiters.fetch_add(1, std::memory_order_seq_cst);
     g_tail.wait(old, std::memory_order_seq_cst);
     g_tailWaiters.fetch_sub(1, std::memory_order_relaxed);
@@ -232,16 +249,25 @@ void End(uint32_t words)
 
 // Waits until the worker has done everything logged so far.
 std::atomic<uint64_t> g_drains{ 0 }, g_drainWaits{ 0 };
-void Drain()
+// REGPU_PERF: microseconds the command processor waited in drains, by call site (0 COND_WRITE, 1 WAIT_REG_MEM,
+// 2 INTERRUPT, 3 = the time the command-stream interrupt handlers ran; 4 = the interrupt's wait for the fence writes
+// before it, PendingWrites::Drain).
+std::atomic<uint64_t> g_drainUs[5];
+void Drain(int site = 3)
 {
     if (!g_started.load(std::memory_order_acquire))
         return;
     g_drains++;
-    if (g_tail.load(std::memory_order_acquire) != g_head.load(std::memory_order_relaxed))
+    const bool waits = g_tail.load(std::memory_order_acquire) != g_head.load(std::memory_order_relaxed);
+    if (waits)
         g_drainWaits++;
+    const auto t0 = waits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const uint64_t head = g_head.load(std::memory_order_relaxed);
     for (uint64_t tail; (tail = g_tail.load(std::memory_order_acquire)) != head;)
         WaitTail(tail);
+    if (waits)
+        g_drainUs[site & 3].fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count()),
+            std::memory_order_relaxed);
 }
 
 bool Active() { return g_enabled && g_started.load(std::memory_order_relaxed); }
@@ -1513,7 +1539,7 @@ uint32_t ExecutePacket(uint32_t ptr)
             seg::Flush();
         const uint32_t info = arg(0);
         if (info & 0x10) // a memory poll may read a fence the worker writes
-            work::Drain();
+            work::Drain(0);
         const uint32_t value = (info & 0x10) ? ReadBack(arg(1)) : Reg(arg(1));
         if (WaitCompare(info & 7, value & arg(3), arg(2)))
         {
@@ -1534,8 +1560,50 @@ uint32_t ExecutePacket(uint32_t ptr)
         // condition already holds (most waits are for values the title set).
         // REGPU_NO_WAIT_DRAIN=1 (live, test): no drain here; the wait polls while the draw thread runs on.
         static LiveSwitch noWaitDrain("REGPU_NO_WAIT_DRAIN");
-        if ((info & 0x10) && !noWaitDrain && !WaitCompare(info & 7, ReadBack(arg(1)) & arg(3), arg(2)))
-            work::Drain();
+        const bool holdsNow = !(info & 0x10) || WaitCompare(info & 7, ReadBack(arg(1)) & arg(3), arg(2));
+        // REGPU_VBLANK_ON_WAIT: the vblank asked for before the drain, so its round trip (the vblank thread, the
+        // handler on the interrupt thread) overlaps the draw thread's catching up instead of following it (PGR3 port:
+        // the drains here were ~89% of the command processor's time in a race). REGPU_VBLANK_KICK_AFTER_DRAIN=1: after.
+        static LiveSwitch kickAfterDrain("REGPU_VBLANK_KICK_AFTER_DRAIN");
+        if (!holdsNow && !kickAfterDrain && VblankOnWait())
+            SetEvent(VblankKickEvent());
+        if (!holdsNow && !noWaitDrain)
+        {
+            const auto d0 = std::chrono::steady_clock::now();
+            work::Drain(1);
+            // REGPU_PERF: the drained waits by address (every 2 s, the top 6): microseconds drained, how many, and how
+            // many still did not hold after the drain.
+            static LiveSwitch perfDrains("REGPU_PERF");
+            if (perfDrains)
+            {
+                struct D
+                {
+                    uint64_t us = 0, n = 0, after = 0;
+                    uint32_t ref = 0;
+                };
+                static std::map<uint32_t, D> byAddress;
+                static auto lastLog = Clock::now();
+                D& d = byAddress[arg(1)];
+                d.us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - d0).count());
+                d.n++, d.ref = arg(2);
+                d.after += !WaitCompare(info & 7, ReadBack(arg(1)) & arg(3), arg(2));
+                if (Clock::now() - lastLog > std::chrono::seconds(2))
+                {
+                    lastLog = Clock::now();
+                    std::vector<std::pair<uint64_t, uint32_t>> top;
+                    for (auto& [a, x] : byAddress)
+                        top.push_back({ x.us, a });
+                    std::sort(top.rbegin(), top.rend());
+                    for (size_t i = 0; i < top.size() && i < 6; i++)
+                    {
+                        const D& x = byAddress[top[i].second];
+                        Log("perf: drained for WAIT_REG_MEM mem %08X (fn %u ref %08X): %.1f ms, %llu times, %llu still waiting after", top[i].second,
+                            info & 7, x.ref, x.us / 1000.0, (unsigned long long)x.n, (unsigned long long)x.after);
+                    }
+                    byAddress.clear();
+                }
+            }
+        }
         g_gpu.waitingOn = arg(1);
         g_gpu.waitingRef = arg(2);
         g_gpu.waitingInfo = info;
@@ -1617,9 +1685,14 @@ uint32_t ExecutePacket(uint32_t ptr)
         // REGPU_NO_INTERRUPT_DRAIN=1 (live, test): the handler runs without waiting for the draw thread.
         static LiveSwitch noInterruptDrain("REGPU_NO_INTERRUPT_DRAIN");
         if (!noInterruptDrain)
-            work::Drain(); // after the draws before it, like the hardware
+            work::Drain(2); // after the draws before it, like the hardware
         if (!g_noFenceOrder)
+        {
+            const auto t0 = std::chrono::steady_clock::now();
             PendingWrites::Drain(); // and after the fence writes before it
+            work::g_drainUs[4].fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count()),
+                std::memory_order_relaxed);
+        }
         for (uint32_t cpu = 0; cpu < 6; cpu++)
         {
             if ((arg(0) >> cpu) & 1)
@@ -1627,7 +1700,10 @@ uint32_t ExecutePacket(uint32_t ptr)
                 // Synchronous, like the hardware: the handler runs on this
                 // thread before the command processor reads on.
                 g_gpu.interruptsRaised++;
+                const auto h0 = std::chrono::steady_clock::now();
                 DispatchInterrupt(*t_cpContext, 1, cpu);
+                work::g_drainUs[3].fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - h0).count()),
+                    std::memory_order_relaxed);
                 g_gpu.interruptsHandled++;
             }
         }
@@ -1928,8 +2004,12 @@ void CommandProcessorLoop(PPCContext& ctx)
                     uint64_t busy = 0;
                     if (workerHandle && GetThreadTimes(workerHandle, &c, &e, &k, &u))
                         busy = (uint64_t(k.dwHighDateTime) << 32 | k.dwLowDateTime) + (uint64_t(u.dwHighDateTime) << 32 | u.dwLowDateTime);
-                    Log("perf: draw worker: %.0f%% busy, %llu drains (%llu waited) in 2 s", (busy - lastBusy) / 1e7 / 2.0 * 100.0,
-                        (unsigned long long)work::g_drains.exchange(0), (unsigned long long)work::g_drainWaits.exchange(0));
+                    Log("perf: draw worker: %.0f%% busy, %llu drains (%llu waited) in 2 s; waited ms: cond write %.1f, "
+                        "wait reg mem %.1f, interrupt %.1f, interrupt handlers (run, not waited) %.1f, interrupt's fence writes %.1f",
+                        (busy - lastBusy) / 1e7 / 2.0 * 100.0,
+                        (unsigned long long)work::g_drains.exchange(0), (unsigned long long)work::g_drainWaits.exchange(0),
+                        work::g_drainUs[0].exchange(0) / 1000.0, work::g_drainUs[1].exchange(0) / 1000.0, work::g_drainUs[2].exchange(0) / 1000.0,
+                        work::g_drainUs[3].exchange(0) / 1000.0, work::g_drainUs[4].exchange(0) / 1000.0);
                     lastBusy = busy;
                 }
             }
