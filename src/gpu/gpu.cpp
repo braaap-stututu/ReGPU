@@ -1028,10 +1028,13 @@ uint32_t ExecutePacket(uint32_t ptr)
         const bool end = (c[4] == finished && c[5] == finished) || (c[2] == finished && c[3] == finished);
         static int logged = 0;
         static LiveSwitch traceZpd("REGPU_TRACE_ZPD"); // (a getenv per query was ~1% of the command processor)
-        if (logged < 12 && traceZpd)
+        if (!traceZpd)
+            logged = 0; // (12 more each time it is switched on)
+        else if (logged < 12)
         {
             logged++;
-            Log("zpd: %08X %08X %08X %08X %08X %08X %08X %08X%s", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], end ? " (end)" : "");
+            Log("zpd: %08X %08X %08X %08X %08X %08X %08X %08X%s, RB_SAMPLE_COUNT_CTL %08X", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
+                end ? " (end)" : "", gpureg::Get(0x2324));
         }
         // Real counts when draws are recorded here in stream order (not with the draw thread
         // or workers, whose lists the query would not wrap): the sun flare fades behind trees.
