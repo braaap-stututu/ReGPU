@@ -216,6 +216,18 @@ struct PassScaleSnapshot
     float passScale = 1, scaleY = 1, scaleWide = 1, scaleX = 1;
 };
 const PassScaleSnapshot& PassScales();
+// Which other parts of the constant blocks a shader's code reads (TranslatedShader::readsBools ...), from its final
+// HLSL past the preamble: the names it would read them by. A false match only writes a part it doesn't need.
+void ScanBlockUse(TranslatedShader& info)
+{
+    const std::string& h = info.hlsl;
+    const size_t from = std::min(info.bodyStart, h.size());
+    auto has = [&](const char* t) { return h.find(t, from) != std::string::npos; };
+    info.readsBools = has("vb") || has("pb") || has("BoolConstant");
+    info.readsLoops = has("vl[") || has("pl[");
+    info.readsFetchLayout = has("vfl") || has("VFetchK") || has("VMerge");
+    info.readsUser = has("vuser");
+}
 uint32_t BigPassSize() { return PassScales().big; }
 uint32_t PassWidth() { return PassScales().width; }
 // Another MSAA view of the tall pass's EDRAM: a title can clear the stencil of its 1x
@@ -4280,6 +4292,10 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
                 cs.info.constantsUsed = base.info.constantsUsed; // same ALU code
                 cs.info.constantMask = base.info.constantMask;
                 cs.info.interpolatorsWritten = base.info.interpolatorsWritten;
+                cs.info.readsBools = base.info.readsBools; // same code
+                cs.info.readsLoops = base.info.readsLoops;
+                cs.info.readsUser = base.info.readsUser;
+                cs.info.readsFetchLayout = true; // its layout comes from vfl
                 cs.info.vertexFetchLayout = std::move(layout.vertexFetchLayout);
                 cs.info.vertexFetchConstants = std::move(layout.vertexFetchConstants);
                 cs.cacheKey = base.cacheKey;
@@ -4319,6 +4335,7 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
     // The game's own fixes to this shader (regpu.h Host::rewriteShader).
     if (const auto rewrite = regpu::GetHost().rewriteShader)
         cs.tag = rewrite(hash, cs.info.hlsl, pixel);
+    ScanBlockUse(cs.info);
     if (g_dumpHlsl)
     {
         std::filesystem::create_directories("out/hlsl");
@@ -12188,15 +12205,27 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             static LiveSwitch byRangeSwitch("REGPU_FETCH_TABLE_BY_RANGE");
             const bool byRange = byRangeSwitch;
             const uint32_t slots = byRange && usedSlots ? 32 - uint32_t(__builtin_clz(usedSlots)) : 0;
+            // Bool and loop constants, the fetch layout and the game's vuser constants only for shaders that read
+            // them (ScanBlockUse): unread, they were ~400 of ~1,470 bytes a draw (FM3, session 30); everything
+            // for a hooked draw or a live shader edit. REGPU_WRITE_UNREAD_PARTS=1 writes them all again (A/B).
+            static LiveSwitch writeUnreadSwitch("REGPU_WRITE_UNREAD_PARTS");
+            const bool all = writeUnreadSwitch || hooked || IsPsEditAlias(C().psHash);
+            auto span = [](size_t from, size_t to, bool on) { return on ? std::pair<size_t, size_t>{ from, to } : std::pair<size_t, size_t>{ from, from }; };
+            const bool vsHook = hooked; // vsFrom = 0: c[] goes from the stage too
             const std::pair<size_t, size_t> vsRanges[] = {
-                { vsFrom, offsetof(VSConstants, vf) },
+                span(vsFrom, offsetof(VSConstants, b), vsHook),
+                span(offsetof(VSConstants, b), offsetof(VSConstants, l), all || vs.info.readsBools),
+                span(offsetof(VSConstants, l), offsetof(VSConstants, vf), all || vs.info.readsLoops),
                 { offsetof(VSConstants, vf), offsetof(VSConstants, vf) + (byRange ? fetches : 0) * sizeof(vc->vf[0]) },
                 { offsetof(VSConstants, info), offsetof(VSConstants, vfl) },
-                { offsetof(VSConstants, vfl), offsetof(VSConstants, vfl) + layouts * sizeof(vc->vfl[0]) },
-                { offsetof(VSConstants, vuser), sizeof(VSConstants) },
+                span(offsetof(VSConstants, vfl), offsetof(VSConstants, vfl) + layouts * sizeof(vc->vfl[0]), all || vs.info.readsFetchLayout),
+                span(offsetof(VSConstants, vuser), offsetof(VSConstants, vdepth), all || vs.info.readsUser),
+                { offsetof(VSConstants, vdepth), sizeof(VSConstants) },
             };
             const std::pair<size_t, size_t> psRanges[] = {
-                { psFrom, offsetof(PSConstants, tinfo) },
+                span(psFrom, offsetof(PSConstants, l), all || ps.info.readsBools),
+                span(offsetof(PSConstants, l), offsetof(PSConstants, info), all || ps.info.readsLoops),
+                { offsetof(PSConstants, info), offsetof(PSConstants, tinfo) },
                 { offsetof(PSConstants, tinfo), offsetof(PSConstants, tinfo) + slots * sizeof(pc->tinfo[0]) },
                 { offsetof(PSConstants, tbias), offsetof(PSConstants, tbias) + slots * sizeof(pc->tbias[0]) },
             };
