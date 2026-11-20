@@ -23,7 +23,7 @@ struct Settings
     int helpers = -1;       // percent, 25-100
     int resolve1010 = -1;   // 0 or 1
     int aniso = -1;         // 0, 2, 4, 8 or 16
-    int decimate = -1;      // percent of triangles kept (needs meshoptimizer: not built in this tree)
+    int decimate = -1;      // percent of triangles kept (needs meshoptimizer, REGPU_MESHOPT_DIR)
     int cullPixels = -1;    // -1 off, else the pixel threshold
     int freeze = -1;        // frames before a 3D helper view freezes, 0 off
     int shaderCuts = -1;    // 0 or 1: the lossless shader cuts as one group

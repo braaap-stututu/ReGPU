@@ -101,6 +101,15 @@ target_compile_definitions(regpu PUBLIC ${REGPU_GUEST_DEFINES})
 target_include_directories(regpu PRIVATE src "${REGPU_GENERATED}")
 # VR through OpenXR (src/render/xr.cpp, REGPU_VR=screen): the OpenXR SDK's include/openxr headers. The loader DLL is
 # loaded at run time (openxr_loader.dll beside the exe), so nothing links against it.
+# Hyper's mesh decimation and vertex-cache order (src/gpu/renderer.cpp hyperdec, FM3 port session 43): meshoptimizer
+# (MIT, github.com/zeux/meshoptimizer) compiled in when its folder is given; empty: built without (the cuts log so).
+set(REGPU_MESHOPT_DIR "" CACHE PATH "meshoptimizer source folder (with src/meshoptimizer.h)")
+if(REGPU_MESHOPT_DIR AND EXISTS "${REGPU_MESHOPT_DIR}/src/meshoptimizer.h")
+    file(GLOB REGPU_MESHOPT_SOURCES "${REGPU_MESHOPT_DIR}/src/*.cpp")
+    target_sources(regpu PRIVATE ${REGPU_MESHOPT_SOURCES})
+    target_compile_definitions(regpu PRIVATE REGPU_MESHOPT=1)
+    target_include_directories(regpu PRIVATE "${REGPU_MESHOPT_DIR}/src")
+endif()
 set(REGPU_OPENXR_DIR "" CACHE PATH "OpenXR SDK folder with include/openxr/openxr.h (VR; empty: built without)")
 if(REGPU_OPENXR_DIR AND EXISTS "${REGPU_OPENXR_DIR}/include/openxr/openxr.h")
     target_compile_definitions(regpu PRIVATE REGPU_OPENXR=1)

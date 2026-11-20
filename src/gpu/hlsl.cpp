@@ -849,6 +849,8 @@ struct Emitter
             // FM4 port. REGPU_NO_MINI_CONST=1 takes the mini's own field again (A/B; read at translation).
             static const bool miniOwnConst = getenv("REGPU_NO_MINI_CONST") != nullptr;
             const uint32_t constIndex = f.isMini && !miniOwnConst ? lastConst : f.constIndex;
+            if (!f.isMini && !result.positionFetch[0])
+                result.positionFetch = { constIndex + 1, f.format | (f.isSigned ? 0x100u : 0), lastStride, f.offset };
             // The index register, or (ScanFetchIndex) the value the full fetch kept before overwriting it.
             const std::string indexReg = "r[" + std::to_string(lastSrc) + "]." + "xyzw"[lastSrcSwizzle & 3];
             const std::string indexSrc = saveFetchIndex ? "vfi" : indexReg;
@@ -1558,6 +1560,7 @@ bool TranslateVertexFetchLayout(const Shader& shader, TranslatedShader& out)
             break;
     }
     out.vertexFetchLayout = std::move(result.vertexFetchLayout);
+    out.positionFetch = result.positionFetch;
     out.vertexFetchConstants = std::move(result.vertexFetchConstants);
     return true;
 }

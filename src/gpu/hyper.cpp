@@ -139,7 +139,13 @@ void Configure(const Settings& settings)
         Default("REGPU_HYPER_SWIZZLE_SEL", "1");
         Default("REGPU_HYPER_TAILSPEC", "1");
         Default("REGPU_HYPER_RESOLVE_BY_SIZE", "1");
+        Default("REGPU_HYPER_VCACHE", "2"); // triangles reordered for the vertex cache and overdraw (lossless; meshoptimizer)
     }
+
+    // Mesh decimation (meshoptimizer): big meshes keep this percent of their triangles. Extreme 25, Potato 10.
+    const int decimate = Value("REGPU_HYPER_DECIMATE", g_settings.decimate, p == Preset::Extreme ? 25 : p == Preset::Potato ? 10 : 0);
+    if (decimate > 0 && decimate < 100)
+        Default("REGPU_HYPER_DECIMATE", decimate);
 
     // Draw culling by pixel count (Potato 256 px, with the probe, 200% hysteresis and the pin: the version that
     // gained on both Intel and AMD and does not flicker).
@@ -228,6 +234,10 @@ void LogSummary()
     if (on("REGPU_HYPER_FREEZE"))
         Log("hyper: 3D helper views frozen after %s frames, redrawn every %s", getenv("REGPU_HYPER_FREEZE"),
             getenv("REGPU_HYPER_FREEZE_REFRESH") ? getenv("REGPU_HYPER_FREEZE_REFRESH") : "never");
+    if (on("REGPU_HYPER_DECIMATE"))
+        Log("hyper: big meshes keep %s%% of their triangles", getenv("REGPU_HYPER_DECIMATE"));
+    if (on("REGPU_HYPER_VCACHE"))
+        Log("hyper: mesh triangles reordered for the vertex cache%s", atoi(getenv("REGPU_HYPER_VCACHE")) >= 2 ? " and overdraw" : "");
     if (on("REGPU_COPIES_1010102"))
         Log("hyper: 10:10:10:2 copies kept at 32 bits");
     if (HelperScalePercent() < 100)
