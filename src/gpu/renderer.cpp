@@ -5992,8 +5992,16 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
     // and the game hasn't rewritten or a debug edit changed; the rest, and every variant (motion, no-kill, fetch), keep
     // the HLSL path. Its fetches follow the full TFetch (with the instruction's filter override) whatever
     // REGPU_LEAN_FETCH says. Not cached on disk; logged once per shader that falls back.
-    static const bool direct = getenv("REGPU_SPIRV_DIRECT") && strcmp(getenv("REGPU_SPIRV_DIRECT"), "0") != 0;
-    if (direct && pixel && !cs.tag && cs.info.hlsl == translatedHlsl)
+    // (=ps: pixel shaders only, =vs: vertex shaders only, any other value both. Vertex shaders: the HLSL wrapper's index
+    // fetch, rectangles, points and viewport transform, with the vertex fetches baked as REGPU_DYNAMIC_VFETCH-less HLSL
+    // bakes them.)
+    static const int direct = [] {
+        const char* v = getenv("REGPU_SPIRV_DIRECT");
+        if (!v || !*v || strcmp(v, "0") == 0)
+            return 0;
+        return strcmp(v, "ps") == 0 ? 1 : strcmp(v, "vs") == 0 ? 2 : 3;
+    }();
+    if ((direct & (pixel ? 1 : 2)) && !cs.tag && cs.info.hlsl == translatedHlsl)
     {
         const auto start = std::chrono::steady_clock::now();
         std::vector<uint32_t> words;
@@ -6012,13 +6020,13 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
             const uint32_t n = ++count;
             micros += us;
             if (n == 1 || n % 100 == 0)
-                Log("spirv direct: %u pixel shaders translated directly (%.2f ms average)", n, double(micros.load()) / 1000.0 / n);
+                Log("spirv direct: %u shaders translated directly (%.2f ms average)", n, double(micros.load()) / 1000.0 / n);
             g_stats.shadersBuilt++;
             return cs;
         }
         static std::atomic<uint32_t> fallbacks{ 0 };
         if (fallbacks++ < 40)
-            Log("spirv direct: ps %016llx falls back to HLSL: %s", (unsigned long long)hash, why.c_str());
+            Log("spirv direct: %s %016llx falls back to HLSL: %s", pixel ? "ps" : "vs", (unsigned long long)hash, why.c_str());
     }
     cs.cacheKey = Fnv(cs.info.hlsl.data(), cs.info.hlsl.size(), pixel ? 1 : 2);
     if (auto b = g_bytecode.find(cs.cacheKey); b != g_bytecode.end())

@@ -165,6 +165,30 @@ void Builder::BeginFunction(uint32_t function, uint32_t ret, uint32_t fnType)
     terminated_ = false;
 }
 
+std::vector<uint32_t> Builder::BeginFunction(uint32_t function, uint32_t ret, uint32_t fnType, const std::vector<uint32_t>& paramTypes)
+{
+    Emit(functions_, spv::OpFunction, { ret, function, uint32_t(spv::FunctionControlMaskNone), fnType });
+    std::vector<uint32_t> ids;
+    for (uint32_t t : paramTypes)
+    {
+        ids.push_back(Id());
+        Emit(functions_, spv::OpFunctionParameter, { t, ids.back() });
+    }
+    Emit(functions_, spv::OpLabel, { Id() });
+    fnVars_.clear();
+    fnBody_.clear();
+    terminated_ = false;
+    return ids;
+}
+
+void Builder::ReturnValue(uint32_t value)
+{
+    if (terminated_)
+        Label(Id());
+    Emit(fnBody_, spv::OpReturnValue, { value });
+    terminated_ = true;
+}
+
 uint32_t Builder::Variable(uint32_t pointerType)
 {
     const uint32_t id = Id();

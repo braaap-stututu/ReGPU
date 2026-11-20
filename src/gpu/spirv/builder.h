@@ -57,6 +57,9 @@ public:
 
     // Functions: one at a time. Begin opens the entry block; Variable adds a Function variable to it.
     void BeginFunction(uint32_t function, uint32_t ret, uint32_t fnType);
+    // With parameters (their types; their ids are returned), before the entry block.
+    std::vector<uint32_t> BeginFunction(uint32_t function, uint32_t ret, uint32_t fnType, const std::vector<uint32_t>& paramTypes);
+    void ReturnValue(uint32_t value);
     uint32_t Variable(uint32_t pointerType);
     void EndFunction();
 

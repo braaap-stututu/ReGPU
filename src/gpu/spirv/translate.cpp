@@ -1,6 +1,10 @@
 #include "gpu/spirv/translate.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
 #include <cfloat>
 
 #include "gpu/spirv/builder.h"
@@ -23,6 +27,12 @@ struct Translator
     uint32_t pUniV4 = 0, pUniUV4 = 0, pUniU = 0, pInV4 = 0;
     // Globals.
     uint32_t cb = 0, inO = 0, inPcoord = 0, inPos = 0, outColor = 0, outDepth = 0;
+    uint32_t cbTex = 0; // the block with tinfo / tbias (PSConstants: cb in a pixel shader, binding 1 in a vertex shader)
+    // Vertex shaders: the guest program's outputs (GuestVS), the vertex-fetch state as hlsl.cpp's Emitter keeps it, the
+    // guest memory buffers (set 0 binding 100 gmem, 101 gphys).
+    uint32_t oPos = 0, oArr = 0, oPts = 0, vfi = 0, gmemV = 0, gphysV = 0, pSbU = 0;
+    uint32_t lastConst = 0, lastStride = 0, lastSrc = 0, lastSrcSwizzle = 0;
+    bool lastRound = false;
     // Function variables.
     uint32_t r = 0, ps = 0, p = 0, a0 = 0, aL = 0, oC[4] = {}, oD = 0;
     uint32_t cfpc = 0, loopCount = 0, loopSaved = 0, loopDepth = 0, callRet = 0, callDepth = 0, guard = 0;
@@ -147,6 +157,8 @@ struct Translator
 
     void KillIf(uint32_t cond)
     {
+        if (!shader.pixel)
+            return;
         // (pinfo.z bit 2: kills skipped, renderer.cpp: the vertex shader wrote no interpolators.)
         b.If(And(cond, Not(PinfoBit(4))), [&] { b.Kill(); });
     }
@@ -363,7 +375,17 @@ struct Translator
         if (a.exportData)
         {
             uint32_t target = 0;
-            if (a.vectorDest == 61)
+            if (!shader.pixel)
+            {
+                // Vertex shaders: o0-o15, position (62), point size (63); memory exports (eA, eM0-4) dropped, as HLSL does.
+                if (a.vectorDest == 62)
+                    target = oPos;
+                else if (a.vectorDest == 63)
+                    target = oPts;
+                else if (a.vectorDest < 16)
+                    target = b.Op(spv::OpAccessChain, pFnV4, { oArr, I(int32_t(a.vectorDest)) });
+            }
+            else if (a.vectorDest == 61)
                 target = oD;
             else if (a.vectorDest < 4)
                 target = oC[a.vectorDest];
@@ -522,8 +544,8 @@ struct Translator
     uint32_t TexFetch(uint32_t slot, uint32_t coord, bool denorm, bool level, uint32_t bias, float ox, float oy, int filt, bool lean = false)
     {
         InitTextures();
-        const uint32_t ti = Load(tUV4, b.Op(spv::OpAccessChain, pUniUV4, { cb, I(5), I(int32_t(slot)) }));
-        const uint32_t tb = Load(tV4, b.Op(spv::OpAccessChain, pUniV4, { cb, I(6), I(int32_t(slot)) }));
+        const uint32_t ti = Load(tUV4, b.Op(spv::OpAccessChain, pUniUV4, { cbTex, I(5), I(int32_t(slot)) }));
+        const uint32_t tb = Load(tV4, b.Op(spv::OpAccessChain, pUniV4, { cbTex, I(6), I(int32_t(slot)) }));
         // (A specialised slot's words are literals: the driver folds every path its constant doesn't take.)
         const SpirvFetchSpec* spec = Spec(slot);
         const uint32_t info = spec ? U(spec->info) : Comp(ti, 0, tU), w = spec ? U(spec->w) : Comp(ti, 3, tU);
@@ -586,8 +608,9 @@ struct Translator
                         mode = filt == 0 ? SelU(wrap, U(3), U(2)) : SelU(wrap, U(0), U(1));
                     }
                     // The sampler: at a level the mode itself (gLevelWrap); else modes 1-3 theirs, mode 0 the anisotropy's
-                    // (tinfo.x bits 20-22: 1-4 = s4-s7) or linear wrap.
-                    uint32_t s = mode;
+                    // (tinfo.x bits 20-22: 1-4 = s4-s7) or linear wrap. A vertex shader (no gLevelWrap): point modes
+                    // theirs, the rest linear clamp.
+                    uint32_t s = shader.pixel ? mode : SelU(Or(UEq(mode, 2), UEq(mode, 3)), mode, U(1));
                     if (!level)
                     {
                         const uint32_t aniso = UBits(info, 20, 7);
@@ -640,8 +663,8 @@ struct Translator
     uint32_t TexFetchPlain(uint32_t slot, uint32_t coord, bool denorm, uint32_t bias, float ox, float oy, int filt)
     {
         InitTextures();
-        const uint32_t ti = Load(tUV4, b.Op(spv::OpAccessChain, pUniUV4, { cb, I(5), I(int32_t(slot)) }));
-        const uint32_t tb = Load(tV4, b.Op(spv::OpAccessChain, pUniV4, { cb, I(6), I(int32_t(slot)) }));
+        const uint32_t ti = Load(tUV4, b.Op(spv::OpAccessChain, pUniUV4, { cbTex, I(5), I(int32_t(slot)) }));
+        const uint32_t tb = Load(tV4, b.Op(spv::OpAccessChain, pUniV4, { cbTex, I(6), I(int32_t(slot)) }));
         const SpirvFetchSpec* spec = Spec(slot);
         const uint32_t info = spec ? U(spec->info) : Comp(ti, 0, tU);
         uint32_t mode = UBits(info, 0, 3);
@@ -678,6 +701,11 @@ struct Translator
 
     void EmitFetchBody(const Fetch& f)
     {
+        if (f.opcode == 0)
+        {
+            EmitVertexFetch(f);
+            return;
+        }
         const uint32_t src = Load(tV4, RegPtr(f.src));
         auto comp = [&](uint32_t i) { return Comp(src, (f.srcSwizzle >> (2 * i)) & 3); };
         if (f.opcode == 1)
@@ -687,8 +715,9 @@ struct Translator
             InitTextures();
             const uint32_t coord = f.dimension == 0 && !no1d ? Vec3(comp(0), F(0.5f), F(0)) : Vec3(comp(0), comp(1), comp(2));
             static const bool noRegisterLod = getenv("REGPU_NO_REGISTER_LOD") != nullptr;
-            const bool level = !noRegisterLod && !f.useComputedLod;
-            const uint32_t tb = Load(tV4, b.Op(spv::OpAccessChain, pUniV4, { cb, I(6), I(int32_t(f.constIndex)) }));
+            // (A vertex shader samples at a level: hlsl.cpp's vertexStage; its sampler is chosen in TexFetch.)
+            const bool level = !shader.pixel || (!noRegisterLod && !f.useComputedLod);
+            const uint32_t tb = Load(tV4, b.Op(spv::OpAccessChain, pUniV4, { cbTex, I(6), I(int32_t(f.constIndex)) }));
             uint32_t bias = FAdd(F(f.lodBias), Comp(tb, 0));
             if (!noRegisterLod && f.useRegisterLod)
                 bias = FAdd(Load(tF, regLod), bias);
@@ -708,7 +737,7 @@ struct Translator
                 // TFetch2DV2: a plain constant (tinfo.x bit 7) one sample with the instruction's filter, else TFetch2D.
                 InitTextures();
                 const SpirvFetchSpec* spec = Spec(f.constIndex);
-                const uint32_t ti = Load(tUV4, b.Op(spv::OpAccessChain, pUniUV4, { cb, I(5), I(int32_t(f.constIndex)) }));
+                const uint32_t ti = Load(tUV4, b.Op(spv::OpAccessChain, pUniUV4, { cbTex, I(5), I(int32_t(f.constIndex)) }));
                 const uint32_t info = spec ? U(spec->info) : Comp(ti, 0, tU);
                 const uint32_t out = b.Variable(pFnV4);
                 b.If(UBit(info, 7), [&] { Store(out, TexFetchPlain(f.constIndex, coord, f.denormalized, bias, f.offsetX, f.offsetY, filtV2)); },
@@ -723,7 +752,7 @@ struct Translator
         }
         else if (f.opcode == 24)
             Store(regLod, comp(0)); // setTexLOD
-        else if (f.opcode == 18)
+        else if (f.opcode == 18 && shader.pixel)
         {
             // getGradients: (ddx(a), ddy(a), ddx(b), ddy(b)).
             const uint32_t a = comp(0), c = comp(1);
@@ -736,7 +765,7 @@ struct Translator
             uint32_t x = comp(0), y = comp(1);
             if (!f.denormalized)
             {
-                const uint32_t ti = Load(tUV4, b.Op(spv::OpAccessChain, pUniUV4, { cb, I(5), I(int32_t(f.constIndex)) }));
+                const uint32_t ti = Load(tUV4, b.Op(spv::OpAccessChain, pUniUV4, { cbTex, I(5), I(int32_t(f.constIndex)) }));
                 x = FMulS(x, b.Op(spv::OpConvertUToF, tF, { b.Ext(tU, GLSLstd450UMax, { UBits(Comp(ti, 1, tU), 0, 0xFFFF), U(1) }) }));
                 y = FMulS(y, b.Op(spv::OpConvertUToF, tF, { b.Ext(tU, GLSLstd450UMax, { UBits(Comp(ti, 2, tU), 0, 0xFFFF), U(1) }) }));
             }
@@ -977,8 +1006,8 @@ struct Translator
                 if ((cf.sequence() >> (2 * k)) & 1)
                 {
                     const Fetch f = DecodeFetch(w);
-                    if (f.opcode == 0)
-                        return why = "vertex fetch", false;
+                    if (f.opcode == 0 && shader.pixel)
+                        return why = "vertex fetch in a pixel shader", false;
                     if (f.opcode == 1 && f.dimension > 3)
                         return why = "texture fetch dimension " + std::to_string(f.dimension), false;
                     if (f.opcode == 1 || f.opcode == 24 || f.opcode == 19)
@@ -1011,7 +1040,7 @@ struct Translator
     bool Run(std::vector<uint32_t>& words)
     {
         if (!shader.pixel)
-            return why = "vertex shader", false;
+            return RunVertex(words);
         std::vector<bool> reachable;
         bool linear, forward, loops;
         if (!Scan(reachable, linear, forward, loops))
@@ -1054,6 +1083,7 @@ struct Translator
         cb = b.GlobalVariable(b.TypePointer(spv::StorageClassUniform, block), spv::StorageClassUniform);
         b.Decorate(cb, spv::DecorationDescriptorSet, { 0 });
         b.Decorate(cb, spv::DecorationBinding, { 1 });
+        cbTex = cb;
 
         // VSOut: SV_Position, o[16] (TEXCOORD0, location 0-15), pcoord (TEXCOORD16, location 16).
         inPos = b.GlobalVariable(pInV4, spv::StorageClassInput);
@@ -1115,57 +1145,7 @@ struct Translator
         Store(a0, I(0));
         Store(aL, I(0));
 
-        if (linear)
-        {
-            for (size_t i = 0; i < shader.cf.size(); i++)
-                if (reachable[i])
-                    EmitCf(i, true);
-        }
-        else
-        {
-            cfpc = b.Variable(pFnU);
-            Store(cfpc, U(0));
-            auto blocks = [&] {
-                for (size_t i = 0; i < shader.cf.size(); i++)
-                    if (reachable[i])
-                        b.If(Bin(spv::OpIEqual, tB, Load(tU, cfpc), U(uint32_t(i))), [&] { EmitCf(i, false); });
-            };
-            if (forward)
-                blocks();
-            else
-            {
-                // do { blocks in order (a jump forward runs its target in the same pass, a jump back the next) }
-                // while (cfpc != end && guard < limit).
-                const uint32_t aU4 = b.TypePointer(spv::StorageClassFunction, b.TypeArray(tU, 4));
-                const uint32_t aI4 = b.TypePointer(spv::StorageClassFunction, b.TypeArray(tI, 4));
-                loopCount = b.Variable(aU4);
-                loopSaved = b.Variable(aI4);
-                callRet = b.Variable(aU4);
-                loopDepth = b.Variable(pFnU);
-                callDepth = b.Variable(pFnU);
-                guard = b.Variable(pFnU);
-                const uint32_t zu4 = b.ConstComposite(b.TypeArray(tU, 4), { U(0), U(0), U(0), U(0) });
-                Store(loopCount, zu4);
-                Store(callRet, zu4);
-                Store(loopSaved, b.ConstComposite(b.TypeArray(tI, 4), { I(0), I(0), I(0), I(0) }));
-                Store(loopDepth, U(0));
-                Store(callDepth, U(0));
-                Store(guard, U(0));
-                const uint32_t header = b.Id(), body = b.Id(), cont = b.Id(), merge = b.Id();
-                b.Label(header);
-                b.OpNoResult(spv::OpLoopMerge, { merge, cont, uint32_t(spv::LoopControlMaskNone) });
-                b.Branch(body);
-                b.Label(body);
-                blocks();
-                b.Branch(cont);
-                b.Label(cont);
-                const uint32_t g = Bin(spv::OpIAdd, tU, Load(tU, guard), U(1));
-                Store(guard, g);
-                const uint32_t more = And(Bin(spv::OpULessThan, tB, g, U(loops ? 65536 : 1024)), Bin(spv::OpINotEqual, tB, Load(tU, cfpc), U(0xFFFF)));
-                b.BranchConditional(more, header, merge);
-                b.Label(merge);
-            }
-        }
+        EmitProgram(reachable, linear, forward, loops);
 
         // Epilogue (hlsl.cpp TranslateShader): alpha test, alpha to mask, exponent bias, target clamps.
         {
@@ -1224,6 +1204,573 @@ struct Translator
     }
 
     uint32_t Splat4B(uint32_t c) { return b.Op(spv::OpCompositeConstruct, tB4, { c, c, c, c }); }
+
+    // The guest program's control flow (straight, forward jumps, or a loop over the blocks), into the current function.
+    void EmitProgram(const std::vector<bool>& reachable, bool linear, bool forward, bool loops)
+    {
+        if (linear)
+        {
+            for (size_t i = 0; i < shader.cf.size(); i++)
+                if (reachable[i])
+                    EmitCf(i, true);
+        }
+        else
+        {
+            cfpc = b.Variable(pFnU);
+            Store(cfpc, U(0));
+            auto blocks = [&] {
+                for (size_t i = 0; i < shader.cf.size(); i++)
+                    if (reachable[i])
+                        b.If(Bin(spv::OpIEqual, tB, Load(tU, cfpc), U(uint32_t(i))), [&] { EmitCf(i, false); });
+            };
+            if (forward)
+                blocks();
+            else
+            {
+                // do { blocks in order (a jump forward runs its target in the same pass, a jump back the next) }
+                // while (cfpc != end && guard < limit).
+                const uint32_t aU4 = b.TypePointer(spv::StorageClassFunction, b.TypeArray(tU, 4));
+                const uint32_t aI4 = b.TypePointer(spv::StorageClassFunction, b.TypeArray(tI, 4));
+                loopCount = b.Variable(aU4);
+                loopSaved = b.Variable(aI4);
+                callRet = b.Variable(aU4);
+                loopDepth = b.Variable(pFnU);
+                callDepth = b.Variable(pFnU);
+                guard = b.Variable(pFnU);
+                const uint32_t zu4 = b.ConstComposite(b.TypeArray(tU, 4), { U(0), U(0), U(0), U(0) });
+                Store(loopCount, zu4);
+                Store(callRet, zu4);
+                Store(loopSaved, b.ConstComposite(b.TypeArray(tI, 4), { I(0), I(0), I(0), I(0) }));
+                Store(loopDepth, U(0));
+                Store(callDepth, U(0));
+                Store(guard, U(0));
+                const uint32_t header = b.Id(), body = b.Id(), cont = b.Id(), merge = b.Id();
+                b.Label(header);
+                b.OpNoResult(spv::OpLoopMerge, { merge, cont, uint32_t(spv::LoopControlMaskNone) });
+                b.Branch(body);
+                b.Label(body);
+                blocks();
+                b.Branch(cont);
+                b.Label(cont);
+                const uint32_t g = Bin(spv::OpIAdd, tU, Load(tU, guard), U(1));
+                Store(guard, g);
+                const uint32_t more = And(Bin(spv::OpULessThan, tB, g, U(loops ? 65536 : 1024)), Bin(spv::OpINotEqual, tB, Load(tU, cfpc), U(0xFFFF)));
+                b.BranchConditional(more, header, merge);
+                b.Label(merge);
+            }
+        }
+    }
+
+    // ---- Vertex shaders (hlsl.cpp: GuestVS and the VSOut main wrapper; the vertex fetch as VFetch, baked) ----
+    uint32_t VsU(uint32_t member, uint32_t comp) { return Load(tU, b.Op(spv::OpAccessChain, pUniU, { cb, I(int32_t(member)), I(int32_t(comp)) })); }
+    uint32_t VsF(uint32_t member, uint32_t comp)
+    {
+        return Load(tF, b.Op(spv::OpAccessChain, b.TypePointer(spv::StorageClassUniform, tF), { cb, I(int32_t(member)), I(int32_t(comp)) }));
+    }
+    uint32_t Vf(uint32_t fetch, uint32_t comp) { return Load(tU, b.Op(spv::OpAccessChain, pUniU, { cb, I(3), I(int32_t(fetch)), I(int32_t(comp)) })); }
+    // A dword of a guest memory buffer (ByteAddressBuffer.Load: the byte address, 4-aligned).
+    uint32_t GuestWord(uint32_t buffer, uint32_t byteAddress)
+    {
+        return Load(tU, b.Op(spv::OpAccessChain, pSbU, { buffer, I(0), Bin(spv::OpShiftRightLogical, tU, byteAddress, U(2)) }));
+    }
+    uint32_t UOp(spv::Op op, uint32_t x, uint32_t y) { return Bin(op, tU, x, y); }
+    uint32_t UAnd(uint32_t x, uint32_t m) { return UOp(spv::OpBitwiseAnd, x, U(m)); }
+    uint32_t UOr(uint32_t x, uint32_t y) { return UOp(spv::OpBitwiseOr, x, y); }
+    uint32_t UShl(uint32_t x, uint32_t n) { return UOp(spv::OpShiftLeftLogical, x, U(n)); }
+    uint32_t UShr(uint32_t x, uint32_t n) { return UOp(spv::OpShiftRightLogical, x, U(n)); }
+    uint32_t UToF(uint32_t x) { return b.Op(spv::OpConvertUToF, tF, { x }); }
+
+    // hlsl.cpp's Swap (the fetch constant's endian: 1 bytes in halves, 2 all four, 3 halves).
+    uint32_t Swap(uint32_t v, uint32_t e)
+    {
+        const uint32_t s1 = UOr(UShl(UAnd(v, 0x00FF00FFu), 8), UAnd(UShr(v, 8), 0x00FF00FFu));
+        const uint32_t s2 = UOr(UOr(UShr(v, 24), UAnd(UShr(v, 8), 0xFF00u)), UOr(UAnd(UShl(v, 8), 0xFF0000u), UShl(v, 24)));
+        const uint32_t s3 = UOr(UShl(v, 16), UShr(v, 16));
+        return SelU(UEq(e, 1), s1, SelU(UEq(e, 2), s2, SelU(UEq(e, 3), s3, v)));
+    }
+    // LoadGuest: past the buffer's end (vf.w dwords) 0; vf.z: guest physical memory instead of the upload ring.
+    uint32_t LoadGuest(uint32_t fetch, uint32_t dword)
+    {
+        const uint32_t out = b.Variable(pFnU);
+        Store(out, U(0));
+        b.If(Bin(spv::OpULessThan, tB, dword, Vf(fetch, 3)), [&] {
+            const uint32_t a = UOp(spv::OpIAdd, Vf(fetch, 0), UOp(spv::OpIMul, dword, U(4)));
+            b.If(Bin(spv::OpINotEqual, tB, Vf(fetch, 2), U(0)), [&] { Store(out, GuestWord(gphysV, a)); }, [&] { Store(out, GuestWord(gmemV, a)); });
+            Store(out, Swap(Load(tU, out), Vf(fetch, 1)));
+        });
+        return Load(tU, out);
+    }
+    uint32_t SignExtend(uint32_t v, uint32_t bits)
+    {
+        const uint32_t i = b.Op(spv::OpBitcast, tI, { UShl(v, 32 - bits) });
+        return b.Op(spv::OpConvertSToF, tF, { Bin(spv::OpShiftRightArithmetic, tI, i, I(int32_t(32 - bits))) });
+    }
+    // Xenos 16-bit float: exponent 31 an ordinary exponent (no infinities or NaNs).
+    uint32_t XHalf(uint32_t h)
+    {
+        h = UAnd(h, 0xFFFF);
+        const uint32_t big = UEq(UAnd(UShr(h, 10), 31), 31);
+        const uint32_t v = FMulS(FAdd(F(1), FDiv(UToF(UAnd(h, 1023)), F(1024))), F(65536));
+        const uint32_t sv = SelF(Bin(spv::OpINotEqual, tB, UAnd(h, 0x8000), U(0)), b.Op(spv::OpFNegate, tF, { v }), v);
+        const uint32_t half = Comp(b.Ext(tV2, GLSLstd450UnpackHalf2x16, { h }), 0);
+        return SelF(big, sv, half);
+    }
+    // hlsl.cpp's Unpack for one (literal) format.
+    uint32_t Unpack(uint32_t format, bool isSigned, bool norm, const std::function<uint32_t(uint32_t)>& w)
+    {
+        auto bits = [&](uint32_t v, uint32_t shift, uint32_t count) { return UAnd(shift ? UShr(v, shift) : v, count >= 32 ? 0xFFFFFFFFu : (1u << count) - 1); };
+        auto vec = [&](uint32_t x, uint32_t y, uint32_t z, uint32_t ww) { return Vec4(x, y, z, ww); };
+        auto asF = [&](uint32_t v) { return b.Op(spv::OpBitcast, tF, { v }); };
+        auto asI = [&](uint32_t v) { return b.Op(spv::OpConvertSToF, tF, { b.Op(spv::OpBitcast, tI, { v }) }); };
+        auto num = [&](uint32_t v) { return isSigned ? asI(v) : UToF(v); };
+        switch (format)
+        {
+        case 6: case 7: case 25: case 26: case 16: case 17:
+        {
+            uint32_t u[4], nb[4];
+            uint32_t comps = 4;
+            if (format == 6)
+                for (uint32_t c = 0; c < 4; c++)
+                    u[c] = bits(w(0), 8 * c, 8), nb[c] = 8;
+            else if (format == 7)
+            {
+                u[0] = bits(w(0), 0, 10), u[1] = bits(w(0), 10, 10), u[2] = bits(w(0), 20, 10), u[3] = UShr(w(0), 30);
+                nb[0] = nb[1] = nb[2] = 10, nb[3] = 2;
+            }
+            else if (format == 25 || format == 26)
+            {
+                u[0] = bits(w(0), 0, 16), u[1] = UShr(w(0), 16);
+                if (format == 26)
+                    u[2] = bits(w(1), 0, 16), u[3] = UShr(w(1), 16);
+                else
+                    u[2] = u[3] = U(0);
+                for (uint32_t c = 0; c < 4; c++)
+                    nb[c] = 16;
+            }
+            else
+            {
+                const uint32_t bx = format == 16 ? 11 : 10, by = 11, bz = format == 16 ? 10 : 11;
+                u[0] = bits(w(0), 0, bx), u[1] = bits(w(0), bx, by), u[2] = UShr(w(0), bx + by);
+                nb[0] = bx, nb[1] = by, nb[2] = bz;
+                comps = 3;
+            }
+            uint32_t r[4] = { F(0), F(0), F(0), F(1) };
+            for (uint32_t c = 0; c < comps; c++)
+            {
+                if (isSigned)
+                {
+                    r[c] = SignExtend(u[c], nb[c]);
+                    if (norm)
+                        r[c] = FMax(FDiv(r[c], F(float((1u << (nb[c] - 1)) - 1))), F(-1));
+                }
+                else
+                {
+                    r[c] = UToF(u[c]);
+                    if (norm)
+                        r[c] = FDiv(r[c], F(float((1u << nb[c]) - 1)));
+                }
+            }
+            if (format == 25)
+                r[2] = F(0), r[3] = F(1);
+            return vec(r[0], r[1], r[2], r[3]);
+        }
+        case 31: return vec(XHalf(w(0)), XHalf(UShr(w(0), 16)), F(0), F(1));
+        case 32: return vec(XHalf(w(0)), XHalf(UShr(w(0), 16)), XHalf(w(1)), XHalf(UShr(w(1), 16)));
+        case 33: return vec(num(w(0)), F(0), F(0), F(1));
+        case 34: return vec(num(w(0)), num(w(1)), F(0), F(1));
+        case 35: return vec(num(w(0)), num(w(1)), num(w(2)), num(w(3)));
+        case 36: return vec(asF(w(0)), F(0), F(0), F(1));
+        case 37: return vec(asF(w(0)), asF(w(1)), F(0), F(1));
+        case 57: return vec(asF(w(0)), asF(w(1)), asF(w(2)), F(1));
+        case 38: return vec(asF(w(0)), asF(w(1)), asF(w(2)), asF(w(3)));
+        default: return b.ConstVec4(0, 0, 0, 1);
+        }
+    }
+
+    // A vertex fetch as hlsl.cpp's EmitFetch bakes it (BakedVertexFetch): a mini fetch reads the vertex its full fetch
+    // addressed, through the full fetch's constant, index, stride and rounding (vfi: the index the full fetch read).
+    void EmitVertexFetch(const Fetch& f)
+    {
+        static const bool miniOwnConst = getenv("REGPU_NO_MINI_CONST") != nullptr;
+        if (!f.isMini)
+        {
+            lastConst = f.constIndex;
+            lastStride = f.stride;
+            lastSrc = f.src;
+            lastSrcSwizzle = f.srcSwizzle;
+            lastRound = f.roundIndex;
+            Store(vfi, Comp(Load(tV4, RegPtr(lastSrc)), lastSrcSwizzle & 3));
+        }
+        const uint32_t constIndex = f.isMini && !miniOwnConst ? lastConst : f.constIndex;
+        const uint32_t idx = b.Ext(tF, lastRound ? GLSLstd450RoundEven : GLSLstd450Floor, { Load(tF, vfi) });
+        const uint32_t d = UOp(spv::OpIAdd, UOp(spv::OpIMul, b.Op(spv::OpConvertFToU, tU, { FMax(idx, F(0)) }), U(lastStride)), U(f.offset));
+        uint32_t words[4] = {};
+        auto w = [&](uint32_t i) {
+            if (!words[i])
+                words[i] = LoadGuest(constIndex, i ? UOp(spv::OpIAdd, d, U(i)) : d);
+            return words[i];
+        };
+        uint32_t t = Unpack(f.format, f.isSigned, f.isNormalized, w);
+        if (f.expAdjust)
+            t = b.Op(spv::OpVectorTimesScalar, tV4, { t, F(std::ldexp(1.0f, f.expAdjust)) });
+        DestSwizzleWrite(f.dest, f.destSwizzle, t);
+    }
+
+    bool RunVertex(std::vector<uint32_t>& words)
+    {
+        // The HLSL path's vertex variants the translator doesn't make: those shaders keep HLSL.
+        if (!BakedVertexFetch())
+            return why = "dynamic vertex fetch (REGPU_DYNAMIC_VFETCH)", false;
+        if (LeanVertexFetch())
+            return why = "REGPU_LEAN_VFETCH", false;
+        // (hlsl.cpp's PlainMulVertexLevel, TripleShaders and StereoShaders: the same switches.)
+        auto envOn = [](const char* name) {
+            const char* v = getenv(name);
+            return v && *v && strcmp(v, "0") != 0;
+        };
+        if (envOn("REGPU_PLAIN_MUL_VS"))
+            return why = "REGPU_PLAIN_MUL_VS", false;
+        if (envOn("REGPU_TRIPLE") || (getenv("REGPU_VR") && strcmp(getenv("REGPU_VR"), "stereo") == 0))
+            return why = "triple-screen or stereo vertex shaders", false;
+        std::vector<bool> reachable;
+        bool linear, forward, loops;
+        if (!Scan(reachable, linear, forward, loops))
+            return false;
+        for (uint32_t i = 0, n = 0; i < 256; i++)
+            rank[i] = uint8_t(n), n += (info.constantMask[i >> 6] >> (i & 63)) & 1;
+
+        b.Capability(spv::CapabilityShader);
+        tVoid = b.TypeVoid();
+        tF = b.TypeFloat();
+        tU = b.TypeUint();
+        tI = b.TypeInt();
+        tB = b.TypeBool();
+        tV4 = b.TypeVector(tF, 4);
+        tV2 = b.TypeVector(tF, 2);
+        tUV4 = b.TypeVector(tU, 4);
+        tB4 = b.TypeVector(tB, 4);
+        pFnV4 = b.TypePointer(spv::StorageClassFunction, tV4);
+        pFnF = b.TypePointer(spv::StorageClassFunction, tF);
+        pFnU = b.TypePointer(spv::StorageClassFunction, tU);
+        pFnI = b.TypePointer(spv::StorageClassFunction, tI);
+        pFnB = b.TypePointer(spv::StorageClassFunction, tB);
+        pUniV4 = b.TypePointer(spv::StorageClassUniform, tV4);
+        pUniUV4 = b.TypePointer(spv::StorageClassUniform, tUV4);
+        pUniU = b.TypePointer(spv::StorageClassUniform, tU);
+
+        // VSConstants (hlsl.cpp's preamble, DX layout): vc[256] 0, vb[2] 1, vl[8] 2, vf[96] 3, vinfo 4, vpoint 5, vscale 6,
+        // voffset 7, vte 8, vfl[32] 9, vuser[4] 10, vdepth 11, vwide 12. (Members 0-2 as the PS block's: the constant reads
+        // are shared.)
+        {
+            const uint32_t aC = b.TypeArray(tV4, 256), aB = b.TypeArray(tUV4, 2), aL8 = b.TypeArray(tUV4, 8), aVf = b.TypeArray(tUV4, 96),
+                           aVfl = b.TypeArray(tUV4, 32), aUser = b.TypeArray(tV4, 4);
+            for (uint32_t a : { aC, aB, aL8, aVf, aVfl, aUser })
+                b.Decorate(a, spv::DecorationArrayStride, { 16 });
+            const uint32_t block = b.TypeStruct({ aC, aB, aL8, aVf, tUV4, tV4, tV4, tV4, tUV4, aVfl, aUser, tV4, tV4 });
+            b.Decorate(block, spv::DecorationBlock);
+            const uint32_t offsets[] = { 0, 4096, 4128, 4256, 5792, 5808, 5824, 5840, 5856, 5872, 6384, 6448, 6464 };
+            for (uint32_t m = 0; m < 13; m++)
+                b.MemberDecorate(block, m, spv::DecorationOffset, { offsets[m] });
+            b.Name(block, "VSConstants");
+            cb = b.GlobalVariable(b.TypePointer(spv::StorageClassUniform, block), spv::StorageClassUniform);
+            b.Decorate(cb, spv::DecorationDescriptorSet, { 0 });
+            b.Decorate(cb, spv::DecorationBinding, { 0 });
+        }
+        // PSConstants for the fetch constants (tinfo, tbias), binding 1, as the HLSL vertex shaders read them.
+        {
+            const uint32_t aC = b.TypeArray(tV4, 256), aB = b.TypeArray(tUV4, 2), aL8 = b.TypeArray(tUV4, 8), aTi = b.TypeArray(tUV4, 32),
+                           aTb = b.TypeArray(tV4, 32);
+            // (The array types are shared with the VS block, deduplicated: each decorated once.)
+            for (uint32_t a : { aTb })
+                b.Decorate(a, spv::DecorationArrayStride, { 16 });
+            const uint32_t block = b.TypeStruct({ aC, aB, aL8, tUV4, tV4, aTi, aTb });
+            b.Decorate(block, spv::DecorationBlock);
+            const uint32_t offsets[] = { 0, 4096, 4128, 4256, 4272, 4288, 4800 };
+            for (uint32_t m = 0; m < 7; m++)
+                b.MemberDecorate(block, m, spv::DecorationOffset, { offsets[m] });
+            b.Name(block, "PSConstants");
+            cbTex = b.GlobalVariable(b.TypePointer(spv::StorageClassUniform, block), spv::StorageClassUniform);
+            b.Decorate(cbTex, spv::DecorationDescriptorSet, { 0 });
+            b.Decorate(cbTex, spv::DecorationBinding, { 1 });
+        }
+        // gmem (binding 100) and gphys (101): read-only storage buffers of dwords.
+        {
+            const uint32_t ra = b.Type(spv::OpTypeRuntimeArray, { tU });
+            b.Decorate(ra, spv::DecorationArrayStride, { 4 });
+            const uint32_t sb = b.TypeStruct({ ra });
+            b.Decorate(sb, spv::DecorationBlock);
+            b.MemberDecorate(sb, 0, spv::DecorationOffset, { 0 });
+            b.MemberDecorate(sb, 0, spv::DecorationNonWritable);
+            pSbU = b.TypePointer(spv::StorageClassStorageBuffer, tU);
+            const uint32_t pSb = b.TypePointer(spv::StorageClassStorageBuffer, sb);
+            gmemV = b.GlobalVariable(pSb, spv::StorageClassStorageBuffer);
+            b.Decorate(gmemV, spv::DecorationDescriptorSet, { 0 });
+            b.Decorate(gmemV, spv::DecorationBinding, { 100 });
+            b.Name(gmemV, "gmem");
+            gphysV = b.GlobalVariable(pSb, spv::StorageClassStorageBuffer);
+            b.Decorate(gphysV, spv::DecorationDescriptorSet, { 0 });
+            b.Decorate(gphysV, spv::DecorationBinding, { 101 });
+            b.Name(gphysV, "gphys");
+        }
+        // VSOut: SV_Position, o[16] (location 0-15), pcoord (location 16); SV_VertexID.
+        const uint32_t tA16 = b.TypeArray(tV4, 16);
+        const uint32_t inVid = b.GlobalVariable(b.TypePointer(spv::StorageClassInput, tI), spv::StorageClassInput);
+        b.Decorate(inVid, spv::DecorationBuiltIn, { spv::BuiltInVertexIndex });
+        const uint32_t outPos = b.GlobalVariable(b.TypePointer(spv::StorageClassOutput, tV4), spv::StorageClassOutput);
+        b.Decorate(outPos, spv::DecorationBuiltIn, { spv::BuiltInPosition });
+        const uint32_t outO = b.GlobalVariable(b.TypePointer(spv::StorageClassOutput, tA16), spv::StorageClassOutput);
+        b.Decorate(outO, spv::DecorationLocation, { 0 });
+        const uint32_t outPc = b.GlobalVariable(b.TypePointer(spv::StorageClassOutput, tV2), spv::StorageClassOutput);
+        b.Decorate(outPc, spv::DecorationLocation, { 16 });
+
+        // GuestVS(vindex): the guest program, returning (opos, o[16], opts).
+        const uint32_t tRet = b.TypeStruct({ tV4, tA16, tV4 });
+        const uint32_t pFnA16 = b.TypePointer(spv::StorageClassFunction, tA16);
+        const uint32_t zeroA16 = b.ConstComposite(tA16, std::vector<uint32_t>(16, Zero4()));
+        const uint32_t guest = b.Id();
+        b.Name(guest, "GuestVS");
+        {
+            const std::vector<uint32_t> params = b.BeginFunction(guest, tRet, b.TypeFunction(tRet, { tU }), { tU });
+            r = b.Variable(b.TypePointer(spv::StorageClassFunction, b.TypeArray(tV4, regCount)));
+            ps = b.Variable(pFnF);
+            p = b.Variable(pFnB);
+            a0 = b.Variable(pFnI);
+            aL = b.Variable(pFnI);
+            oPos = b.Variable(pFnV4);
+            oArr = b.Variable(pFnA16);
+            oPts = b.Variable(pFnV4);
+            vfi = b.Variable(pFnF);
+            regLod = b.Variable(pFnF);
+            for (uint32_t n = 0; n < regCount; n++)
+                Store(RegPtr(n), Zero4());
+            Store(RegPtr(0), Vec4(UToF(params[0]), F(0), F(0), F(0))); // r0.x = float(vindex)
+            Store(oArr, zeroA16);
+            Store(oPos, b.ConstVec4(0, 0, 0, 1));
+            Store(oPts, Zero4());
+            Store(ps, F(0));
+            Store(p, b.ConstBool(false));
+            Store(a0, I(0));
+            Store(aL, I(0));
+            Store(vfi, F(0));
+            Store(regLod, F(0));
+            EmitProgram(reachable, linear, forward, loops);
+            b.ReturnValue(b.Op(spv::OpCompositeConstruct, tRet, { Load(tV4, oPos), Load(tA16, oArr), Load(tV4, oPts) }));
+            b.EndFunction();
+        }
+
+        const uint32_t entry = b.Id();
+        b.Name(entry, "main");
+        b.EntryPoint(spv::ExecutionModelVertex, entry, "main", { inVid, outPos, outO, outPc });
+        b.BeginFunction(entry, tVoid, b.TypeFunction(tVoid));
+        const uint32_t vteX = VsU(8, 0), vteY = VsU(8, 1), vteZ = VsU(8, 2), vteW = VsU(8, 3), vinfoX = VsU(4, 0), vinfoY = VsU(4, 1);
+        const uint32_t id = b.Op(spv::OpBitcast, tU, { Load(tI, inVid) });
+        // The guest index: direct indices read in place (y: 1 direct, 2 strip, 4 32-bit, 8 auto, 64 quad list, endian in
+        // bits 4-5), else ReGPU's expanded list in the upload ring.
+        const uint32_t eVar = b.Variable(pFnU);
+        b.If(UBit(vteY, 0), [&] {
+            const uint32_t t = UOp(spv::OpUDiv, id, U(3)), k = UOp(spv::OpUMod, id, U(3));
+            const uint32_t odd = Bin(spv::OpINotEqual, tB, UAnd(t, 1), U(0));
+            const uint32_t iStrip = UOp(spv::OpIAdd, t, SelU(odd, SelU(UEq(k, 0), U(1), SelU(UEq(k, 1), U(0), U(2))), k));
+            const uint32_t q = UOp(spv::OpUDiv, id, U(6)), k6 = UOp(spv::OpUMod, id, U(6));
+            const uint32_t iQuad = UOp(spv::OpIAdd, UOp(spv::OpIMul, q, U(4)),
+                SelU(Bin(spv::OpULessThan, tB, k6, U(3)), k6, SelU(UEq(k6, 3), U(0), UOp(spv::OpISub, k6, U(2)))));
+            const uint32_t i = SelU(UBit(vteY, 1), iStrip, SelU(UBit(vteY, 6), iQuad, id));
+            const uint32_t endian = UBits(vteY, 4, 3);
+            b.If(UBit(vteY, 3), [&] { Store(eVar, i); }, [&] {
+                b.If(UBit(vteY, 2), [&] {
+                    const uint32_t x = GuestWord(gphysV, UOp(spv::OpIAdd, vteZ, UOp(spv::OpIMul, i, U(4))));
+                    const uint32_t s2 = UOr(UOr(UShr(x, 24), UAnd(UShr(x, 8), 0xFF00u)), UOr(UAnd(UShl(x, 8), 0xFF0000u), UShl(x, 24)));
+                    const uint32_t s1 = UOr(UShl(UAnd(x, 0x00FF00FFu), 8), UAnd(UShr(x, 8), 0x00FF00FFu));
+                    Store(eVar, SelU(UEq(endian, 2), s2, SelU(UEq(endian, 1), s1, x)));
+                }, [&] {
+                    const uint32_t a = UOp(spv::OpIAdd, vteZ, UOp(spv::OpIMul, i, U(2)));
+                    const uint32_t wv = GuestWord(gphysV, UAnd(a, ~3u));
+                    const uint32_t x = SelU(Bin(spv::OpINotEqual, tB, UAnd(a, 2), U(0)), UShr(wv, 16), UAnd(wv, 0xFFFF));
+                    const uint32_t swapped = UOr(UShl(UAnd(x, 0xFF), 8), UShr(x, 8));
+                    Store(eVar, SelU(Or(UEq(endian, 1), UEq(endian, 2)), swapped, x));
+                });
+            });
+            Store(eVar, UOp(spv::OpIAdd, Load(tU, eVar), vteW));
+        }, [&] { Store(eVar, GuestWord(gmemV, UOp(spv::OpIAdd, vinfoX, UOp(spv::OpIMul, id, U(4))))); });
+        const uint32_t e = Load(tU, eVar);
+
+        // Points (vinfo.y bit 1) and rectangles (the index's bit 31) run the guest program in one loop: a rectangle's three
+        // corners for their positions, then the outputs its vertex needs (the fourth corner adds two and takes one).
+        const uint32_t isPoint = UBit(vinfoY, 1), rect = And(Not(isPoint), UBit(e, 31));
+        const uint32_t pFnA3U = b.TypePointer(spv::StorageClassFunction, b.TypeArray(tU, 3));
+        const uint32_t pFnA3V = b.TypePointer(spv::StorageClassFunction, b.TypeArray(tV4, 3));
+        const uint32_t vi = b.Variable(pFnA3U), vp = b.Variable(pFnA3V), rPos = b.Variable(pFnV4), rO = b.Variable(pFnA16), rPc = b.Variable(
+                                                                                                                          b.TypePointer(spv::StorageClassFunction, tV2)),
+                       opts = b.Variable(pFnV4), pointOffset = b.Variable(b.TypePointer(spv::StorageClassFunction, tV2));
+        const uint32_t first = b.Variable(pFnU), n = b.Variable(pFnU), pk0 = b.Variable(pFnU), pk1 = b.Variable(pFnU), pk2 = b.Variable(pFnU),
+                       j = b.Variable(pFnU);
+        auto viPtr = [&](uint32_t index) { return b.Op(spv::OpAccessChain, pFnU, { vi, index }); };
+        auto vpPtr = [&](uint32_t index) { return b.Op(spv::OpAccessChain, pFnV4, { vp, index }); };
+        Store(viPtr(U(0)), SelU(isPoint, UAnd(e, 0x1FFFFFFFu), e));
+        Store(viPtr(U(1)), U(0));
+        Store(viPtr(U(2)), U(0));
+        b.If(rect, [&] {
+            const uint32_t base = UOp(spv::OpIAdd, vinfoX, UOp(spv::OpIMul, UAnd(e, 0x1FFFFFFFu), U(4)));
+            for (uint32_t c = 0; c < 3; c++)
+                Store(viPtr(U(c)), GuestWord(gmemV, c ? UOp(spv::OpIAdd, base, U(4 * c)) : base));
+        });
+        for (uint32_t c = 0; c < 3; c++)
+            Store(vpPtr(U(c)), Zero4());
+        Store(rPos, Zero4());
+        Store(rO, zeroA16);
+        Store(rPc, b.ConstComposite(tV2, { F(0), F(0) }));
+        Store(opts, Zero4());
+        Store(pointOffset, b.ConstComposite(tV2, { F(0), F(0) }));
+        Store(first, SelU(rect, U(3), U(0)));
+        Store(n, U(1));
+        Store(pk0, U(0));
+        Store(pk1, U(0));
+        Store(pk2, U(0));
+        Store(j, U(0));
+        {
+            const uint32_t header = b.Id(), body = b.Id(), cont = b.Id(), merge = b.Id();
+            b.Branch(header);
+            b.Label(header);
+            const uint32_t check = b.Id();
+            b.OpNoResult(spv::OpLoopMerge, { merge, cont, uint32_t(spv::LoopControlMaskNone) });
+            b.Branch(check);
+            b.Label(check);
+            const uint32_t more = Bin(spv::OpULessThan, tB, Load(tU, j), UOp(spv::OpIAdd, Load(tU, first), Load(tU, n)));
+            b.BranchConditional(more, body, merge);
+            b.Label(body);
+            {
+                const uint32_t jv = Load(tU, j), fv = Load(tU, first);
+                const uint32_t m = UOp(spv::OpISub, jv, fv), corner = Bin(spv::OpULessThan, tB, jv, fv);
+                const uint32_t pick = SelU(UEq(m, 0), Load(tU, pk0), SelU(UEq(m, 1), Load(tU, pk1), Load(tU, pk2)));
+                const uint32_t arg = Load(tU, viPtr(SelU(corner, jv, pick)));
+                const uint32_t res = b.Op(spv::OpFunctionCall, tRet, { guest, arg });
+                const uint32_t kp = Comp(res, 0, tV4), ko = Comp(res, 1, tA16), kpts = Comp(res, 2, tV4);
+                b.If(corner, [&] {
+                    Store(vpPtr(jv), kp);
+                    b.If(UEq(jv, 2), [&] {
+                        // The second triangle: role 0 the computed fourth corner, roles 1 and 2 the hypotenuse's ends.
+                        uint32_t v[3], nd[3];
+                        for (uint32_t c = 0; c < 3; c++)
+                        {
+                            v[c] = Load(tV4, vpPtr(U(c)));
+                            nd[c] = Vec2(FDiv(Comp(v[c], 0), Comp(v[c], 3)), FDiv(Comp(v[c], 1), Comp(v[c], 3)));
+                        }
+                        const uint32_t d01 = b.Ext(tF, GLSLstd450Distance, { nd[0], nd[1] }), d02 = b.Ext(tF, GLSLstd450Distance, { nd[0], nd[2] }),
+                                       d12 = b.Ext(tF, GLSLstd450Distance, { nd[1], nd[2] });
+                        const uint32_t ra = SelU(And(FGe(d12, d01), FGe(d12, d02)), U(0), SelU(FGe(d02, d01), U(1), U(2)));
+                        const uint32_t e1 = UOp(spv::OpUMod, UOp(spv::OpIAdd, ra, U(1)), U(3)), e2 = UOp(spv::OpUMod, UOp(spv::OpIAdd, ra, U(2)), U(3));
+                        const uint32_t role = UBits(e, 29, 3);
+                        b.If(UEq(role, 1), [&] {
+                            Store(rPos, Load(tV4, vpPtr(e1)));
+                            Store(pk0, e1);
+                        }, [&] {
+                            b.If(UEq(role, 2), [&] {
+                                Store(rPos, Load(tV4, vpPtr(e2)));
+                                Store(pk0, e2);
+                            }, [&] {
+                                Store(rPos, Bin(spv::OpFSub, tV4, Bin(spv::OpFAdd, tV4, Load(tV4, vpPtr(e1)), Load(tV4, vpPtr(e2))), Load(tV4, vpPtr(ra))));
+                                Store(n, U(3));
+                                Store(pk0, e1);
+                                Store(pk1, e2);
+                                Store(pk2, ra);
+                            });
+                        });
+                    });
+                }, [&] {
+                    b.If(UEq(m, 0), [&] {
+                        Store(rO, ko);
+                        // (A plain vertex or a point: its own position; a rectangle's was found above.)
+                        b.If(Not(rect), [&] {
+                            Store(rPos, kp);
+                            Store(opts, kpts);
+                        });
+                    }, [&] {
+                        const uint32_t add = UEq(m, 1);
+                        for (uint32_t c = 0; c < 16; c++)
+                        {
+                            const uint32_t ptr = b.Op(spv::OpAccessChain, pFnV4, { rO, I(int32_t(c)) });
+                            const uint32_t cur = Load(tV4, ptr), k = Comp(ko, c, tV4);
+                            Store(ptr, b.Op(spv::OpSelect, tV4, { Splat4B(add), Bin(spv::OpFAdd, tV4, cur, k), Bin(spv::OpFSub, tV4, cur, k) }));
+                        }
+                    });
+                });
+            }
+            b.Branch(cont);
+            b.Label(cont);
+            Store(j, UOp(spv::OpIAdd, Load(tU, j), U(1)));
+            b.Branch(header);
+            b.Label(merge);
+        }
+        // Point sprite: the corner in bits 29-30, expanded around the point in screen space.
+        b.If(isPoint, [&] {
+            const uint32_t corner = UBits(e, 29, 3);
+            const uint32_t ox = Comp(Load(tV4, opts), 0);
+            const uint32_t big = FGt(ox, F(0));
+            const uint32_t dx = b.Ext(tF, GLSLstd450FClamp, { SelF(big, ox, VsF(5, 0)), VsF(5, 2), VsF(5, 3) });
+            const uint32_t dy = b.Ext(tF, GLSLstd450FClamp, { SelF(big, ox, VsF(5, 1)), VsF(5, 2), VsF(5, 3) });
+            const uint32_t cx = UToF(UAnd(corner, 1)), cy = UToF(UShr(corner, 1));
+            Store(rPc, Vec2(cx, cy));
+            auto off = [&](uint32_t c, uint32_t d) { return FMulS(FMulS(FSub(FMulS(c, F(2)), F(1)), d), F(0.5f)); };
+            Store(pointOffset, Vec2(off(cx, dx), off(cy, dy)));
+        });
+
+        // The Xenos viewport transform (PA_CL_VTE_CNTL), Hor+ for wide passes, back to clip space (hlsl.cpp's main).
+        const uint32_t pos = Load(tV4, rPos);
+        const uint32_t flat = Bin(spv::OpFOrdLessThanEqual, tB, FAbs(FSub(Comp(pos, 3), F(1))), F(1e-4f));
+        uint32_t px = SelF(flat, Comp(pos, 0), FMulS(Comp(pos, 0), VsF(12, 0)));
+        uint32_t py = SelF(flat, Comp(pos, 1), FMulS(Comp(pos, 1), VsF(12, 1)));
+        uint32_t pz = Comp(pos, 2);
+        const uint32_t posZ = pz;
+        uint32_t w = Comp(pos, 3);
+        const uint32_t noDivXY = UBit(vteX, 8), noDivZ = UBit(vteX, 9);
+        px = SelF(noDivXY, px, FDiv(px, w));
+        py = SelF(noDivXY, py, FDiv(py, w));
+        pz = SelF(noDivZ, pz, FDiv(pz, w));
+        px = SelF(UBit(vteX, 0), FMulS(px, VsF(6, 0)), px);
+        px = SelF(UBit(vteX, 1), FAdd(px, VsF(7, 0)), px);
+        py = SelF(UBit(vteX, 2), FMulS(py, VsF(6, 1)), py);
+        py = SelF(UBit(vteX, 3), FAdd(py, VsF(7, 1)), py);
+        pz = SelF(UBit(vteX, 4), FMulS(pz, VsF(6, 2)), pz);
+        pz = SelF(UBit(vteX, 5), FAdd(pz, VsF(7, 2)), pz);
+        const uint32_t halfPixel = UEq(UAnd(vteX, 0x30Fu), 0x300u);
+        const uint32_t snap = And(halfPixel, UBit(vteX, 30));
+        px = SelF(snap, b.Ext(tF, GLSLstd450Ceil, { px }), px);
+        py = SelF(snap, b.Ext(tF, GLSLstd450Ceil, { py }), py);
+        const uint32_t shiftFirst = And(And(halfPixel, Not(snap)), UBit(vteX, 31));
+        px = SelF(shiftFirst, FAdd(px, F(0.5f)), px);
+        py = SelF(shiftFirst, FAdd(py, F(0.5f)), py);
+        const uint32_t msaaRect = FGt(VsF(6, 3), F(0));
+        px = SelF(msaaRect, FMulS(px, VsF(6, 3)), px);
+        py = SelF(msaaRect, FMulS(py, VsF(7, 3)), py);
+        const uint32_t shiftAfter = And(And(halfPixel, Not(snap)), Not(UBit(vteX, 31)));
+        px = SelF(shiftAfter, FAdd(px, F(0.5f)), px);
+        py = SelF(shiftAfter, FAdd(py, F(0.5f)), py);
+        const uint32_t d3d9 = And(Not(halfPixel), UBit(vteX, 28));
+        px = SelF(d3d9, FAdd(px, F(0.5f)), px);
+        py = SelF(d3d9, FAdd(py, F(0.5f)), py);
+        const uint32_t po = Load(tV2, pointOffset);
+        px = FAdd(px, Comp(po, 0));
+        py = FAdd(py, Comp(po, 1));
+        w = SelF(noDivXY, F(1), w);
+        const uint32_t sizeX = UToF(VsU(4, 2)), sizeY = UToF(VsU(4, 3));
+        uint32_t ndcX = FSub(FMulS(FDiv(px, sizeX), F(2)), F(1));
+        const uint32_t ndcY = FSub(F(1), FMulS(FDiv(py, sizeY), F(2)));
+        const uint32_t squeeze = And(And(And(flat, FGt(VsF(12, 3), F(0.5f))), FLt(VsF(12, 2), F(1))),
+            And(Not(halfPixel), FLt(FAbs(ndcX), F(0.999f))));
+        ndcX = SelF(squeeze, FMulS(ndcX, VsF(12, 2)), ndcX);
+        uint32_t zc = FMulS(pz, w);
+        const uint32_t homogeneous = And(And(Not(noDivZ), Not(noDivXY)), Not(UBit(vteX, 29)));
+        const uint32_t zh = FAdd(FMulS(posZ, SelF(UBit(vteX, 4), VsF(6, 2), F(1))), FMulS(SelF(UBit(vteX, 5), VsF(7, 2), F(0)), w));
+        zc = SelF(homogeneous, zh, zc);
+        zc = FAdd(zc, FMulS(VsF(11, 0), w));
+        Store(outPos, Vec4(FMulS(ndcX, w), FMulS(ndcY, w), zc, w));
+        Store(outO, Load(tA16, rO));
+        Store(outPc, Load(tV2, rPc));
+        b.EndFunction();
+        words = b.Finish();
+        return true;
+    }
+
 };
 }
 
