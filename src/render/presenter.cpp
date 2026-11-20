@@ -441,7 +441,7 @@ void PresenterUseRenderer()
 }
 
 bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, ID3D12Resource* overlay, uint32_t overlayW, uint32_t overlayH,
-    ID3D12Resource* timer, uint32_t timerW, uint32_t timerH)
+    ID3D12Resource* timer, uint32_t timerW, uint32_t timerH, ID3D12Resource* fps, uint32_t fpsW, uint32_t fpsH)
 {
     if (!g_p.ready)
         return false;
@@ -498,6 +498,17 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, I
         from.pResource = timer;
         from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         list->CopyTextureRegion(&dst, offsetX, offsetY, 0, &from, nullptr);
+    }
+    if (fps && fpsW <= std::min<UINT64>(sd.Width, bd.Width) && fpsH + 12 <= bd.Height)
+    {
+        // Top centre of the picture.
+        D3D12_TEXTURE_COPY_LOCATION dst{}, from{};
+        dst.pResource = backBuffer;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        from.pResource = fps;
+        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        const UINT shownW = UINT(std::min(sd.Width, bd.Width));
+        list->CopyTextureRegion(&dst, offsetX + (shownW - fpsW) / 2, offsetY + 12, 0, &from, nullptr);
     }
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
