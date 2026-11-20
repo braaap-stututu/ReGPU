@@ -5,25 +5,20 @@ XenonRecomp and link ReGPU for graphics: that is the supported route, and the on
 builds for. Read [`README.md`](README.md) for the build and the API, and
 [`docs/xenos-notes.md`](docs/xenos-notes.md) before changing the renderer.
 
-## Work in progress: the Vulkan conversion
+## The renderer is Vulkan
 
-**Vulkan is to be ReGPU's one render backend** (decided 20 Nov 2026): `renderer.cpp` is converted in place, on the
-`vulkan` branch, and Direct3D 12 is then removed, with no abstraction layer between the two. Start with:
-- [`docs/vulkan-conversion-plan.md`](docs/vulkan-conversion-plan.md): the decision, design rules and phases;
-- [`docs/vulkan.md`](docs/vulkan.md): the experimental backend in `src/gpu/vk`, the parts bin;
-- [`docs/merge-2026-11.md`](docs/merge-2026-11.md): where the code came from.
+**Vulkan is ReGPU's one render backend** (decided 20 Nov 2026, converted the same month on the `vulkan` branch):
+`renderer.cpp` was converted in place and Direct3D 12 removed, with no abstraction layer. Read:
+- [`docs/vulkan.md`](docs/vulkan.md): requirements, the layer in `src/gpu/vk`, how the renderer uses it, the tests;
+- [`docs/vulkan-conversion-plan.md`](docs/vulkan-conversion-plan.md): the decision, the commits, the behaviour that
+  changed, and what is still to do (the first boot, phase 0 captures, OpenXR, Linux);
+- [`docs/merge-2026-11.md`](docs/merge-2026-11.md): where the code came from;
 - [`docs/modular-runtimes.md`](docs/modular-runtimes.md): the planned split into core, console frontends (Xenos, later
   RSX) and CPU runtime adapters (ReXenon the default for 360).
 
-The tag `d3d12-reference` is the frozen D3D12 renderer to compare Vulkan frames against. Keep every `REGPU_*` switch
-and its behaviour through the conversion.
-
-**Where the conversion stands:** the plan's "Step 6 progress" section, kept current. The rules:
-- **Coexistence:** `renderer.cpp` holds Vulkan members next to D3D12 ones until each D3D12 one is unused. Every commit
-  builds.
-- **Progress:** `py -3 tools/d3d12_left.py src/gpu/renderer.cpp` counts the D3D12 left.
-- **Tests:** the GPU tests (`regpu_vkprobe`, `regpu_vkrecord`, `regpu_vkresources`, `regpu_vkdraw`) must pass with
-  `REGPU_VK_VALIDATION=2` and no messages.
+The tag `d3d12-reference` is the last D3D12 renderer, kept to compare frames against. Keep every `REGPU_*` switch and
+its behaviour. The GPU tests (`regpu_vkprobe`, `vkrecord`, `vkresources`, `vkdraw`, `vkpasses`) must pass with
+`REGPU_VK_VALIDATION=2` and no messages. The repo's files are LF: write them so on Windows.
 
 ## Ground rules
 
@@ -44,7 +39,7 @@ and its behaviour through the conversion.
 
 1. Recompile it with XenonRecomp; get the game booting to its first `VdInitializeRingBuffer`.
 2. Fill `regpu::Config` and `regpu::Host` (README), call `regpu::Start()`.
-3. Expect a first boot that compiles shaders for minutes (fxc). Later boots load them from
+3. Expect a first boot that compiles shaders for minutes (DXC to SPIR-V, then pipelines). Later boots load them from
    `Config::userDir`. Changing `src/gpu/hlsl.cpp`'s preamble invalidates every cached shader.
 4. Work through the screens. For each broken one: capture, find the draw, fix, re-check the others.
 5. Write the game's quirks down in the port, not here.
@@ -113,10 +108,10 @@ Same scene, same settings, both sides: if the console shows it too, it isn't a R
 | `src/gpu/gpu.cpp` | Command processor (PM4 packets), `Vd*` exports, interrupts, vblank, frame cap |
 | `src/gpu/ucode.cpp` | Xenos shader microcode decoder |
 | `src/gpu/hlsl.cpp` | Microcode to HLSL (the preamble: fetches, unpacking, constants) |
-| `src/gpu/renderer.cpp` | D3D12: draws, EDRAM surfaces, resolves, textures, pipelines, upscaling, captures |
+| `src/gpu/renderer.cpp` | Vulkan: draws, EDRAM surfaces, resolves, textures, pipelines, upscaling, captures |
 | `src/gpu/texture.cpp` | Texture formats, tiling, decoding |
 | `src/gpu/frame.cpp`, `shader_scan.cpp` | Shader uploads, finding shaders in memory ahead of use |
 | `src/render/presenter.cpp` | Window, swap chain, frame pacing |
-| `src/gpu/vk/` | The Vulkan backend (experimental, `REGPU_VULKAN`): see [`docs/vulkan.md`](docs/vulkan.md) |
+| `src/gpu/vk/` | The Vulkan layer under the renderer (device, recorder, resources, bindings, pipelines, passes): see [`docs/vulkan.md`](docs/vulkan.md) |
 | `src/debug.cpp` | The debug server (`tools/regpuctl.py`) |
 | `tools/` | regpuctl, XBDM tools, shader disassembler (`xenos_dis.cpp`), frame comparison |

@@ -170,7 +170,7 @@ measurements are FM2's, at 1080p. FM2's environment variable names are `FM2_*`; 
 | 3 | **`RecordedList` with Vulkan operations** (`src/gpu/vk/recorded.h`, test `regpu_vkrecord`) | Done, `8d57e6b` |
 | 4 | **Resources** (`src/gpu/vk/resources.*`, `bindings.*`; tests `regpu_vkresources`, `regpu_vkdraw`) | Done, `b0eaaee`, `09f9dc5` |
 | 5 | **Pipelines and shaders** (`src/gpu/vk/pipelines.*`; the translated-shader layout tested by `regpu_vkdraw`) | Building blocks done, `09f9dc5`; `PipelineKey` to `VkPipeline` goes with step 6 |
-| 6 | **The renderer, function by function** | In progress: see "Step 6 progress" below |
+| 6 | **The renderer, function by function**, then D3D12 deleted | Done, `4af99c6` to `63b8c59` (20 Nov 2026): see "Step 6" below |
 | 7 | **First boot**, only once the user agrees, then slice-by-slice comparison with `d3d12-reference` (phase 2 below) | |
 
 **Step 2, the device:**
@@ -187,65 +187,37 @@ measurements are FM2's, at 1080p. FM2's environment variable names are `FM2_*`; 
   draw or clear begins rendering; a barrier, copy or new target ends it.
 - Root constants become push constants.
 
-**Step 6 progress (20 Nov 2026):** the D3D12 count went from 1,964 tokens in 156 functions to 1,811 in 147
-(`py -3 tools/d3d12_left.py src/gpu/renderer.cpp`).
+**Step 6 (done 20 Nov 2026).** `renderer.cpp`, the presenter and the build have no Direct3D 12 left
+(`py -3 tools/d3d12_left.py src/gpu/renderer.cpp` counts none but comments). The commits, in order:
 
-**Converted so far:**
-- **`InitVulkan`** (`960e8e5`):
-  - the draw bindings and sampler banks;
-  - guest physical memory as an imported host buffer;
-  - the per-slot command pools, rings and set 0s;
-  - the main command buffer and its recorder (`g_mainContext.vkList`).
-- **EDRAM surfaces** (`7be9628`, `3bc76a1`):
-  - `GetSurface`, `DropSurfaces`, `EvictSurfaces`, `SelectSurfaces`, `PropagateDepthClear`;
-  - `DrawContext::vkColor`/`vkDepth`;
-  - `ReleaseWithFrame` with `FrameResources::vkGarbage`;
-  - `SurfaceTargets()`.
-- **Shaders and pipelines** (`8fe18da`):
-  - `CompiledShader::code` is SPIR-V (`SpirvCode`), with the cache in `<key>.vk1.spv`;
-  - `EnsurePipeline` builds `VkPipeline`s through the pipeline cache.
-- **The draw's state** (`7899384`):
-  - `GetPipeline` and `DrawState`;
-  - D3D-convention viewports (`ToVkViewport`, negative height), scissors, the stencil reference and blend constants;
-  - the clears, the pipeline binding, and set 0 with dynamic offsets (sets 1-3 once per command buffer);
-  - the topology and the draw calls.
-- **Index buffers, the arenas and the ring** (`f6f6099`):
-  - `IndexView` replaces `D3D12_INDEX_BUFFER_VIEW`;
-  - the index and vertex arenas are VMA buffers;
-  - `f.ringCpu` points into the Vulkan ring (`RecreateVkRing`), so every CPU ring write lands there;
-  - set 0's `gphys` follows D3D12's per-frame t1 (`UpdateSlotSets`).
+| Commit | What |
+|---|---|
+| `960e8e5`-`f6f6099` | `InitVulkan`, the EDRAM surfaces, SPIR-V shaders and `VkPipeline`s, the draw's state, index buffers, arenas, ring data |
+| `4af99c6` | The command buffer cycle (per-thread pools, `HandOffNew`, the renderer's fence as a timeline semaphore), the upload rings, guest memory import |
+| `2859ef9` | Textures, resolves, ReGPU's own passes (`passes.*`), FSR 1, grading, the post filters, the temporal upscalers, the presenter's swap chain, the frame end, hold and boot screens, the host device and present API |
+| `bc47ec4` | Occlusion queries, draw culling's predication (conditional rendering), the timing and statistics queries |
+| `2286d6d` | D3D12 deleted: `Init`, root signatures, heaps, the D3D12 recorder and pipeline library, fxc/DXIL, the parts-bin renderer; motion vectors' b2; live anisotropy |
+| `63b8c59` | `regpu_vkpasses`, and the two shader fixes it found (entry points named `main`, storage images without a declared format) |
 
-**Still D3D12, by size:**
-- `Init` (the D3D12 objects themselves: they go last);
-- `BlitResolve`;
-- `RendererOnSwapImpl` (the frame end and submission);
-- `GetTextureLocked`;
-- `InitPostAA`, `UpscaleResolved`;
-- `BeginFrameIfNeeded` (the command buffer cycle);
-- `EvaluateTemporal`, `AaDispatch`, `GetCubeTexture`;
-- the front-buffer passes, `HyperCullCollect`, `BootPresent`, `ResolveIntoEnclosing`, and so on.
+**What changed in behaviour (the switches and features that could not stay as they were):**
+- **Texture memory:** VMA replaces the 128 MB texture heaps. `REGPU_COMMITTED_TEXTURES` / `REGPU_COMMITTED_CUBES` give
+  dedicated allocations; `REGPU_OLD_TEXTURE_POOL`, `REGPU_KEEP_TEXTURE_HEAPS` and `REGPU_NO_HEAP_AHEAD` have no meaning.
+- **`REGPU_UMA_TEXTURES`** (opt-in, measured slower): not on Vulkan (`VK_EXT_host_image_copy` would be the way).
+- **EQAA** (`Config::eqaa`): plain MSAA (Vulkan has it only through `VK_AMD_mixed_attachment_samples`).
+- **`REGPU_GPU_UPLOAD_RING`** follows resizable BAR (a device-local, host-visible memory type over 256 MB).
+- **`REGPU_OPTIMIZE_SHADERS` / `REGPU_OPTIMIZE_LEVEL`** (fxc's background optimiser) are gone: DXC optimises once.
+- **Debugging:** `REGPU_D3D12_DEBUG`, `REGPU_D3D12_GBV`, `REGPU_D3D12_STACKS` → `REGPU_VK_VALIDATION=1|2`;
+  `REGPU_DRED` has no counterpart (`VK_EXT_device_fault` would be it); `REGPU_DUMP_ROOTSIG` (RGA) is not needed (RGA
+  reads SPIR-V); `REGPU_TRACE_BARRIERS` (barriers by call site) is not ported.
+- **The swap chain** follows the window's size (Vulkan has no DXGI-style stretch): the frame end blits the picture
+  onto the output canvas scaled to it.
+- **Draw culling** (`REGPU_DRAW_CULL`) needs `VK_EXT_conditional_rendering`; per-draw queries (draw culling, Hyper
+  culling, pipeline statistics) stay inside the render pass, the title's own occlusion queries end it.
+- **VR (OpenXR)** takes the stub until its session moves to `XR_KHR_vulkan_enable2`.
 
-**Still D3D12 inside the draw:**
-- occlusion queries and predication (`DrawCull`, `HyperCull`, the occlusion heap), and pipeline statistics;
-- the motion block (b2, `motionPrevious`);
-- the `ClearRenderTargetView` calls after the draw.
-
-**Suggested next order:**
-1. **The command buffer cycle:** `BeginFrameIfNeeded`, `AcquireList`, the hand-offs, `RendererOnSwapImpl`'s submission,
-   `WaitFenceValue` / `WaitGpuIdle` on the queue timeline.
-2. **Textures:** `CreateTexture`, `GetTextureLocked`, cubes, volumes, `BindlessIndexLocked` to `vk::WriteTexture` with
-   swizzled views.
-3. **Resolves:** `BlitResolve`, `Resolve`, `WriteResolveToGuest`, write-backs. The blit shaders also need SPIR-V.
-4. **Queries and predication.**
-5. **The frame end and present:** the presenter's swap chain.
-6. **The extras** (phase 4).
-
-**Known interim gaps, marked in the code:**
-- **Motion targets:** `Upscale::vkMotion` / `vkReactive` are null until the upscalers are converted.
-- **EQAA:** Vulkan has it only through AMD's mixed-samples extension.
-- **The ring's auto mode:** with `REGPU_GPU_UPLOAD_RING` on auto, the ring is made again at every switch.
-- **Strip restart:** `pd.primitiveRestart` with a dynamic list topology needs `primitiveTopologyListRestart`, or keep
-  strips separate.
+**Not verified yet:** no game has run on this branch. The GPU tests cover the layer (`regpu_vkprobe`, `vkrecord`,
+`vkresources`, `vkdraw`, `vkpasses`, all clean under synchronization validation), not the renderer's paths through a
+real frame. Step 7, the first boot, needs the user's go-ahead.
 
 **Steps 2 and 3, what to know:**
 - `vk::Submit`, `vk::Completed` and `vk::WaitFor` on the queue timeline replace D3D12's fences. The queue needs a
@@ -260,8 +232,8 @@ measurements are FM2's, at 1080p. FM2's environment variable names are `FM2_*`; 
   Synchronization validation caught this on its first run.
 
 **Steps 4 and 5, what to know:**
-- **Five GPU tests** (`regpu_vkprobe`, `vkrecord`, `vkresources`, `vkdraw`, with `regpu_linkcheck`). Run them with
-  `REGPU_VK_VALIDATION=2`; every one must stay clean.
+- **The GPU tests** (`regpu_vkprobe`, `vkrecord`, `vkresources`, `vkdraw`, `vkpasses`, with `regpu_linkcheck`). Run
+  them with `REGPU_VK_VALIDATION=2`; every one must stay clean.
 - **Image state:** `vk::Image::state` replaces D3D12's resource states. Use `vk::Transition` / `vk::Barriers` with
   `vk::Use`; a read after a read records nothing.
 - **Deferred destruction:** `vk::Graveyard` replaces `FrameResources::garbage`.
@@ -271,8 +243,6 @@ measurements are FM2's, at 1080p. FM2's environment variable names are `FM2_*`; 
     `rrr1`.
 - **Shaders:** `vk::AdaptHlsl` (in `vk_shader.h`) plus `vk::CompileHlsl` make SPIR-V. The PS constants are `pc[]` in
   the preamble.
-- **Name clash:** the parts bin's `vk_context.h` also defines `vk::Image`. Code using the new layer must not include
-  `vk_context.h` / `vk_shaders.h`.
 - **The coexistence rule for step 6:**
   - Add the Vulkan member next to the D3D12 one in `Renderer`, and convert functions to it.
   - Delete a D3D12 member once nothing uses it.
