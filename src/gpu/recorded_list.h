@@ -6,6 +6,7 @@
 // list once everything recorded so far has been replayed (for code that records on it
 // directly, and before Close/Execute). REGPU_NO_RECORD_THREAD=1 calls the driver directly.
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -248,8 +249,17 @@ private:
             return;
         Submit();
         std::unique_lock lock(m_mutex);
+        if (m_queue.empty() && !m_busy)
+            return;
+        const auto w0 = std::chrono::steady_clock::now();
         m_idle.wait(lock, [this] { return m_queue.empty() && !m_busy; });
+        m_drainWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
     }
+
+public:
+    // Time spent waiting in Drain for the replay thread (summed; the long-frame log reads the difference per frame).
+    double m_drainWaitMs = 0;
+private:
 
     void Worker()
     {
