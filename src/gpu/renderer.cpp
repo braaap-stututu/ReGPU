@@ -15,6 +15,7 @@
 #include <array>
 #include <bit>
 #include <immintrin.h>
+#include <intrin.h>
 #include <atomic>
 #include <future>
 #include <condition_variable>
@@ -12946,10 +12947,146 @@ uint32_t EncodeDepth20e4(float v)
 // sampled; REGPU_WRITEBACK_POINT takes that for colour too). Depth goes out as the console stores
 // a D24FS8 copy: 32-bit words, the 20e4 float depth in the top 24 bits. (From the FM4 port: 8888
 // only before, and the top-left texel of each scaled pixel.)
+// WriteResolvePixels' path for half-float images (the colour surfaces and HDR resolves): each texel's four halves
+// converted at once (F16C), the box filter's column spans worked out once per call, the common 8-bit destination
+// formats packed with SSE (others through PackPixel), and each pixel's bytes written as one swapped word. The
+// per-pixel scalar path was ~40% of FM4's draw thread in races (the road surface image, 512x512, written back every
+// frame). REGPU_SLOW_WRITEBACK=1 (live): the scalar path (A/B). Needs F16C (every x64 CPU since 2012; checked).
+bool CpuHasF16c()
+{
+    static const bool has = [] {
+        int r[4];
+        __cpuid(r, 1);
+        return ((r[2] >> 29) & 1) != 0;
+    }();
+    return has;
+}
+
+[[gnu::target("f16c,sse4.1")]] void WriteResolvePixelsHalf(const uint8_t* pixels, UINT pitch, UINT hostW, UINT hostH, uint8_t* guest,
+    uint32_t width, uint32_t destFormat, uint32_t log2Bytes, uint32_t endian, bool swapRB, bool point, uint32_t x0, uint32_t x1, uint32_t y0,
+    uint32_t y1)
+{
+    const uint32_t bytes = 1u << log2Bytes, pitchTexels = (width + 31) & ~31u;
+    const auto span = [point](uint32_t i, uint32_t n, UINT host, UINT& first, UINT& last) {
+        if (point)
+        {
+            first = std::min<UINT>(UINT(uint64_t(2 * i + 1) * host / (2 * uint64_t(n))), host - 1);
+            last = first + 1;
+            return;
+        }
+        first = std::min<UINT>(UINT(uint64_t(i) * host / n), host - 1);
+        last = std::clamp<UINT>(UINT(uint64_t(i + 1) * host / n), first + 1, host);
+    };
+    thread_local std::vector<UINT> colFirst, colLast;
+    colFirst.resize(x1 - x0);
+    colLast.resize(x1 - x0);
+    for (uint32_t x = x0; x < x1; x++)
+        span(x - x0, x1 - x0, hostW, colFirst[x - x0], colLast[x - x0]);
+    const bool fast8 = destFormat == 6 || destFormat == 14 || destFormat == 10 || destFormat == 2 || destFormat == 8 || destFormat == 9;
+    const __m128 zero = _mm_setzero_ps(), one = _mm_set1_ps(1.0f), scale255 = _mm_set1_ps(255.0f), half = _mm_set1_ps(0.5f);
+    for (uint32_t y = y0; y < y1; y++)
+    {
+        UINT hy0, hy1;
+        span(y - y0, y1 - y0, hostH, hy0, hy1);
+        for (uint32_t x = x0; x < x1; x++)
+        {
+            const UINT hx0 = colFirst[x - x0], hx1 = colLast[x - x0];
+            __m128 sum = _mm_setzero_ps();
+            for (UINT hy = hy0; hy < hy1; hy++)
+            {
+                const uint8_t* row = pixels + size_t(hy) * pitch;
+                for (UINT hx = hx0; hx < hx1; hx++)
+                    sum = _mm_add_ps(sum, _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(row + size_t(hx) * 8))));
+            }
+            const UINT count = (hx1 - hx0) * (hy1 - hy0);
+            __m128 c = count == 1 ? sum : _mm_mul_ps(sum, _mm_set1_ps(1.0f / float(count)));
+            if (swapRB)
+                c = _mm_shuffle_ps(c, c, _MM_SHUFFLE(3, 0, 1, 2));
+            uint32_t words[4] = {};
+            if (fast8)
+            {
+                // Unorm(v, 8) for four at once: NaN -> 0 (max returns its second operand), saturated, rounded.
+                const __m128i q = _mm_cvttps_epi32(_mm_add_ps(_mm_mul_ps(_mm_min_ps(_mm_max_ps(c, zero), one), scale255), half));
+                const __m128i b8 = _mm_packus_epi16(_mm_packus_epi32(q, q), _mm_setzero_si128());
+                words[0] = uint32_t(_mm_cvtsi128_si32(b8));
+                if (destFormat == 10)
+                    words[0] &= 0xFFFFu;
+                else if (destFormat == 2 || destFormat == 8 || destFormat == 9)
+                    words[0] &= 0xFFu;
+            }
+            else
+            {
+                alignas(16) float f[4];
+                _mm_store_ps(f, c);
+                regpu::resolve::PackPixel(destFormat, f, words);
+            }
+            uint8_t* at = guest + TextureTiledOffset(x, y, pitchTexels, log2Bytes);
+            // The pixel's bytes in the guest's byte order: whole 16/32-bit words swapped as one where the swap stays within
+            // them, else byte by byte.
+            if (bytes == 4 && (endian == 0 || endian == 2))
+            {
+                const uint32_t w = endian == 2 ? __builtin_bswap32(words[0]) : words[0];
+                memcpy(at, &w, 4);
+            }
+            else if (bytes == 4 && endian == 3)
+            {
+                const uint32_t w = (words[0] << 16) | (words[0] >> 16);
+                memcpy(at, &w, 4);
+            }
+            else if (bytes == 2 && (endian == 0 || endian == 1))
+            {
+                const uint16_t w = endian == 1 ? __builtin_bswap16(uint16_t(words[0])) : uint16_t(words[0]);
+                memcpy(at, &w, 2);
+            }
+            else
+            {
+                const size_t off = size_t(at - guest);
+                const uint8_t* b = reinterpret_cast<const uint8_t*>(words);
+                for (uint32_t k = 0; k < bytes; k++)
+                    guest[regpu::resolve::SwappedByte(off + k, endian)] = b[k];
+            }
+        }
+    }
+}
+
+thread_local bool t_writebackScalar = false; // (REGPU_WRITEBACK_VERIFY's second pass)
 void WriteResolvePixels(const uint8_t* pixels, UINT pitch, VkFormat hostFormat, UINT hostW, UINT hostH, uint32_t base, uint32_t width,
     uint32_t info, bool depth, uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1)
 {
     static LiveSwitch pointColor("REGPU_WRITEBACK_POINT");
+    if (static LiveSwitch slow("REGPU_SLOW_WRITEBACK"); !slow && !t_writebackScalar && !depth && hostFormat == VK_FORMAT_R16G16B16A16_SFLOAT && CpuHasF16c())
+    {
+        const uint32_t endian = info & 7, destFormat = (info >> 7) & 0x3F;
+        uint32_t log2Bytes = 2;
+        if (!regpu::resolve::DestLog2Bytes(destFormat, log2Bytes))
+            return;
+        uint8_t* guest = GuestPtr<uint8_t>(GpuPhysToGuest(base));
+        // REGPU_WRITEBACK_VERIFY=1 (diagnostic, live): each write also made by the scalar path, the bytes compared.
+        static LiveSwitch verify("REGPU_WRITEBACK_VERIFY");
+        std::vector<uint8_t> before, fast;
+        const size_t spanBytes = size_t((width + 31) & ~31u) * ((y1 + 31) & ~31u) << log2Bytes;
+        if (verify)
+            before.assign(guest, guest + spanBytes);
+        WriteResolvePixelsHalf(pixels, pitch, hostW, hostH, guest, width, destFormat, log2Bytes, endian, ((info >> 24) & 1) != 0, pointColor, x0, x1,
+            y0, y1);
+        if (!verify)
+            return;
+        fast.assign(guest, guest + spanBytes);
+        memcpy(guest, before.data(), spanBytes);
+        t_writebackScalar = true;
+        WriteResolvePixels(pixels, pitch, hostFormat, hostW, hostH, base, width, info, depth, x0, x1, y0, y1);
+        t_writebackScalar = false;
+        size_t diffs = 0;
+        for (size_t i = 0; i < spanBytes; i++)
+            diffs += guest[i] != fast[i];
+        static std::atomic<uint32_t> checks{ 0 }, bad{ 0 };
+        checks++;
+        if (diffs && bad++ < 20)
+            Log("writeback verify: %08X %ux%u rows %u-%u format %u endian %u: %zu bytes differ", base, width, y1, y0, y1, destFormat, endian, diffs);
+        if ((checks.load() & 1023) == 0)
+            Log("writeback verify: %u writes checked, %u differed", checks.load(), bad.load());
+        return;
+    }
     const uint32_t endian = info & 7, destFormat = depth ? 6 : (info >> 7) & 0x3F;
     const bool swapRB = !depth && ((info >> 24) & 1);
     uint32_t log2Bytes = 2;
