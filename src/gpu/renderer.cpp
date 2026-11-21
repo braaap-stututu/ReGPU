@@ -17630,6 +17630,26 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
     const auto now = std::chrono::steady_clock::now();
     g_perf.swapSeconds += std::chrono::duration<double>(now - t0).count();
     g_perf.frames++;
+    // REGPU_FRAME_TIMES_SWAP=<file> (start-time): REGPU_FRAME_TIMES's lines ("log seconds, gap ms"), timed at the draw
+    // thread's frame end instead of the present: for a minimized window, which presents nothing.
+    {
+        static FILE* times = [] {
+            const char* path = getenv("REGPU_FRAME_TIMES_SWAP");
+            return path && *path ? fopen(path, "w") : nullptr;
+        }();
+        if (times)
+        {
+            static std::chrono::steady_clock::time_point last{}, flushed = now;
+            if (last != std::chrono::steady_clock::time_point{})
+                fprintf(times, "%.4f,%.3f\n", LogSeconds(), std::chrono::duration<double, std::milli>(now - last).count());
+            last = now;
+            if (now - flushed >= std::chrono::seconds(1))
+            {
+                fflush(times);
+                flushed = now;
+            }
+        }
+    }
     if (PerfLiteOn() || LongFramesEnabled())
         PerfLite::Push(now, g_perf.draws + g_perfDrawsLogged);
     if (LongFramesEnabled())
