@@ -190,11 +190,29 @@ const bool g_alwaysNotify = getenv("REGPU_ALWAYS_NOTIFY") != nullptr;
 // REGPU_HANDOFF_SPIN=<n> (start-time, read at static init: set it in the process environment): each side first spins
 // n pauses (~15 ns each on Zen 4) for the other before it sleeps. A drain (8 a frame in PGR3) costs two wake-ups, the
 // command processor's and then the draw thread's, ~10-20 us each; spinning catches most of them awake (PGR3 port,
-// session 4). Default 2000; 0 = sleep at once, as before.
-const int g_handoffSpin = getenv("REGPU_HANDOFF_SPIN") ? std::max(0, atoi(getenv("REGPU_HANDOFF_SPIN"))) : 2000;
+// session 4). Default 2000 with 6 or more logical CPUs to run on, 0 = sleep at once below that: a spinning thread then
+// takes a core's other half from the draw thread (FM3 frozen grid held to 2 cores: 296.7 fps spinning, 301.5 not).
+// The CPU count is the process's affinity, read again every second.
+int HandoffSpin()
+{
+    static const int forced = getenv("REGPU_HANDOFF_SPIN") ? std::max(0, atoi(getenv("REGPU_HANDOFF_SPIN"))) : -1;
+    if (forced >= 0)
+        return forced;
+    static std::atomic<int> spin{ 2000 };
+    static std::atomic<int64_t> checked{ 0 };
+    const int64_t now = int64_t(GetTickCount64());
+    if (now - checked.load(std::memory_order_relaxed) > 1000)
+    {
+        checked.store(now, std::memory_order_relaxed);
+        DWORD_PTR process = 0, system = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system))
+            spin.store(__builtin_popcountll(uint64_t(process)) >= 6 ? 2000 : 0, std::memory_order_relaxed);
+    }
+    return spin.load(std::memory_order_relaxed);
+}
 void WaitHead(uint64_t old)
 {
-    for (int i = 0; i < g_handoffSpin; i++)
+    for (int i = 0, spins = HandoffSpin(); i < spins; i++)
     {
         if (g_head.load(std::memory_order_acquire) != old)
             return;
@@ -206,7 +224,7 @@ void WaitHead(uint64_t old)
 }
 void WaitTail(uint64_t old)
 {
-    for (int i = 0; i < g_handoffSpin; i++)
+    for (int i = 0, spins = HandoffSpin(); i < spins; i++)
     {
         if (g_tail.load(std::memory_order_acquire) != old)
             return;
