@@ -100,11 +100,19 @@ VkPipeline CreateGraphicsPipeline(Device& d, const PipelineDesc& p, const char* 
     cb.attachmentCount = p.colorCount;
     cb.pAttachments = blend;
 
-    const VkDynamicState dynamic[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+    std::vector<VkDynamicState> dynamic = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
         VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY };
+    if (p.dynamicDepthStencil)
+        dynamic.insert(dynamic.end(), { VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+                                          VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+                                          VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                                          VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE });
+    if (p.dynamicBlend)
+        dynamic.insert(dynamic.end(), { VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
+                                          VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT });
     VkPipelineDynamicStateCreateInfo dyn{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dyn.dynamicStateCount = uint32_t(sizeof(dynamic) / sizeof(dynamic[0]));
-    dyn.pDynamicStates = dynamic;
+    dyn.dynamicStateCount = uint32_t(dynamic.size());
+    dyn.pDynamicStates = dynamic.data();
 
     VkPipelineRenderingCreateInfo rendering{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
     rendering.colorAttachmentCount = p.colorCount;

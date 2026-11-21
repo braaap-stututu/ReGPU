@@ -75,6 +75,12 @@ struct PipelineDesc
     // IBStripCutValue: 0xFFFF / 0xFFFFFFFF ends a strip).
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     bool primitiveRestart = false;
+
+    // Set per draw instead (RecordedList::SetDrawState): cull mode, front face, depth test / write / compare, stencil
+    // test / ops / masks, depth bias (core Vulkan 1.3); and with dynamicBlend (Device::dynamicBlend) attachment 0's blend
+    // enable, equation and write mask. Their values above are then ignored.
+    bool dynamicDepthStencil = false;
+    bool dynamicBlend = false;
 };
 
 // Builds the pipeline (through the device's pipeline cache). VK_NULL_HANDLE and a log line on failure.

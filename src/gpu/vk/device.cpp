@@ -413,6 +413,7 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     const bool derivativesKhr = optional(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     const bool derivativesNv = !derivativesKhr && optional(VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     d.mutableDescriptors = optional(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+    const bool eds3 = optional(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
     // VR (REGPU_VR): what OpenXR runtimes ask of an application's device to share its swapchain images and to sync with
     // its compositor (render/xr.cpp logs the runtime's own list at the session).
     if (const char* vr = getenv("REGPU_VR"); vr && *vr && strcmp(vr, "0") != 0 && strcmp(vr, "off") != 0)
@@ -451,6 +452,12 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     {
         haveMutable.pNext = haveCond.pNext;
         haveCond.pNext = &haveMutable;
+    }
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT haveEds3{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT };
+    if (eds3)
+    {
+        haveEds3.pNext = haveCond.pNext;
+        haveCond.pNext = &haveEds3;
     }
     vkGetPhysicalDeviceFeatures2(d.physical, &have);
     const VkPhysicalDeviceFeatures& h = have.features;
@@ -560,7 +567,18 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     mutableDescriptors.mutableDescriptorType = haveMutable.mutableDescriptorType;
     d.mutableDescriptors = d.mutableDescriptors && haveMutable.mutableDescriptorType;
     if (d.mutableDescriptors)
+    {
         *tail = &mutableDescriptors;
+        tail = &mutableDescriptors.pNext;
+    }
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT dyn3{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT };
+    dyn3.extendedDynamicState3ColorBlendEnable = haveEds3.extendedDynamicState3ColorBlendEnable;
+    dyn3.extendedDynamicState3ColorBlendEquation = haveEds3.extendedDynamicState3ColorBlendEquation;
+    dyn3.extendedDynamicState3ColorWriteMask = haveEds3.extendedDynamicState3ColorWriteMask;
+    d.dynamicBlend = eds3 && dyn3.extendedDynamicState3ColorBlendEnable && dyn3.extendedDynamicState3ColorBlendEquation &&
+        dyn3.extendedDynamicState3ColorWriteMask;
+    if (eds3)
+        *tail = &dyn3;
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
@@ -616,10 +634,10 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     for (uint32_t i = 0; i < d.memory.memoryHeapCount; i++)
         if (d.memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
             local = std::max<uint64_t>(local, d.memory.memoryHeaps[i].size);
-    Log("presenter: Vulkan on %s (%s %s), %llu MB video memory, %s%s; conditional rendering %s, host memory import %s, push descriptors %s",
+    Log("presenter: Vulkan on %s (%s %s), %llu MB video memory, %s%s; conditional rendering %s, host memory import %s, push descriptors %s, dynamic blend %s",
         d.name.c_str(), d.driver.driverName, d.driver.driverInfo, (unsigned long long)(local >> 20),
         d.uma ? "UMA (shared system memory)" : "discrete", d.largeBar ? ", host-visible VRAM (resizable BAR)" : "",
-        d.conditionalRendering ? "yes" : "no", d.externalMemoryHost ? "yes" : "no", d.pushDescriptor ? "yes" : "no");
+        d.conditionalRendering ? "yes" : "no", d.externalMemoryHost ? "yes" : "no", d.pushDescriptor ? "yes" : "no", d.dynamicBlend ? "yes" : "no");
 }
 
 size_t SavePipelineCache(Device& d)

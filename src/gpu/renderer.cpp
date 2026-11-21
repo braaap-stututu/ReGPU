@@ -1803,6 +1803,8 @@ struct DrawState
     uint32_t set0Offsets[3] = { ~0u, ~0u, ~0u };
 
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+    vk::DrawState dyn{};  // the dynamic draw state last set (DynamicDrawState)
+    bool dynSet = false;  // ... in this command buffer since the last pipeline bind
     bool motionTargets = false; // the motion target is bound as the second render target
     bool motionRoot = false;    // the motion root signature is set
     IndexView indexBuffer{};
@@ -6849,15 +6851,12 @@ struct PipelinePool
     }
 };
 
-std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const CompiledShader& ps, const PipelineKey& key)
+// A draw's blend, depth, stencil, cull and depth-bias state from its key (the console's registers), as Vulkan's.
+void StateFromKey(const PipelineKey& key, vk::PipelineDesc& pd)
 {
-    if (auto it = g_r.pipelines.find(key); it != g_r.pipelines.end())
-        return it->second;
     const uint32_t blend = key.blend, depth = key.depth;
     const uint32_t mask = (key.stencilMaskMode >> 24) & 0xF, mode = (key.stencilMaskMode >> 28) & 7, stencil = key.stencilMaskMode & 0xFFFFFF;
     const bool alphaToMask = key.flags & 1, cullable = (key.flags >> 1) & 1;
-    vk::PipelineDesc pd;
-    pd.layout = g_r.vkBindings.layout; // (the motion variants' b2 is in set 0 too: one layout)
     vk::BlendTarget& rt = pd.blend[0];
     const uint32_t srcC = blend & 31, opC = (blend >> 5) & 7, dstC = (blend >> 8) & 31;
     const uint32_t srcA = (blend >> 16) & 31, opA = (blend >> 21) & 7, dstA = (blend >> 24) & 31;
@@ -6919,6 +6918,86 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     // (rectangle corners, point sprites) is never culled.
     static LiveSwitch noCull("REGPU_NO_CULL"); // A/B
     pd.cull = !cullable || noCull ? VK_CULL_MODE_NONE : (mode & 3) == 1 ? VK_CULL_MODE_FRONT_BIT : (mode & 3) == 2 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+}
+
+// Dynamic draw state (FM3: ~2,800 pipelines for 253 shader pairs, most differing only in depth, stencil, cull and blend
+// state): the draws' pipelines are made with depth, stencil, cull and depth bias dynamic (core Vulkan 1.3), keyed
+// without them, and each draw sets them (vk::DrawState). FM3 with a cold pipeline cache: 2,938 pipelines against 3,800,
+// the boot's precompile 5.6 s against 13.9, the race grid at 17.6 s against 26.3. REGPU_VK_NO_DYNAMIC_STATE=1
+// (start-time): the state in the pipelines, as before.
+bool DynamicDrawState()
+{
+    static const bool on = !(getenv("REGPU_VK_NO_DYNAMIC_STATE") && strcmp(getenv("REGPU_VK_NO_DYNAMIC_STATE"), "0") != 0);
+    return on;
+}
+// Blend dynamic too (REGPU_VK_DYNAMIC_BLEND=1, start-time; needs VK_EXT_extended_dynamic_state3): fewer pipelines still
+// (FM3's grid: 1,440 against 2,938) but not faster to boot, and the GPU frame +10% at 1080p on an RX 7900 XTX (the
+// driver can't tailor the colour output to a blend state it doesn't know); depth and stencil dynamic cost +3% there.
+bool DynamicBlendState()
+{
+    static const bool on = DynamicDrawState() && g_r.vkd && g_r.vkd->dynamicBlend && getenv("REGPU_VK_DYNAMIC_BLEND") &&
+        strcmp(getenv("REGPU_VK_DYNAMIC_BLEND"), "0") != 0;
+    return on;
+}
+// The key a pipeline is made and found by: without the state that is dynamic. (Motion pipelines keep their blend: their
+// extra targets' write masks follow it.)
+PipelineKey PipelineLookupKey(const PipelineKey& key)
+{
+    if (!DynamicDrawState())
+        return key;
+    PipelineKey k = key;
+    k.depth = 0;
+    k.biasScale = k.biasOffset = 0;
+    k.flags &= ~2u; // cullable: only the cull mode and the back-face stencil follow it
+    k.stencilMaskMode &= 0x0F000000u; // (the colour mask stays, unless blend is dynamic too)
+    if (DynamicBlendState() && !(k.flags & 0x800))
+    {
+        k.blend = 0;
+        k.stencilMaskMode = 0;
+    }
+    return k;
+}
+// The dynamic part of a draw's state, from its full key.
+vk::DrawState DrawStateFromKey(const PipelineKey& key)
+{
+    vk::PipelineDesc pd;
+    StateFromKey(key, pd);
+    vk::DrawState d{};
+    d.cull = pd.cull;
+    d.frontFace = pd.frontFace;
+    d.depthTest = pd.depthTest;
+    d.depthWrite = pd.depthWrite;
+    d.depthCompare = pd.depthCompare;
+    d.stencilTest = pd.stencilTest;
+    d.frontFail = pd.front.fail, d.frontPass = pd.front.pass, d.frontDepthFail = pd.front.depthFail, d.frontCompare = pd.front.compare;
+    d.backFail = pd.back.fail, d.backPass = pd.back.pass, d.backDepthFail = pd.back.depthFail, d.backCompare = pd.back.compare;
+    d.stencilReadMask = pd.stencilReadMask;
+    d.stencilWriteMask = pd.stencilWriteMask;
+    d.depthBias = pd.depthBiasConstant != 0 || pd.depthBiasSlope != 0;
+    d.biasConstant = pd.depthBiasConstant;
+    d.biasSlope = pd.depthBiasSlope;
+    if (DynamicBlendState() && !(key.flags & 0x800))
+    {
+        const vk::BlendTarget& rt = pd.blend[0];
+        d.blend = 1;
+        d.blendEnable = rt.enable;
+        d.equation = { rt.srcColor, rt.dstColor, rt.colorOp, rt.srcAlpha, rt.dstAlpha, rt.alphaOp };
+        d.writeMask = rt.writeMask;
+    }
+    return d;
+}
+
+std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const CompiledShader& ps, const PipelineKey& fullKey)
+{
+    const PipelineKey key = PipelineLookupKey(fullKey);
+    if (auto it = g_r.pipelines.find(key); it != g_r.pipelines.end())
+        return it->second;
+    vk::PipelineDesc pd;
+    pd.layout = g_r.vkBindings.layout; // (the motion variants' b2 is in set 0 too: one layout)
+    pd.dynamicDepthStencil = DynamicDrawState();
+    pd.dynamicBlend = DynamicBlendState() && !(key.flags & 0x800);
+    StateFromKey(key, pd);
+    const vk::BlendTarget& rt = pd.blend[0];
     pd.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // (the class; the draw sets the exact topology)
     pd.primitiveRestart = key.flags & 0x100;            // D3D12's strip cut 0xFFFF
     pd.colorCount = 1;
@@ -7134,7 +7213,7 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
 
 extern thread_local bool g_hyperProbe;
 VkPipeline GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false, bool stripCut = false,
-    bool coverage = false, bool noKill = false, uint32_t fetchMask = 0)
+    bool coverage = false, bool noKill = false, uint32_t fetchMask = 0, vk::DrawState* state = nullptr)
 {
     PipelineKey key = MakePipelineKey(C().vsHash, C().psHash, depthOnly, cullable);
     if (noKill)
@@ -7158,6 +7237,22 @@ VkPipeline GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool 
         key.flags |= 0x800; // (EnsurePipeline)
     if (stripCut)
         key.flags |= 0x100; // strips restart at index 0xFFFF (DrawImpl)
+    // The draw's dynamic state (DynamicDrawState), from the full key; the pipeline is found by the rest.
+    if (DynamicDrawState())
+    {
+        thread_local PipelineKey lastFull{};
+        thread_local vk::DrawState lastState{};
+        thread_local bool have = false;
+        if (!have || memcmp(&key, &lastFull, sizeof(key)) != 0)
+        {
+            lastFull = key;
+            lastState = DrawStateFromKey(key);
+            have = true;
+        }
+        if (state)
+            *state = lastState;
+        key = PipelineLookupKey(key);
+    }
     thread_local std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> ready; // (cleared when the pipelines are replaced: g_pipelineGen)
     // Runs of draws share a pipeline: the last one's answer first, before the map.
     thread_local PipelineKey lastKey{};
@@ -14374,7 +14469,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // this draw's own (no motion).
     uint32_t motionOffset = 0;
     bool motionKnown = false;
-    VkPipeline pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true, stripCut && directIndex) : VK_NULL_HANDLE;
+    // The bound pipeline's dynamic draw state (DynamicDrawState), and the occlusion coverage draw's.
+    vk::DrawState drawDyn{}, coverDyn{};
+    VkPipeline pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true, stripCut && directIndex, false, false, 0, &drawDyn) : VK_NULL_HANDLE;
     const CompiledShader* psUsed = nullptr; // the pixel shader drawn with, when not a motion pipeline
     if (wantMotion && motion && !pso)
         g_tstat.noPipeline++;
@@ -14405,7 +14502,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const bool depthOnly = edramMode == 5 &&
             !(g_plainRectDraw && !noDepthResetColor && (gpureg::Get(RB_DEPTH_INFO) & 0xFFF) == (gpureg::Get(RB_COLOR_INFO) & 0xFFF) &&
                 (gpureg::Get(0x2200 /* RB_DEPTHCONTROL */) & 5) != 0);
-        pso = GetPipeline(vs, *psUsed, depthOnly, cullable, false, stripCut && directIndex, false, psUsed != &ps);
+        pso = GetPipeline(vs, *psUsed, depthOnly, cullable, false, stripCut && directIndex, false, psUsed != &ps, 0, &drawDyn);
     }
     if (!pso)
     {
@@ -15616,8 +15713,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         if (plain)
             if (const CompiledShader* f = FetchShader(*psUsed, plain))
-                if (VkPipeline fp = GetPipeline(vs, *f, edramMode == 5, cullable, false, stripCut && directIndex, false, psUsed != &ps, plain))
+            {
+                vk::DrawState fetchDyn{};
+                if (VkPipeline fp = GetPipeline(vs, *f, edramMode == 5, cullable, false, stripCut && directIndex, false, psUsed != &ps, plain, &fetchDyn))
+                {
                     pso = fp;
+                    drawDyn = fetchDyn;
+                }
+            }
     }
     if (motion != ds.motionRoot)
     {
@@ -15633,6 +15736,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (pso != ds.pso)
     {
         ds.pso = pso;
+        ds.dynSet = false; // (set again with the new pipeline: another pipeline's static state may have replaced it)
         const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         C().vkList->BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
         if (g_perfTiming)
@@ -15642,6 +15746,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 Log("perf: SetPipelineState took %.1f ms (vs %016llx ps %016llx)", ms, (unsigned long long)C().vsHash, (unsigned long long)C().psHash);
         }
     }
+    auto setDrawState = [&](const vk::DrawState& st) {
+        if (!DynamicDrawState() || (ds.dynSet && memcmp(&st, &ds.dyn, sizeof(st)) == 0))
+            return;
+        ds.dyn = st;
+        ds.dynSet = true;
+        C().vkList->SetDrawState(st);
+    };
+    setDrawState(drawDyn);
     if (Unstable::On())
     {
         using namespace Unstable;
@@ -16095,7 +16207,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     static LiveSwitch noCoverage("REGPU_NO_OCCLUSION_COVERAGE");
     // (A draw worker's draw is never inside the command processor's query: gpu.cpp seg::g_query.)
     VkPipeline coveragePso = !C().worker && g_occlusionOpen && !noCoverage && !motion && g_occlusionCount + 2 <= kOcclusionPerFrame
-        ? GetPipeline(vs, ps, edramMode == 5, cullable, false, stripCut && directIndex, true) : VK_NULL_HANDLE;
+        ? GetPipeline(vs, ps, edramMode == 5, cullable, false, stripCut && directIndex, true, false, 0, &coverDyn) : VK_NULL_HANDLE;
     {
         const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const VkPrimitiveTopology topology = indexedCount && prim == 6 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -16194,11 +16306,15 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             const UINT covered = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
             C().vkList->BeginQuery(g_occlusion.pool, covered, g_r.vkd->occlusionPrecise, true);
             C().vkList->BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, coveragePso);
+            ds.dynSet = false;
+            setDrawState(coverDyn);
             issue();
             C().vkList->EndQuery(g_occlusion.pool, covered, true);
             C().vkList->CopyQueryResults(g_occlusion.pool, covered, 1, g_occlusion.readback->buffer, UINT64(covered) * 8);
             g_occlusionCurrent.coverage.push_back(covered);
             C().vkList->BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
+            ds.dynSet = false;
+            setDrawState(drawDyn);
             g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
             g_occlusionCurrent.main.push_back(g_occlusionIndex);
             C().vkList->BeginQuery(g_occlusion.pool, g_occlusionIndex, g_r.vkd->occlusionPrecise);
@@ -16910,7 +17026,7 @@ void BuildSeedPipelines()
         key.biasOffset = RoundedBias(key.biasOffset);
         if (!seen.insert(PipelineKeyHash{}(key)).second)
             continue;
-        g_seedKeys.insert(key);
+        g_seedKeys.insert(PipelineLookupKey(key));
         listed++;
         if (g_manifest.known.count(key) || g_r.pipelines.count(key))
         {

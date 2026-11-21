@@ -90,6 +90,27 @@ struct Targets
     }
 };
 
+// A draw's depth, stencil, cull, depth-bias and (with Device::dynamicBlend) attachment 0 blend state, for pipelines made
+// with PipelineDesc::dynamicDepthStencil / dynamicBlend (the renderer's draws: one pipeline per shader pair and target
+// layout instead of one per state). Compared byte for byte: zero-initialise.
+struct DrawState
+{
+    VkCullModeFlags cull = VK_CULL_MODE_NONE;
+    VkFrontFace frontFace = VK_FRONT_FACE_CLOCKWISE;
+    uint32_t depthTest = 0, depthWrite = 0, stencilTest = 0, depthBias = 0;
+    VkCompareOp depthCompare = VK_COMPARE_OP_ALWAYS;
+    VkStencilOp frontFail = VK_STENCIL_OP_KEEP, frontPass = VK_STENCIL_OP_KEEP, frontDepthFail = VK_STENCIL_OP_KEEP;
+    VkCompareOp frontCompare = VK_COMPARE_OP_ALWAYS;
+    VkStencilOp backFail = VK_STENCIL_OP_KEEP, backPass = VK_STENCIL_OP_KEEP, backDepthFail = VK_STENCIL_OP_KEEP;
+    VkCompareOp backCompare = VK_COMPARE_OP_ALWAYS;
+    uint32_t stencilReadMask = 0xFF, stencilWriteMask = 0xFF;
+    float biasConstant = 0, biasSlope = 0;
+    uint32_t blend = 0; // 1: dynamic blend set (the fields below)
+    uint32_t blendEnable = 0;
+    VkColorBlendEquationEXT equation{};
+    VkColorComponentFlags writeMask = 0xF;
+};
+
 class RecordedList
 {
 public:
@@ -208,6 +229,7 @@ public:
     void SetStencilReference(uint32_t ref) { Put(kStencilRef, &ref, sizeof(ref)); }
     void SetBlendConstants(const float f[4]) { Put(kBlendConstants, f, sizeof(float) * 4); }
     void SetPrimitiveTopology(VkPrimitiveTopology t) { Put(kTopology, &t, sizeof(t)); }
+    void SetDrawState(const DrawState& s) { Put(kDrawState, &s, sizeof(s)); }
     void BindIndexBuffer(VkBuffer b, VkDeviceSize offset, VkIndexType type)
     {
         struct A { VkBuffer b; VkDeviceSize offset; VkIndexType type; } a{ b, offset, type };
@@ -304,7 +326,7 @@ public:
 private:
     enum Op : uint32_t
     {
-        kBarrier, kTargets, kClearColor, kClearDepth, kPipeline, kSets, kPush, kViewports, kScissors, kStencilRef, kBlendConstants, kTopology,
+        kBarrier, kTargets, kClearColor, kClearDepth, kPipeline, kSets, kPush, kViewports, kScissors, kStencilRef, kBlendConstants, kTopology, kDrawState,
         kIndexBuffer, kDraw, kDrawIndexed, kDispatch, kCopyBuffer, kBufferToImage, kImageToBuffer, kCopyImage, kResolve, kFill, kResetQueries,
         kBeginQuery, kEndQuery, kCopyQueries, kTimestamp, kPredication, kBeginLabel, kEndLabel, kHandOff, kCall, kSwitch, kEndRendering
     };
@@ -615,6 +637,29 @@ private:
             case kStencilRef: vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, At<uint32_t>(a)); break;
             case kBlendConstants: vkCmdSetBlendConstants(cb, reinterpret_cast<const float*>(a)); break;
             case kTopology: vkCmdSetPrimitiveTopology(cb, At<VkPrimitiveTopology>(a)); break;
+            case kDrawState:
+            {
+                const DrawState& s = At<DrawState>(a);
+                vkCmdSetCullMode(cb, s.cull);
+                vkCmdSetFrontFace(cb, s.frontFace);
+                vkCmdSetDepthTestEnable(cb, s.depthTest);
+                vkCmdSetDepthWriteEnable(cb, s.depthWrite);
+                vkCmdSetDepthCompareOp(cb, s.depthCompare);
+                vkCmdSetStencilTestEnable(cb, s.stencilTest);
+                vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, s.frontFail, s.frontPass, s.frontDepthFail, s.frontCompare);
+                vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, s.backFail, s.backPass, s.backDepthFail, s.backCompare);
+                vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, s.stencilReadMask);
+                vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, s.stencilWriteMask);
+                vkCmdSetDepthBiasEnable(cb, s.depthBias);
+                vkCmdSetDepthBias(cb, s.biasConstant, 0.0f, s.biasSlope);
+                if (s.blend)
+                {
+                    vkCmdSetColorBlendEnableEXT(cb, 0, 1, &s.blendEnable);
+                    vkCmdSetColorBlendEquationEXT(cb, 0, 1, &s.equation);
+                    vkCmdSetColorWriteMaskEXT(cb, 0, 1, &s.writeMask);
+                }
+                break;
+            }
             case kIndexBuffer:
             {
                 struct A { VkBuffer b; VkDeviceSize offset; VkIndexType type; };
