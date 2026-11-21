@@ -982,6 +982,27 @@ void PresenterPresent()
             PreciseSleepUntil(slot, 300);
         slot = std::max(slot + interval, Clock::now() - interval / 4); // (a little catch-up; no burst after a late one)
     }
+    // REGPU_FRAME_TIMES=<file> (start-time): every present as "log seconds, gap ms" (one line each), for exact
+    // percentiles and 1% lows (tools/frametimes.py). Flushed once a second.
+    {
+        static FILE* times = [] {
+            const char* path = getenv("REGPU_FRAME_TIMES");
+            return path && *path ? fopen(path, "w") : nullptr;
+        }();
+        if (times)
+        {
+            static Clock::time_point last{}, flushed = Clock::now();
+            const auto now = Clock::now();
+            if (last != Clock::time_point{})
+                fprintf(times, "%.4f,%.3f\n", LogSeconds(), std::chrono::duration<double, std::milli>(now - last).count());
+            last = now;
+            if (now - flushed >= std::chrono::seconds(1))
+            {
+                fflush(times);
+                flushed = now;
+            }
+        }
+    }
     // Present gaps for the light performance log: their 99th percentile once a second (what reaches the screen; the
     // perf lite line's frame times are the draw thread's).
     if (RegpuPerfLiteOn())
