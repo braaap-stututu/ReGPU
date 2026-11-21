@@ -2861,12 +2861,60 @@ vk::Targets SurfaceTargets(uint32_t extraCount = 0, vk::Image* const* extraColor
     return t;
 }
 
+// The images ReleaseWithFrame retires are destroyed on this thread, not the draw thread: freeing a dedicated
+// allocation is a kernel call of up to ~10 ms on Windows (21 Nov 2026, FM3: switching to and from the cockpit camera left
+// the other view's depth surfaces idle, and their release 30 s later made a 16-18 ms frame each time). Nothing uses
+// an image once its frame has completed, and VMA frees from any thread. REGPU_DESTROY_ON_DRAW_THREAD=1: as before.
+struct Deleter
+{
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<vk::Image> queue;
+    Deleter()
+    {
+        std::thread([this] {
+            SetThreadDescription(GetCurrentThread(), L"regpu deleter");
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            for (;;)
+            {
+                vk::Image im;
+                {
+                    std::unique_lock lock(mutex);
+                    cv.wait(lock, [this] { return !queue.empty(); });
+                    im = queue.front();
+                    queue.pop_front();
+                }
+                vk::Destroy(*g_r.vkd, im);
+            }
+        }).detach();
+    }
+    void Push(const vk::Image& im)
+    {
+        {
+            std::lock_guard lock(mutex);
+            queue.push_back(im);
+        }
+        cv.notify_one();
+    }
+};
+void DestroyImageSoon(vk::Image& im)
+{
+    static const bool here = getenv("REGPU_DESTROY_ON_DRAW_THREAD") != nullptr;
+    if (here)
+    {
+        vk::Destroy(*g_r.vkd, im);
+        return;
+    }
+    static Deleter deleter;
+    deleter.Push(im);
+}
+
 // Destroys a Vulkan image once the GPU has finished the current frame (D3D12: Frame().garbage.push_back).
 void ReleaseWithFrame(vk::Image& image)
 {
     if (!image)
         return;
-    Frame().vkGarbage.push_back([im = image]() mutable { vk::Destroy(*g_r.vkd, im); });
+    Frame().vkGarbage.push_back([im = image]() mutable { DestroyImageSoon(im); });
     image = {};
 }
 

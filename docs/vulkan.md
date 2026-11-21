@@ -152,6 +152,9 @@ pipeline stalls left in races, new pipelines show as a frame or two of pop-in):
   (`REGPU_VARIANT_INLINE=1`: as before). Spec variants can't be built ahead (their constants come with the draw); the
   draw uses the base pipeline meanwhile, and "seed coverage: built while drawing" no longer counts them.
   `REGPU_LOG_UNPREPARED=1` logs the first 40 drawn pipelines that weren't built ahead.
+- Retired images (`ReleaseWithFrame`: idle EDRAM surfaces, resized targets) are destroyed on a deleter thread:
+  freeing a dedicated allocation is a kernel call of up to ~10 ms. FM3's cockpit camera left the other view's depth
+  surfaces idle, and their release made a 16-18 ms frame. `REGPU_DESTROY_ON_DRAW_THREAD=1`: as before.
 - Pipelines built during play don't hit the driver cache when their create info changes: a complete pipeline's dynamic
   states must stay in the same order (28a4d62).
 
