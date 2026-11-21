@@ -251,6 +251,20 @@ void LogCrashContext();
 void SetGameWidescreen(bool on);
 // Call when the game has stopped drawing (the window is closing): flushes the shader and pipeline caches.
 void SaveCaches();
+// True when no shader or pipeline compile is running and none finished in the last 2 s: for a tool that steps through
+// the game's screens to warm the caches, and waits between steps.
+bool CompileIdle();
+// Benchmark: the presented frames' times are recorded while on; the report (a text file) gives the average, 1% and 0.1%
+// lows, the slowest frame, pacing and a 5-second timeline, with the CPU, GPU and settings.
+void BenchmarkRecord(bool on);
+void BenchmarkWriteReport(const char* path);
+// Decodes mip 0 of a 2D texture held outside guest memory (a texture file's data after its header) to RGBA8,
+// row-major. `fetch` is the texture fetch constant (6 dwords, host order); false for a format ReGPU can't decode or
+// data shorter than the texture.
+bool DecodeTexture(const uint32_t fetch[6], const uint8_t* data, size_t size, uint32_t& width, uint32_t& height,
+    std::vector<uint8_t>& rgba);
+// Writes RGBA8 as a PNG (for a game's preview tools).
+bool WritePng(const std::filesystem::path& path, uint32_t width, uint32_t height, const std::vector<uint8_t>& rgba);
 // For a host that shuts down while ReGPU's threads still run: call this before the guest's memory and
 // threads go away. When it returns, no interrupt callback is running in guest code and none will be
 // started; interrupts raised later are dropped. It also ends the periodic shader scan of guest memory:

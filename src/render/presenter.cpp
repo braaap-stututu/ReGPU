@@ -982,6 +982,15 @@ void PresenterPresent()
             PreciseSleepUntil(slot, 300);
         slot = std::max(slot + interval, Clock::now() - interval / 4); // (a little catch-up; no burst after a late one)
     }
+    // The benchmark recorder (regpu::BenchmarkRecord): every present's gap while it records.
+    {
+        void BenchmarkFrame(double ms);
+        static Clock::time_point last{};
+        const auto now = Clock::now();
+        if (last != Clock::time_point{})
+            BenchmarkFrame(std::chrono::duration<double, std::milli>(now - last).count());
+        last = now;
+    }
     // REGPU_FRAME_TIMES=<file> (start-time): every present as "log seconds, gap ms" (one line each), for exact
     // percentiles and 1% lows (tools/frametimes.py). Flushed once a second.
     {
@@ -1041,4 +1050,21 @@ uint32_t DisplayRefreshHz()
     if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1)
         return mode.dmDisplayFrequency;
     return 60;
+}
+
+// The GPU's name and its device-local memory, for the benchmark report ("" and 0 before the device exists).
+const char* PresenterGpuName()
+{
+    return g_p.d ? g_p.d->props.deviceName : "";
+}
+uint64_t PresenterGpuMemoryMB()
+{
+    if (!g_p.d)
+        return 0;
+    const VkPhysicalDeviceMemoryProperties& mp = g_p.d->memory;
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+        if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            bytes = std::max<uint64_t>(bytes, mp.memoryHeaps[i].size);
+    return bytes >> 20;
 }

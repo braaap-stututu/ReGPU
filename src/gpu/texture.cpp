@@ -3,6 +3,7 @@
 // this is the reference implementation and the first-pixels path.
 #include <cstdio>
 #include "gpu/texture.h"
+#include "regpu/regpu.h"
 
 #include <algorithm>
 #include <atomic>
@@ -783,4 +784,27 @@ uint32_t TextureFaceStride(const TextureFetch& fetch)
         blocksY = (blocksY + 31) & ~31u;
     }
     return ((pitchBlocks * blocksY << info.log2Bytes) + 4095) & ~4095u;
+}
+
+// (regpu.h) Mip 0 of a 2D texture from a buffer of the caller's (a texture file's data after its header). From the FM4
+// port's ReGPU.
+bool regpu::DecodeTexture(const uint32_t fetchDwords[6], const uint8_t* data, size_t size, uint32_t& width, uint32_t& height,
+    std::vector<uint8_t>& rgba)
+{
+    TextureFetch fetch;
+    std::copy(fetchDwords, fetchDwords + 6, fetch.dwords);
+    FormatInfo info;
+    if (fetch.Type() != 2 || fetch.Dimension() == 2 || !Info(fetch.Format(), info))
+        return false;
+    // The most the decoder reads: tiled surfaces pad pitch and rows to 32 blocks.
+    const uint32_t blocksX = (fetch.Width() + info.blockSize - 1) / info.blockSize;
+    const uint32_t blocksY = (fetch.Height() + info.blockSize - 1) / info.blockSize;
+    const uint32_t pitchBlocks = std::max(fetch.Pitch() / info.blockSize, blocksX);
+    const uint64_t pitch = fetch.Tiled() ? (pitchBlocks + 31) & ~31u : pitchBlocks;
+    const uint64_t rows = fetch.Tiled() ? (blocksY + 31) & ~31u : blocksY;
+    if (uint64_t(size) < pitch * rows << info.log2Bytes)
+        return false;
+    width = fetch.Width();
+    height = fetch.Height();
+    return ::DecodeTexture(fetch, data, rgba);
 }
