@@ -111,6 +111,18 @@ struct DrawState
     VkColorComponentFlags writeMask = 0xF;
 };
 
+// DrawState's fields as RecordedList::SetDrawState's mask bits.
+enum DrawStateField : uint32_t
+{
+    kDsCull = 1, kDsFrontFace = 2, kDsDepthTest = 4, kDsDepthWrite = 8, kDsDepthCompare = 16, kDsStencilTest = 32, kDsFrontOps = 64,
+    kDsBackOps = 128, kDsReadMask = 256, kDsWriteMask = 512, kDsBiasEnable = 1024, kDsBias = 2048, kDsBlend = 4096
+};
+struct DrawStateSet
+{
+    DrawState s;
+    uint32_t mask;
+};
+
 class RecordedList
 {
 public:
@@ -239,7 +251,13 @@ public:
     void SetStencilReference(uint32_t ref) { Put(kStencilRef, &ref, sizeof(ref)); }
     void SetBlendConstants(const float f[4]) { Put(kBlendConstants, f, sizeof(float) * 4); }
     void SetPrimitiveTopology(VkPrimitiveTopology t) { Put(kTopology, &t, sizeof(t)); }
-    void SetDrawState(const DrawState& s) { Put(kDrawState, &s, sizeof(s)); }
+    // mask: the fields to set (DrawStateField bits; all after an invalidation), so a draw that changes one state doesn't
+    // send the other eleven again.
+    void SetDrawState(const DrawState& s, uint32_t mask = ~0u)
+    {
+        const DrawStateSet a{ s, mask };
+        Put(kDrawState, &a, sizeof(a));
+    }
     void BindIndexBuffer(VkBuffer b, VkDeviceSize offset, VkIndexType type)
     {
         struct A { VkBuffer b; VkDeviceSize offset; VkIndexType type; } a{ b, offset, type };
@@ -664,20 +682,34 @@ private:
             case kTopology: vkCmdSetPrimitiveTopology(cb, At<VkPrimitiveTopology>(a)); break;
             case kDrawState:
             {
-                const DrawState& s = At<DrawState>(a);
-                vkCmdSetCullMode(cb, s.cull);
-                vkCmdSetFrontFace(cb, s.frontFace);
-                vkCmdSetDepthTestEnable(cb, s.depthTest);
-                vkCmdSetDepthWriteEnable(cb, s.depthWrite);
-                vkCmdSetDepthCompareOp(cb, s.depthCompare);
-                vkCmdSetStencilTestEnable(cb, s.stencilTest);
-                vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, s.frontFail, s.frontPass, s.frontDepthFail, s.frontCompare);
-                vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, s.backFail, s.backPass, s.backDepthFail, s.backCompare);
-                vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, s.stencilReadMask);
-                vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, s.stencilWriteMask);
-                vkCmdSetDepthBiasEnable(cb, s.depthBias);
-                vkCmdSetDepthBias(cb, s.biasConstant, 0.0f, s.biasSlope);
-                if (s.blend)
+                const DrawStateSet& set = At<DrawStateSet>(a);
+                const DrawState& s = set.s;
+                const uint32_t m = set.mask;
+                if (m & kDsCull)
+                    vkCmdSetCullMode(cb, s.cull);
+                if (m & kDsFrontFace)
+                    vkCmdSetFrontFace(cb, s.frontFace);
+                if (m & kDsDepthTest)
+                    vkCmdSetDepthTestEnable(cb, s.depthTest);
+                if (m & kDsDepthWrite)
+                    vkCmdSetDepthWriteEnable(cb, s.depthWrite);
+                if (m & kDsDepthCompare)
+                    vkCmdSetDepthCompareOp(cb, s.depthCompare);
+                if (m & kDsStencilTest)
+                    vkCmdSetStencilTestEnable(cb, s.stencilTest);
+                if (m & kDsFrontOps)
+                    vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, s.frontFail, s.frontPass, s.frontDepthFail, s.frontCompare);
+                if (m & kDsBackOps)
+                    vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, s.backFail, s.backPass, s.backDepthFail, s.backCompare);
+                if (m & kDsReadMask)
+                    vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, s.stencilReadMask);
+                if (m & kDsWriteMask)
+                    vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, s.stencilWriteMask);
+                if (m & kDsBiasEnable)
+                    vkCmdSetDepthBiasEnable(cb, s.depthBias);
+                if (m & kDsBias)
+                    vkCmdSetDepthBias(cb, s.biasConstant, 0.0f, s.biasSlope);
+                if (s.blend && (m & kDsBlend))
                 {
                     vkCmdSetColorBlendEnableEXT(cb, 0, 1, &s.blendEnable);
                     vkCmdSetColorBlendEquationEXT(cb, 0, 1, &s.equation);

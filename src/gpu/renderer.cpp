@@ -16592,12 +16592,33 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 Log("perf: SetPipelineState took %.1f ms (vs %016llx ps %016llx)", ms, (unsigned long long)C().vsHash, (unsigned long long)C().psHash);
         }
     }
+    // Only the fields that changed since the last draw's are set again (all of them after an invalidation), not all
+    // twelve dynamic states at every change of any one: fewer driver calls on the replay thread. (The GPU time was the
+    // same, FM4 720p grid 3.27 ms either way: AMD's driver writes only what changed.) REGPU_FULL_DRAW_STATE=1 (live):
+    // all of them, as before.
     auto setDrawState = [&](const vk::DrawState& st) {
         if (!DynamicDrawState() || (ds.dynSet && memcmp(&st, &ds.dyn, sizeof(st)) == 0))
             return;
+        uint32_t mask = ~0u;
+        if (static LiveSwitch full("REGPU_FULL_DRAW_STATE"); ds.dynSet && !full)
+        {
+            const vk::DrawState& o = ds.dyn;
+            mask = (st.cull != o.cull ? vk::kDsCull : 0u) | (st.frontFace != o.frontFace ? vk::kDsFrontFace : 0u) |
+                (st.depthTest != o.depthTest ? vk::kDsDepthTest : 0u) | (st.depthWrite != o.depthWrite ? vk::kDsDepthWrite : 0u) |
+                (st.depthCompare != o.depthCompare ? vk::kDsDepthCompare : 0u) | (st.stencilTest != o.stencilTest ? vk::kDsStencilTest : 0u) |
+                (st.frontFail != o.frontFail || st.frontPass != o.frontPass || st.frontDepthFail != o.frontDepthFail || st.frontCompare != o.frontCompare
+                        ? vk::kDsFrontOps : 0u) |
+                (st.backFail != o.backFail || st.backPass != o.backPass || st.backDepthFail != o.backDepthFail || st.backCompare != o.backCompare
+                        ? vk::kDsBackOps : 0u) |
+                (st.stencilReadMask != o.stencilReadMask ? vk::kDsReadMask : 0u) | (st.stencilWriteMask != o.stencilWriteMask ? vk::kDsWriteMask : 0u) |
+                (st.depthBias != o.depthBias ? vk::kDsBiasEnable : 0u) |
+                (st.biasConstant != o.biasConstant || st.biasSlope != o.biasSlope ? vk::kDsBias : 0u) |
+                (st.blend != o.blend || st.blendEnable != o.blendEnable || memcmp(&st.equation, &o.equation, sizeof(st.equation)) != 0 ||
+                        st.writeMask != o.writeMask ? vk::kDsBlend : 0u);
+        }
         ds.dyn = st;
         ds.dynSet = true;
-        C().vkList->SetDrawState(st);
+        C().vkList->SetDrawState(st, mask);
     };
     setDrawState(drawDyn);
     if (Unstable::On())
@@ -17670,8 +17691,45 @@ void RendererStereoCaptureEye(int eye, uint32_t frontBuffer)
 }
 
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer);
+// REGPU_TRACE_VARIANTS=1 (start-time): the fetch variants' states every 10 s (made, ready, pending, failed).
+void TraceFetchVariants()
+{
+    static const bool on = getenv("REGPU_TRACE_VARIANTS") != nullptr;
+    static auto next = std::chrono::steady_clock::now();
+    if (!on || std::chrono::steady_clock::now() < next)
+        return;
+    next = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    uint32_t ready = 0, pending = 0, failed = 0, spec = 0;
+    size_t made;
+    {
+        std::lock_guard lock(g_fetchVariantMutex);
+        made = g_fetchShaders.size();
+        for (const auto& [id, cs] : g_fetchShaders)
+        {
+            const int st = cs->state.load(std::memory_order_acquire);
+            ready += st == CompiledShader::Ready;
+            failed += st == CompiledShader::Failed;
+            pending += st != CompiledShader::Ready && st != CompiledShader::Failed;
+            spec += (uint32_t(id) >> 31) & 1;
+        }
+    }
+    size_t queued;
+    {
+        std::lock_guard lock(Pipelines().mutex);
+        queued = Pipelines().queue.size();
+    }
+    size_t pipelines;
+    {
+        std::lock_guard lock(g_shaderMutex);
+        pipelines = g_r.pipelines.size();
+    }
+    Log("variants: %zu made (%u ready, %u pending, %u failed), pipeline pool queue %zu, %zu pipelines", made, ready, pending, failed, queued,
+        pipelines);
+}
+
 void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
 {
+    TraceFetchVariants();
     const auto t0 = std::chrono::steady_clock::now();
     RendererOnSwapImpl(frameNumber, frontBuffer);
     const auto now = std::chrono::steady_clock::now();
