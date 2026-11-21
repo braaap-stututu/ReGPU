@@ -7484,6 +7484,17 @@ double PipelineBudgetMs()
     }();
     return ms;
 }
+// REGPU_BUDGET_OFFSCREEN=1 (start-time, with a budget): once the game has settled (no load hold for 4 s, GameSettled),
+// off-screen and depth-only draws over the budget are dropped too (shadow maps, reflections and post passes, redrawn
+// every frame). During loads they still wait: a car's livery is built once then, and a layer dropped there stays missing.
+bool BudgetOffscreen()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_BUDGET_OFFSCREEN");
+        return v && *v && strcmp(v, "0") != 0;
+    }();
+    return on;
+}
 std::atomic<double> g_buildAvgMs{ 20.0 }; // recent average pipeline build (cache hits included)
 void NotePipelineBuild(double ms)
 {
@@ -7644,7 +7655,8 @@ VkPipeline GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool 
     }
     // The budget (PipelineBudgetMs): a screen-pass draw over it is dropped for the frame (not clears or must-draw passes).
     if (const double budget = PipelineBudgetMs(); budget >= 0 && entry->state.load(std::memory_order_acquire) == 0 &&
-        g_frameBuildMs.load(std::memory_order_relaxed) >= budget && WidePass() && !PlainRectMustDraw() && !ScreenPassMustDraw())
+        g_frameBuildMs.load(std::memory_order_relaxed) >= budget && !PlainRectMustDraw() && !ScreenPassMustDraw() &&
+        (WidePass() || (BudgetOffscreen() && GameSettled())))
     {
         Pipelines().Push([e = entry] { e->Build(); }, true);
         g_skippedPipeline++;
@@ -7652,6 +7664,12 @@ VkPipeline GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool 
         return nullptr;
     }
     // Deferred (DeferredPipelines): the replay thread waits for it, the pool builds it now.
+    // Why a draw waits for its pipeline (deferred or not): the first 200 a run, to see what still stalls.
+    if (entry->state.load(std::memory_order_acquire) == 0)
+        if (static std::atomic<int> told{ 0 }; told < 200 && told++ < 200)
+            Log("pipelines: draw waits for %016llx/%016llx: %s%s%s%s pitch %u%s", (unsigned long long)key.vs, (unsigned long long)key.ps,
+                WidePass() ? "screen pass" : "off-screen pass", depthOnly ? ", depth only" : "", PlainRectMustDraw() ? ", clear/plain rect" : "",
+                ScreenPassMustDraw() ? ", must-draw screen pass" : "", gpureg::Get(0x2000) & 0x3FFF, GameSettled() ? "" : " (load)");
     if (DeferredPipelines() && entry->state.load(std::memory_order_acquire) == 0 && C().vkList && !C().vkList->Direct())
     {
         Pipelines().Push([e = entry] { e->Build(); }, true);

@@ -137,6 +137,10 @@ start-time switches, off by default until compared in play:
   passes and clears still wait (they may be drawn once and kept). `0`: screen-pass draws never wait.
 - `REGPU_COMPILE_PRIORITY=<Win32 level>` (default -1; -2 lowest, -15 idle) for the shader and pipeline threads,
   `REGPU_COMPILE_THREADS=<n>` shader compile workers (default all threads but one), `REGPU_PIPELINE_THREADS=<n>`.
+- `REGPU_BUDGET_OFFSCREEN=1` (with a budget): once the game has settled (no load hold for 4 s), off-screen and
+  depth-only draws over the budget are dropped too. During loads they still wait: liveries are built once then.
+- `pipelines: draw waits for <vs>/<ps>: <why>`: the first 200 draws a run that waited for a pipeline, and why they
+  couldn't skip (off-screen pass, depth only, clear, must-draw screen pass, during a load).
 - The log line `pipelines: last second N draws dropped by the budget, M deferred binds (average build X ms)`.
 - The direct translator (above) makes shaders and their variants in ~1 ms, where DXC took 200-1600 ms for each spec
   variant (the draw's constants baked in, so new ones come with each new scene).
