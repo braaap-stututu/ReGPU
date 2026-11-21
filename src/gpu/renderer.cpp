@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <execution>
 #include <immintrin.h>
 #include <intrin.h>
 #include <atomic>
@@ -12962,91 +12963,134 @@ bool CpuHasF16c()
     return has;
 }
 
-[[gnu::target("f16c,sse4.1")]] void WriteResolvePixelsHalf(const uint8_t* pixels, UINT pitch, UINT hostW, UINT hostH, uint8_t* guest,
-    uint32_t width, uint32_t destFormat, uint32_t log2Bytes, uint32_t endian, bool swapRB, bool point, uint32_t x0, uint32_t x1, uint32_t y0,
-    uint32_t y1)
+// The shared inputs of one half-float write-back (WriteResolvePixelsHalf), for its row bands.
+struct HalfWriteJob
 {
-    const uint32_t bytes = 1u << log2Bytes, pitchTexels = (width + 31) & ~31u;
-    const auto span = [point](uint32_t i, uint32_t n, UINT host, UINT& first, UINT& last) {
-        if (point)
-        {
-            first = std::min<UINT>(UINT(uint64_t(2 * i + 1) * host / (2 * uint64_t(n))), host - 1);
-            last = first + 1;
-            return;
-        }
-        first = std::min<UINT>(UINT(uint64_t(i) * host / n), host - 1);
-        last = std::clamp<UINT>(UINT(uint64_t(i + 1) * host / n), first + 1, host);
-    };
-    thread_local std::vector<UINT> colFirst, colLast;
-    colFirst.resize(x1 - x0);
-    colLast.resize(x1 - x0);
-    for (uint32_t x = x0; x < x1; x++)
-        span(x - x0, x1 - x0, hostW, colFirst[x - x0], colLast[x - x0]);
-    const bool fast8 = destFormat == 6 || destFormat == 14 || destFormat == 10 || destFormat == 2 || destFormat == 8 || destFormat == 9;
+    const uint8_t* pixels;
+    UINT pitch, hostH;
+    uint8_t* guest;
+    uint32_t pitchTexels, destFormat, log2Bytes, endian, x0, x1, y0, y1;
+    bool swapRB, point, fast8;
+    const UINT *colFirst, *colLast;
+};
+
+[[gnu::target("f16c,sse4.1")]] void WriteHalfRows(const HalfWriteJob& j, uint32_t ya, uint32_t yb)
+{
+    const uint32_t bytes = 1u << j.log2Bytes;
     const __m128 zero = _mm_setzero_ps(), one = _mm_set1_ps(1.0f), scale255 = _mm_set1_ps(255.0f), half = _mm_set1_ps(0.5f);
-    for (uint32_t y = y0; y < y1; y++)
+    for (uint32_t y = ya; y < yb; y++)
     {
         UINT hy0, hy1;
-        span(y - y0, y1 - y0, hostH, hy0, hy1);
-        for (uint32_t x = x0; x < x1; x++)
+        const uint32_t i = y - j.y0, n = j.y1 - j.y0;
+        if (j.point)
         {
-            const UINT hx0 = colFirst[x - x0], hx1 = colLast[x - x0];
+            hy0 = std::min<UINT>(UINT(uint64_t(2 * i + 1) * j.hostH / (2 * uint64_t(n))), j.hostH - 1);
+            hy1 = hy0 + 1;
+        }
+        else
+        {
+            hy0 = std::min<UINT>(UINT(uint64_t(i) * j.hostH / n), j.hostH - 1);
+            hy1 = std::clamp<UINT>(UINT(uint64_t(i + 1) * j.hostH / n), hy0 + 1, j.hostH);
+        }
+        for (uint32_t x = j.x0; x < j.x1; x++)
+        {
+            const UINT hx0 = j.colFirst[x - j.x0], hx1 = j.colLast[x - j.x0];
             __m128 sum = _mm_setzero_ps();
             for (UINT hy = hy0; hy < hy1; hy++)
             {
-                const uint8_t* row = pixels + size_t(hy) * pitch;
+                const uint8_t* row = j.pixels + size_t(hy) * j.pitch;
                 for (UINT hx = hx0; hx < hx1; hx++)
                     sum = _mm_add_ps(sum, _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(row + size_t(hx) * 8))));
             }
             const UINT count = (hx1 - hx0) * (hy1 - hy0);
             __m128 c = count == 1 ? sum : _mm_mul_ps(sum, _mm_set1_ps(1.0f / float(count)));
-            if (swapRB)
+            if (j.swapRB)
                 c = _mm_shuffle_ps(c, c, _MM_SHUFFLE(3, 0, 1, 2));
             uint32_t words[4] = {};
-            if (fast8)
+            if (j.fast8)
             {
                 // Unorm(v, 8) for four at once: NaN -> 0 (max returns its second operand), saturated, rounded.
                 const __m128i q = _mm_cvttps_epi32(_mm_add_ps(_mm_mul_ps(_mm_min_ps(_mm_max_ps(c, zero), one), scale255), half));
                 const __m128i b8 = _mm_packus_epi16(_mm_packus_epi32(q, q), _mm_setzero_si128());
                 words[0] = uint32_t(_mm_cvtsi128_si32(b8));
-                if (destFormat == 10)
+                if (j.destFormat == 10)
                     words[0] &= 0xFFFFu;
-                else if (destFormat == 2 || destFormat == 8 || destFormat == 9)
+                else if (j.destFormat == 2 || j.destFormat == 8 || j.destFormat == 9)
                     words[0] &= 0xFFu;
             }
             else
             {
                 alignas(16) float f[4];
                 _mm_store_ps(f, c);
-                regpu::resolve::PackPixel(destFormat, f, words);
+                regpu::resolve::PackPixel(j.destFormat, f, words);
             }
-            uint8_t* at = guest + TextureTiledOffset(x, y, pitchTexels, log2Bytes);
+            uint8_t* at = j.guest + TextureTiledOffset(x, y, j.pitchTexels, j.log2Bytes);
             // The pixel's bytes in the guest's byte order: whole 16/32-bit words swapped as one where the swap stays within
             // them, else byte by byte.
-            if (bytes == 4 && (endian == 0 || endian == 2))
+            if (bytes == 4 && (j.endian == 0 || j.endian == 2))
             {
-                const uint32_t w = endian == 2 ? __builtin_bswap32(words[0]) : words[0];
+                const uint32_t w = j.endian == 2 ? __builtin_bswap32(words[0]) : words[0];
                 memcpy(at, &w, 4);
             }
-            else if (bytes == 4 && endian == 3)
+            else if (bytes == 4 && j.endian == 3)
             {
                 const uint32_t w = (words[0] << 16) | (words[0] >> 16);
                 memcpy(at, &w, 4);
             }
-            else if (bytes == 2 && (endian == 0 || endian == 1))
+            else if (bytes == 2 && (j.endian == 0 || j.endian == 1))
             {
-                const uint16_t w = endian == 1 ? __builtin_bswap16(uint16_t(words[0])) : uint16_t(words[0]);
+                const uint16_t w = j.endian == 1 ? __builtin_bswap16(uint16_t(words[0])) : uint16_t(words[0]);
                 memcpy(at, &w, 2);
             }
             else
             {
-                const size_t off = size_t(at - guest);
+                const size_t off = size_t(at - j.guest);
                 const uint8_t* b = reinterpret_cast<const uint8_t*>(words);
                 for (uint32_t k = 0; k < bytes; k++)
-                    guest[regpu::resolve::SwappedByte(off + k, endian)] = b[k];
+                    j.guest[regpu::resolve::SwappedByte(off + k, j.endian)] = b[k];
             }
         }
     }
+}
+
+void WriteResolvePixelsHalf(const uint8_t* pixels, UINT pitch, UINT hostW, UINT hostH, uint8_t* guest, uint32_t width, uint32_t destFormat,
+    uint32_t log2Bytes, uint32_t endian, bool swapRB, bool point, uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1)
+{
+    thread_local std::vector<UINT> colFirst, colLast;
+    colFirst.resize(x1 - x0);
+    colLast.resize(x1 - x0);
+    for (uint32_t x = x0; x < x1; x++)
+    {
+        const uint32_t i = x - x0, n = x1 - x0;
+        UINT& first = colFirst[i];
+        UINT& last = colLast[i];
+        if (point)
+        {
+            first = std::min<UINT>(UINT(uint64_t(2 * i + 1) * hostW / (2 * uint64_t(n))), hostW - 1);
+            last = first + 1;
+        }
+        else
+        {
+            first = std::min<UINT>(UINT(uint64_t(i) * hostW / n), hostW - 1);
+            last = std::clamp<UINT>(UINT(uint64_t(i + 1) * hostW / n), first + 1, hostW);
+        }
+    }
+    const HalfWriteJob job{ pixels, pitch, hostH, guest, (width + 31) & ~31u, destFormat, log2Bytes, endian, x0, x1, y0, y1, swapRB, point,
+        destFormat == 6 || destFormat == 14 || destFormat == 10 || destFormat == 2 || destFormat == 8 || destFormat == 9, colFirst.data(),
+        colLast.data() };
+    // A large write (FM4's 512x512 road image, every frame) in bands of 32 rows on the system thread pool (each row's
+    // pixels go to bytes of their own): the draw thread waits for a fraction of it. REGPU_SERIAL_WRITEBACK=1 (live): one
+    // thread.
+    static LiveSwitch serial("REGPU_SERIAL_WRITEBACK");
+    if (!serial && uint64_t(x1 - x0) * (y1 - y0) >= 32768 && y1 - y0 >= 64)
+    {
+        std::vector<uint32_t> bands;
+        for (uint32_t y = y0; y < y1; y += 32)
+            bands.push_back(y);
+        std::for_each(std::execution::par, bands.begin(), bands.end(), [&](uint32_t ya) { WriteHalfRows(job, ya, std::min(ya + 32, y1)); });
+    }
+    else
+        WriteHalfRows(job, y0, y1);
 }
 
 thread_local bool t_writebackScalar = false; // (REGPU_WRITEBACK_VERIFY's second pass)
