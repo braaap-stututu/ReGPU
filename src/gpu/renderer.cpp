@@ -6341,6 +6341,63 @@ const CompiledShader* DirectMotionShader(const CompiledShader& base)
     return cs;
 }
 
+// REGPU_VS_SPECIALIZE (live): a direct vertex shader's variant with the draw's wrapper words as literals
+// (SpirvOptions::vsSpec): the viewport transform's controls, the index source, points, whether rectangle-list corners can
+// occur, and each vertex fetch constant's endian swap and buffer. The wrapper and the fetches otherwise test them at run
+// time for every vertex, and the shader carries every path (FM4: vertex shaders ~1,440 GPU instructions at the median,
+// ~710 specialised). Made on a pipeline-pool thread; nullptr until ready (the draw keeps the base meanwhile), or when the
+// base has 32 already, or can't be made. Keyed by the shader object (patched copies bake their own fetch layouts).
+const CompiledShader* VsSpecShader(const CompiledShader& base, const SpirvOptions& options, uint64_t id)
+{
+    if (!base.direct || base.ucodeBE.empty() || base.pixel)
+        return nullptr;
+    struct Key
+    {
+        const CompiledShader* base;
+        uint64_t id;
+        bool operator==(const Key&) const = default;
+    };
+    struct KeyHash
+    {
+        size_t operator()(const Key& k) const { return std::hash<const void*>()(k.base) ^ size_t(k.id * 0x9E3779B97F4A7C15ull); }
+    };
+    // (Each thread's answers first: a lock per draw otherwise.)
+    thread_local std::unordered_map<Key, const CompiledShader*, KeyHash> memo;
+    const Key key{ &base, id };
+    const CompiledShader* cs = nullptr;
+    if (auto it = memo.find(key); it != memo.end())
+        cs = it->second;
+    else
+    {
+        static std::unordered_map<Key, std::unique_ptr<CompiledShader>, KeyHash> made;
+        static std::unordered_map<const CompiledShader*, uint32_t> count;
+        static std::mutex madeMutex;
+        std::lock_guard lock(madeMutex);
+        if (auto it = made.find(key); it != made.end())
+            cs = it->second.get();
+        else if (count[&base] < 32)
+        {
+            count[&base]++;
+            auto v = std::make_unique<CompiledShader>();
+            v->hash = base.hash;
+            v->pixel = false;
+            v->ucodeBE = base.ucodeBE;
+            v->info = base.info;
+            v->state = CompiledShader::Pending;
+            CompiledShader* p = v.get();
+            const CompiledShader* from = &base; // (shaders are never freed)
+            SpirvOptions o = options;
+            RunOnPipelinePool([p, from, o, id] {
+                if (!DirectVariant(*from, o, *p, id ^ 0x7673737065630000ull))
+                    p->state = CompiledShader::Failed;
+            });
+            cs = made.emplace(key, std::move(v)).first->second.get();
+        }
+        memo.emplace(key, cs);
+    }
+    return cs && cs->IsReady() ? cs : nullptr;
+}
+
 const CompiledShader* MotionShaderLookup(const CompiledShader& base)
 {
     static const bool hlslMotion = getenv("REGPU_MOTION_HLSL") != nullptr;
@@ -7472,7 +7529,7 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     g_r.pipelines[key] = entry;
     // The manifest rebuilds pipelines from the base shaders (not live edits or motion variants; the alpha-test-free
     // variant, flag 0x400, is made again from its base: ManifestPixelShader).
-    if (!motion && !IsPsEditAlias(key.ps) && !IsPsEditAlias(key.vs))
+    if (!motion && !(key.flags & 0x4000) && !IsPsEditAlias(key.ps) && !IsPsEditAlias(key.vs))
     {
         g_manifest.RecordShader(false, key.vs, vs.ucodeBE);
         g_manifest.RecordShader(true, key.ps, ps.ucodeBE);
@@ -7784,10 +7841,17 @@ void BindGraphicsPipeline(vk::RecordedList& list, VkPipeline p)
 }
 
 extern thread_local bool g_hyperProbe;
+thread_local PipelineKey g_lastPipelineKey{}; // the lookup key of the pipeline GetPipeline last answered
+thread_local uint64_t g_vsSpecKey = 0;         // set around GetPipeline for a specialised vertex shader (REGPU_VS_SPECIALIZE)
 VkPipeline GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false, bool stripCut = false,
     bool coverage = false, bool noKill = false, uint32_t fetchMask = 0, vk::DrawState* state = nullptr)
 {
     PipelineKey key = MakePipelineKey(C().vsHash, C().psHash, depthOnly, cullable);
+    if (g_vsSpecKey)
+    {
+        key.vs ^= g_vsSpecKey; // a specialised vertex shader (VsSpecShader): its own pipelines, never in the manifest
+        key.flags |= 0x4000;
+    }
     if (noKill)
         key.flags |= 0x400; // the pixel shader's variant without the alpha test (NoKillShader)
     key.fetchMask = fetchMask; // its plain-fetch variant (FetchShader)
@@ -7853,6 +7917,7 @@ VkPipeline GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool 
             *state = m.state;
         key = PipelineLookupKey(key);
     }
+    g_lastPipelineKey = key; // (REGPU_TRACE_SWITCHES)
     ReadyMemo& memo = readyMemo[PipelineKeyHash{}(key) & 1023];
     if (memo.pso && memcmp(&key, &memo.key, sizeof(key)) == 0)
         return memo.pso;
@@ -7870,7 +7935,7 @@ VkPipeline GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool 
                 Log("perf: GetPipeline waited %.1f ms for the shader lock", ms);
         auto it = g_r.pipelines.find(key);
         // (As the manifest records them: no motion variants or live edits.)
-        if (!motion && !g_seedKeys.empty() && !IsPsEditAlias(key.ps) && !IsPsEditAlias(key.vs) && g_drawnKeys.insert(key).second)
+        if (!motion && !(key.flags & 0x4000) && !g_seedKeys.empty() && !IsPsEditAlias(key.ps) && !IsPsEditAlias(key.vs) && g_drawnKeys.insert(key).second)
         {
             g_drawnPipelines++;
             // A fetch specialisation (mask bit 31) counts as seeded when its base is: it is made from the base at run
@@ -16474,6 +16539,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             C().vkList->SetBlendConstants(factor);
         }
     }
+    // The pixel shader the pipeline was picked with, and its fetch variant mask (for REGPU_VS_SPECIALIZE below).
+    const CompiledShader* psSpecBase = psUsed;
+    uint32_t maskSpecBase = 0;
     // REGPU_FETCH_VARIANTS (FetchVariant): the slots whose fetch constant is plain this draw (pc->tinfo/tbias as
     // just filled in), and the pixel shader's variant for them once compiled and its pipeline built.
     if (static LiveSwitch fetchVariants("REGPU_FETCH_VARIANTS"); fetchVariants && psUsed && pso && LeanFetchLevel() >= 1 && !IsPsEditAlias(C().psHash))
@@ -16571,8 +16639,42 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 {
                     pso = fp;
                     drawDyn = fetchDyn;
+                    psSpecBase = f;
+                    maskSpecBase = plain;
                 }
             }
+    }
+    // REGPU_VS_SPECIALIZE (VsSpecShader; live): the vertex shader's variant for this draw's wrapper words, with the pixel
+    // shader (and fetch variant) already picked. The base until the variant is ready; never for motion draws.
+    if (static LiveSwitch vsSpecialize("REGPU_VS_SPECIALIZE"); vsSpecialize && pso && psSpecBase && !motion && vs.direct && !g_hyperProbe)
+    {
+        SpirvOptions o = vs.directOptions;
+        o.vsSpec = true;
+        o.vte = vc->vte[0];
+        o.vteFlags = vc->vte[1];
+        o.vinfoFlags = vc->info[1];
+        o.rects = prim == 8;
+        uint64_t id = 0xCBF29CE484222325ull;
+        for (uint32_t v : { o.vte, o.vteFlags, o.vinfoFlags, uint32_t(o.rects) })
+            id = (id ^ v) * 0x100000001B3ull;
+        for (uint32_t k : vs.info.vertexFetchConstants)
+        {
+            o.vertexSpecs.push_back({ k, vc->vf[k][1], vc->vf[k][2] });
+            id = (id ^ (k | vc->vf[k][1] << 8 | vc->vf[k][2] << 16)) * 0x100000001B3ull;
+        }
+        id |= 1; // (never 0: g_vsSpecKey 0 is "none")
+        if (const CompiledShader* sv = VsSpecShader(vs, o, id))
+        {
+            vk::DrawState specDyn{};
+            g_vsSpecKey = id;
+            const VkPipeline sp = GetPipeline(*sv, *psSpecBase, edramMode == 5, cullable, false, stripCut && directIndex, false, psUsed != &ps, maskSpecBase, &specDyn);
+            g_vsSpecKey = 0;
+            if (sp)
+            {
+                pso = sp;
+                drawDyn = specDyn;
+            }
+        }
     }
     if (motion != ds.motionRoot)
     {
@@ -16587,6 +16689,39 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     if (pso != ds.pso)
     {
+        // REGPU_TRACE_SWITCHES=1 (live): the frame's pipeline switches by what changed (both shaders, the vertex or the pixel
+        // shader only, or neither: then by key field), every 300 frames.
+        if (static LiveSwitch traceSwitches("REGPU_TRACE_SWITCHES"); traceSwitches && !C().worker)
+        {
+            static PipelineKey prev{};
+            static uint64_t n[9] = {}, frames = 0, lastFrame = 0, firstFrame = 0;
+            const PipelineKey& k = g_lastPipelineKey;
+            const bool v = k.vs != prev.vs, p = k.ps != prev.ps;
+            n[v && p ? 0 : v ? 1 : p ? 2 : 3]++;
+            if (!v && !p)
+            {
+                n[4] += k.blend != prev.blend;
+                n[5] += k.stencilMaskMode != prev.stencilMaskMode;
+                n[6] += k.flags != prev.flags;
+                n[7] += k.fetchMask != prev.fetchMask;
+                n[8] += k.depth != prev.depth || k.biasScale != prev.biasScale || k.biasOffset != prev.biasOffset;
+            }
+            prev = k;
+            if (g_r.frame != lastFrame)
+            {
+                lastFrame = g_r.frame;
+                if (!firstFrame)
+                    firstFrame = g_r.frame;
+                if (++frames >= 300)
+                {
+                    Log("switches a frame: %.0f both shaders, %.0f vertex only, %.0f pixel only, %.0f neither (blend %.0f, colour mask/stencil "
+                        "%.0f, flags %.0f, fetch variant %.0f, depth %.0f)",
+                        n[0] / 300.0, n[1] / 300.0, n[2] / 300.0, n[3] / 300.0, n[4] / 300.0, n[5] / 300.0, n[6] / 300.0, n[7] / 300.0, n[8] / 300.0);
+                    std::fill(std::begin(n), std::end(n), 0);
+                    frames = 0;
+                }
+            }
+        }
         ds.pso = pso;
         ds.dynSet = false; // (set again with the new pipeline: another pipeline's static state may have replaced it)
         const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

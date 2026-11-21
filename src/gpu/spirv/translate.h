@@ -43,6 +43,18 @@ struct SpirvOptions
     // pixel shader writes the motion (location 1, RG) and the reactive mask (location 2, R). Combines with the other
     // options, so a motion draw keeps its alpha-test-free and fetch variants.
     bool motion = false;
+    // A vertex shader's draw words as literals (renderer.cpp's REGPU_VS_SPECIALIZE), so its wrapper compiles to the path
+    // the draw takes: vte (PA_CL_VTE_CNTL with ReGPU's flags: the viewport transform), vteFlags (the index source: direct,
+    // strip, 32-bit, auto, quads, endian), vinfoFlags (points), rects (false: no rectangle-list corners), and each vertex
+    // fetch constant's endian swap and buffer (gmem / gphys). Addresses, offsets, sizes and scales stay uniforms.
+    struct VertexSpec
+    {
+        uint32_t fetch, endian, phys;
+    };
+    bool vsSpec = false;
+    uint32_t vte = 0, vteFlags = 0, vinfoFlags = 0;
+    bool rects = true;
+    std::vector<VertexSpec> vertexSpecs;
 };
 
 // hlslInfo: the HLSL path's result for the same shader (TranslateShader, after the renderer's PackConstants): its

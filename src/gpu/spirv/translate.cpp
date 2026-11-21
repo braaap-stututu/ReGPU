@@ -1362,10 +1362,19 @@ struct Translator
     {
         const uint32_t out = b.Variable(pFnU);
         Store(out, U(0));
+        // (SpirvOptions::vsSpec: the constant's buffer and endian swap as literals, so only one load and one swap remain.)
+        const SpirvOptions::VertexSpec* vspec = nullptr;
+        if (options.vsSpec)
+            for (const SpirvOptions::VertexSpec& v : options.vertexSpecs)
+                if (v.fetch == fetch)
+                    vspec = &v;
         b.If(Bin(spv::OpULessThan, tB, dword, Vf(fetch, 3)), [&] {
             const uint32_t a = UOp(spv::OpIAdd, Vf(fetch, 0), UOp(spv::OpIMul, dword, U(4)));
-            b.If(Bin(spv::OpINotEqual, tB, Vf(fetch, 2), U(0)), [&] { Store(out, GuestWord(gphysV, a)); }, [&] { Store(out, GuestWord(gmemV, a)); });
-            Store(out, Swap(Load(tU, out), Vf(fetch, 1)));
+            if (vspec)
+                Store(out, GuestWord(vspec->phys ? gphysV : gmemV, a));
+            else
+                b.If(Bin(spv::OpINotEqual, tB, Vf(fetch, 2), U(0)), [&] { Store(out, GuestWord(gphysV, a)); }, [&] { Store(out, GuestWord(gmemV, a)); });
+            Store(out, Swap(Load(tU, out), vspec ? U(vspec->endian) : Vf(fetch, 1)));
         });
         return Load(tU, out);
     }
@@ -1666,7 +1675,9 @@ struct Translator
             vsIo.insert(vsIo.end(), { outMcur, outMprev });
         b.EntryPoint(spv::ExecutionModelVertex, entry, "main", vsIo);
         b.BeginFunction(entry, tVoid, b.TypeFunction(tVoid));
-        const uint32_t vteX = VsU(8, 0), vteY = VsU(8, 1), vteZ = VsU(8, 2), vteW = VsU(8, 3), vinfoX = VsU(4, 0), vinfoY = VsU(4, 1);
+        const bool spec = options.vsSpec; // (SpirvOptions::vsSpec: the draw's words as literals)
+        const uint32_t vteX = spec ? U(options.vte) : VsU(8, 0), vteY = spec ? U(options.vteFlags) : VsU(8, 1), vteZ = VsU(8, 2), vteW = VsU(8, 3),
+                       vinfoX = VsU(4, 0), vinfoY = spec ? U(options.vinfoFlags) : VsU(4, 1);
         const uint32_t id = b.Op(spv::OpBitcast, tU, { Load(tI, inVid) });
         // The guest index: direct indices read in place (y: 1 direct, 2 strip, 4 32-bit, 8 auto, 64 quad list, endian in
         // bits 4-5), else ReGPU's expanded list in the upload ring.
@@ -1700,7 +1711,7 @@ struct Translator
 
         // Points (vinfo.y bit 1) and rectangles (the index's bit 31) run the guest program in one loop: a rectangle's three
         // corners for their positions, then the outputs its vertex needs (the fourth corner adds two and takes one).
-        const uint32_t isPoint = UBit(vinfoY, 1), rect = And(Not(isPoint), UBit(e, 31));
+        const uint32_t isPoint = UBit(vinfoY, 1), rect = spec && !options.rects ? b.ConstBool(false) : And(Not(isPoint), UBit(e, 31));
         const uint32_t pFnA3U = b.TypePointer(spv::StorageClassFunction, b.TypeArray(tU, 3));
         const uint32_t pFnA3V = b.TypePointer(spv::StorageClassFunction, b.TypeArray(tV4, 3));
         const uint32_t vi = b.Variable(pFnA3U), vp = b.Variable(pFnA3V), rPos = b.Variable(pFnV4), rO = b.Variable(pFnA16), rPc = b.Variable(

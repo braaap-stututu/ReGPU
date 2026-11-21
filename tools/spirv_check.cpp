@@ -48,6 +48,17 @@ int main(int argc, char** argv)
             options.motion = true;
         else if (!strcmp(argv[i], "--no-kill"))
             options.noAlphaTest = true;
+        else if (!strcmp(argv[i], "--vs-spec") && i + 1 < argc)
+        {
+            // --vs-spec <vte hex>: vertex shaders specialised as an indexed triangle list's (SpirvOptions::vsSpec) with this
+            // PA_CL_VTE_CNTL, every fetch constant 8-in-32 endian and read in place (gphys).
+            options.vsSpec = true;
+            options.vte = uint32_t(strtoul(argv[++i], nullptr, 16));
+            options.vteFlags = 1u | 8u;
+            options.rects = false;
+            for (uint32_t k = 0; k < 96; k++)
+                options.vertexSpecs.push_back({ k, 2, 1 });
+        }
         else if (!strcmp(argv[i], "--keep") && i + 1 < argc)
             keep = argv[++i];
         else
