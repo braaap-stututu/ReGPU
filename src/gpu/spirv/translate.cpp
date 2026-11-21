@@ -9,6 +9,8 @@
 
 #include "gpu/spirv/builder.h"
 
+int PlainMulVertexLevel(); // hlsl.cpp (PlainMulPixelLevel is in hlsl.h)
+
 namespace
 {
 using namespace ucode;
@@ -125,10 +127,42 @@ struct Translator
         return v;
     }
 
-    // Xenos multiply: 0 x anything = 0.
+    // Xenos multiply: 0 x anything = 0. plainMul (PlainMulFor: a shader with no op that can make an infinity or NaN, by
+    // REGPU_PLAIN_MUL_PS / _VS): IEEE's, one instruction instead of two compares, an or and a select (and in wave64 each
+    // compare's mask is two scalar registers: FM4's vertex shaders ran out of them and spilled). The same result there
+    // but the sign of a zero.
+    bool plainMul = false;
+    // REGPU_SPIRV_FINITE_MUL=1 (start-time): per instruction instead of per shader. Each temp register (and ps) carries
+    // "may hold an infinity or NaN": set by the scalar ops PlainMulFor counts (exp2, log, raw rcp, raw rsq, sqrt), passed
+    // on by every op that reads it, kept by partial, predicated and conditional writes (straight-line programs only:
+    // taintOn). A multiply whose two operands can't hold one is IEEE's. Constants, fetches and inputs count as finite,
+    // as PlainMulFor's level 2 assumes. FM4's vertex shaders, compiled offline: every multiply plain was -22% code;
+    // shaders with no such op only -1% (most have an rcp or exp somewhere, for fog).
+    bool taintOn = false, mulFinite = false, psTaint = false;
+    int maybeDepth = 0; // > 0: inside a predicated instruction or conditional exec (a write may not happen)
+    uint8_t taint[256] = {};
+    static bool FiniteMulSwitch()
+    {
+        static const bool on = [] {
+            const char* v = getenv("REGPU_SPIRV_FINITE_MUL");
+            return v && *v && strcmp(v, "0") != 0;
+        }();
+        return on;
+    }
+    bool Tainted(const Source& s) const { return taintOn && !s.isConstant && taint[s.reg & 255]; }
+    void TaintWrite(uint32_t reg, bool t, bool full)
+    {
+        if (!taintOn)
+            return;
+        reg &= 255;
+        taint[reg] = (full && !maybeDepth) ? uint8_t(t) : uint8_t(taint[reg] || t);
+    }
+    static bool MakesInf(uint32_t scalarOp) { return scalarOp == 14 || scalarOp == 15 || scalarOp == 16 || scalarOp == 19 || scalarOp == 22 || scalarOp == 40; }
     uint32_t Mul9(uint32_t x, uint32_t y, bool vec)
     {
         const uint32_t t = vec ? tV4 : tF, bt = vec ? tB4 : tB, z = vec ? Zero4() : F(0);
+        if (plainMul || (taintOn && mulFinite))
+            return Bin(spv::OpFMul, t, x, y);
         const uint32_t c = Bin(spv::OpLogicalOr, bt, Bin(spv::OpFOrdEqual, bt, x, z), Bin(spv::OpFOrdEqual, bt, y, z));
         return b.Op(spv::OpSelect, t, { c, z, Bin(spv::OpFMul, t, x, y) });
     }
@@ -356,15 +390,31 @@ struct Translator
         const bool vectorSideEffect = (a.vectorOp >= 20 && a.vectorOp <= 27) || a.vectorOp == 29;
         const bool vectorUnused = !a.vectorMask && !vectorSideEffect && !(a.exportData && a.scalarDestRelative);
         uint32_t v = Zero4(), A = 0;
+        // (REGPU_SPIRV_FINITE_MUL: the operands' and results' "may be infinite or NaN", see taintOn.)
+        const bool vTaint = Tainted(a.src[0]) || Tainted(a.src[1]) || Tainted(a.src[2]);
         if (!vectorUnused)
         {
             A = Src(a.src[0]);
             const uint32_t B = Src(a.src[1]), C = Src(a.src[2]);
+            mulFinite = !Tainted(a.src[0]) && !Tainted(a.src[1]);
             v = VectorOp(a, A, B, C);
             if (a.vectorClamp)
                 v = Saturate(v, true);
         }
+        bool sTaint = psTaint;
+        if (!scalarKept && taintOn)
+        {
+            const uint32_t op = a.scalarOp;
+            const bool usesPs = op == 1 || op == 3 || op == 4 || op == 50;
+            bool in = Tainted(a.src[2]);
+            if (op >= 42 && op <= 47) // (a temp spread over the opcode and swizzle bits, and a constant: ScalarOp)
+                in = taint[((op & 1) | (uint32_t(a.src3IsTemp) << 1) | (a.src3RawSwizzle & 0x3C)) & 255] != 0;
+            mulFinite = !in && !(usesPs && psTaint);
+            sTaint = op == 50 ? psTaint : (in || (usesPs && psTaint) || MakesInf(op));
+        }
         uint32_t s = scalarKept ? Load(tF, ps) : ScalarOp(a);
+        if (!scalarKept && taintOn)
+            psTaint = maybeDepth ? (psTaint || sTaint) : sTaint;
         if (a.vectorOp == 29 && !vectorUnused) // MAXAv: a0 from the first operand's W, after the reads
         {
             const uint32_t i = b.Op(spv::OpConvertFToS, tI, { b.Ext(tF, GLSLstd450Floor, { Bin(spv::OpFAdd, tF, Comp(A, 3), F(0.5f)) }) });
@@ -406,8 +456,13 @@ struct Translator
         else
         {
             WriteMasked(RegPtr(a.vectorDest), v, a.vectorMask);
+            if (a.vectorMask & 15)
+                TaintWrite(a.vectorDest, vTaint, (a.vectorMask & 15) == 15);
             if (a.scalarMask & 15)
+            {
                 WriteMasked(RegPtr(a.scalarDest), Splat(s), a.scalarMask);
+                TaintWrite(a.scalarDest, sTaint, (a.scalarMask & 15) == 15);
+            }
         }
     }
 
@@ -423,7 +478,9 @@ struct Translator
             uint32_t c = Load(tB, p);
             if (!a.predCondition)
                 c = Not(c);
+            maybeDepth++;
             b.If(c, [&] { EmitAluBody(a); });
+            maybeDepth--;
         }
         else
             EmitAluBody(a);
@@ -743,6 +800,11 @@ struct Translator
             c[i] = sel < 4 ? Comp(value, sel) : sel == 4 ? F(0) : sel == 5 ? F(1) : Comp(old, i);
         }
         Store(ptr, Vec4(c[0], c[1], c[2], c[3]));
+        // (A fetch result counts as finite; components kept (6, 7) keep their register's state.)
+        bool full = true;
+        for (uint32_t i = 0; i < 4; i++)
+            full = full && ((swizzle >> (3 * i)) & 7) < 6;
+        TaintWrite(dest, false, full);
     }
 
     void EmitFetchBody(const Fetch& f)
@@ -891,7 +953,9 @@ struct Translator
             uint32_t c = BoolConstant((cf.hi >> 2) & 0xFF);
             if (!cf.condition())
                 c = Not(c);
+            maybeDepth++;
             b.If(c, [&] { EmitExec(cf); });
+            maybeDepth--;
             break;
         }
         case CfOp::CondExecPred:
@@ -900,7 +964,9 @@ struct Translator
             uint32_t c = Load(tB, p);
             if (!cf.condition())
                 c = Not(c);
+            maybeDepth++;
             b.If(c, [&] { EmitExec(cf); });
+            maybeDepth--;
             break;
         }
         case CfOp::CondJmp:
@@ -975,6 +1041,38 @@ struct Translator
     }
 
     // Checks everything the program reaches before emitting anything (so a fallback costs no module).
+    // hlsl.cpp's PlainMulPixelLevel / PlainMulVertexLevel for this shader: 1 every shader, 2 those with no scalar op that
+    // can make an infinity or NaN (raw rcp, rsq, log, sqrt, exp2: Emitter::mayMakeInf), 3 the same with sqrt and rsq
+    // allowed (mayMakeInfStrict). Session 33 of the FM3 port: 1 in pixel shaders turned the crowd's flags black.
+    bool PlainMulFor(int level)
+    {
+        if (level <= 0)
+            return false;
+        if (level == 1)
+            return true;
+        for (const Cf& cf : shader.cf)
+        {
+            if (!cf.IsExec())
+                continue;
+            for (uint32_t k = 0; k < cf.count(); k++)
+            {
+                if ((cf.sequence() >> (2 * k)) & 1)
+                    continue; // (a fetch)
+                const uint32_t index = cf.address() + k;
+                if (size_t(index) * 3 + 3 > shader.words.size())
+                    return false;
+                const Alu a = DecodeAlu(&shader.words[index * 3]);
+                switch (a.scalarOp)
+                {
+                case 14: case 15: case 16: case 19: return false;
+                case 22: case 40: if (level != 3) return false; break;
+                default: break;
+                }
+            }
+        }
+        return true;
+    }
+
     bool Scan(std::vector<bool>& reachable, bool& linear, bool& forward, bool& loops)
     {
         linear = true;
@@ -1091,6 +1189,8 @@ struct Translator
         bool linear, forward, loops;
         if (!Scan(reachable, linear, forward, loops))
             return false;
+        plainMul = PlainMulFor(PlainMulPixelLevel());
+        taintOn = !plainMul && linear && FiniteMulSwitch();
         for (uint32_t i = 0, n = 0; i < 256; i++)
             rank[i] = uint8_t(n), n += (info.constantMask[i >> 6] >> (i & 63)) & 1;
 
@@ -1277,6 +1377,10 @@ struct Translator
     // The guest program's control flow (straight, forward jumps, or a loop over the blocks), into the current function.
     void EmitProgram(const std::vector<bool>& reachable, bool linear, bool forward, bool loops)
     {
+        // (Each emission of the guest program starts with every register finite: a motion variant emits it twice.)
+        std::fill(std::begin(taint), std::end(taint), uint8_t(0));
+        psTaint = false;
+        maybeDepth = 0;
         if (linear)
         {
             for (size_t i = 0; i < shader.cf.size(); i++)
@@ -1501,19 +1605,20 @@ struct Translator
             return why = "dynamic vertex fetch (REGPU_DYNAMIC_VFETCH)", false;
         if (LeanVertexFetch())
             return why = "REGPU_LEAN_VFETCH", false;
-        // (hlsl.cpp's PlainMulVertexLevel, TripleShaders and StereoShaders: the same switches.)
+        // (hlsl.cpp's TripleShaders and StereoShaders: the same switches.)
         auto envOn = [](const char* name) {
             const char* v = getenv(name);
             return v && *v && strcmp(v, "0") != 0;
         };
-        if (envOn("REGPU_PLAIN_MUL_VS"))
-            return why = "REGPU_PLAIN_MUL_VS", false;
         if (envOn("REGPU_TRIPLE") || (getenv("REGPU_VR") && strcmp(getenv("REGPU_VR"), "stereo") == 0))
             return why = "triple-screen or stereo vertex shaders", false;
         std::vector<bool> reachable;
         bool linear, forward, loops;
         if (!Scan(reachable, linear, forward, loops))
             return false;
+        // REGPU_PLAIN_MUL_VS (hlsl.cpp's PlainMulVertexLevel), as the HLSL path applies it.
+        plainMul = PlainMulFor(PlainMulVertexLevel());
+        taintOn = !plainMul && linear && FiniteMulSwitch();
         for (uint32_t i = 0, n = 0; i < 256; i++)
             rank[i] = uint8_t(n), n += (info.constantMask[i >> 6] >> (i & 63)) & 1;
 
