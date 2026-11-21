@@ -600,6 +600,68 @@ private:
                 struct A { uint32_t images, buffers, global; };
                 const A& c = At<A>(a);
                 EndRendering(cb);
+                // Barriers recorded back to back (nothing recorded between them) go out as one vkCmdPipelineBarrier2: on
+                // AMD each call waits and flushes on its own (RGP, FM4's grid: 93 of 319 barriers came right after
+                // another). Not merged when the next one names an image already in the batch (a second transition of
+                // the same image must follow the first). REGPU_BARRIER_MERGE=1 (start-time, off by default): FM4's 1440p 4x
+                // grid on an RX 7900 XTX ran the same with it (3.52-3.62 ms against 3.52-3.54, alternated boots), and
+                // synchronization validation reported nothing.
+                static const bool noMerge = !(getenv("REGPU_BARRIER_MERGE") && strcmp(getenv("REGPU_BARRIER_MERGE"), "0") != 0);
+                if (!noMerge && p < end)
+                {
+                    uint32_t next[2];
+                    memcpy(next, p, sizeof(next));
+                    if (next[0] == kBarrier)
+                    {
+                        thread_local std::vector<VkImageMemoryBarrier2> images;
+                        thread_local std::vector<VkBufferMemoryBarrier2> buffers;
+                        thread_local std::vector<VkMemoryBarrier2> globals;
+                        images.clear();
+                        buffers.clear();
+                        globals.clear();
+                        auto take = [&](const uint8_t* q) {
+                            const A& x = At<A>(q);
+                            const auto* im = reinterpret_cast<const VkImageMemoryBarrier2*>(q + sizeof(A));
+                            const auto* bu = reinterpret_cast<const VkBufferMemoryBarrier2*>(q + sizeof(A) + sizeof(VkImageMemoryBarrier2) * x.images);
+                            const auto* gl = reinterpret_cast<const VkMemoryBarrier2*>(
+                                q + sizeof(A) + sizeof(VkImageMemoryBarrier2) * x.images + sizeof(VkBufferMemoryBarrier2) * x.buffers);
+                            images.insert(images.end(), im, im + x.images);
+                            buffers.insert(buffers.end(), bu, bu + x.buffers);
+                            globals.insert(globals.end(), gl, gl + x.global);
+                        };
+                        take(a);
+                        while (p < end)
+                        {
+                            memcpy(next, p, sizeof(next));
+                            if (next[0] != kBarrier)
+                                break;
+                            const uint8_t* q = p + sizeof(next);
+                            const A& x = At<A>(q);
+                            const auto* im = reinterpret_cast<const VkImageMemoryBarrier2*>(q + sizeof(A));
+                            bool repeat = false;
+                            for (uint32_t i = 0; i < x.images && !repeat; i++)
+                                for (const VkImageMemoryBarrier2& have : images)
+                                    if (have.image == im[i].image)
+                                    {
+                                        repeat = true;
+                                        break;
+                                    }
+                            if (repeat || x.buffers || x.global || !buffers.empty() || !globals.empty())
+                                break; // (buffer and global barriers: kept apart, as recorded)
+                            take(q);
+                            p = q + next[1];
+                        }
+                        VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                        di.imageMemoryBarrierCount = uint32_t(images.size());
+                        di.pImageMemoryBarriers = images.data();
+                        di.bufferMemoryBarrierCount = uint32_t(buffers.size());
+                        di.pBufferMemoryBarriers = buffers.data();
+                        di.memoryBarrierCount = uint32_t(globals.size());
+                        di.pMemoryBarriers = globals.data();
+                        vkCmdPipelineBarrier2(cb, &di);
+                        break;
+                    }
+                }
                 VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
                 di.imageMemoryBarrierCount = c.images;
                 di.pImageMemoryBarriers = reinterpret_cast<const VkImageMemoryBarrier2*>(a + sizeof(A));

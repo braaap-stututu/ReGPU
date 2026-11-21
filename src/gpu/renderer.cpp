@@ -12853,8 +12853,25 @@ void QueueClosedAndSubmit(VkCommandBuffer closed, void* ctx)
 void EndOcclusionQuery();
 void EndOcclusionPart();
 
+// A deferred write-back's copy into its readback buffer, recorded in the main list without its host barrier yet
+// (QueueDeferredWriteback): the barrier goes in once, just before the list is closed for a fence or the frame's end,
+// where the host may next read (the fence writer after that fence, or the frame slot). Right after the copy it waited
+// for the GPU to go idle mid-frame (RGP, FM4's grid: a 126 us drain after the road image's copy, each frame).
+// REGPU_READBACK_BARRIER_DEFER=1 (start-time, off by default): FM4's grid ran the same with it (the drain is the fence
+// that follows the copy, not the barrier), so the barrier stays right after the copy unless asked.
+bool g_readbackPending = false;
+void FlushReadbackBarrier()
+{
+    if (g_readbackPending)
+    {
+        ReadbackBarrier(*C().vkList);
+        g_readbackPending = false;
+    }
+}
+
 void SplitMainList()
 {
+    FlushReadbackBarrier();
     // A D3D query must end in the list it began in: an open guest query ends its part here and goes on
     // in the new list. (Ending the guest query, as before, left the guest's own end without a result:
     // answered as fully visible, with the periodic submits a query here and there every frame.)
@@ -12897,6 +12914,7 @@ void SplitMainListAsync(bool submit)
             SubmitVkLists(0, nullptr);
         return;
     }
+    FlushReadbackBarrier();
     const bool queryOpen = g_occlusionOpen;
     if (queryOpen)
         EndOcclusionPart();
@@ -13430,7 +13448,12 @@ void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint
     vk::Transition(*C().vkList, *r.resource, vk::Use::CopySource);
     CopyToBuffer(*C().vkList, *r.resource, w.buffer->buffer, 0, w.pitch, bpp, int32_t(hostX0), int32_t(hostY0), w.hostW, w.hostH);
     vk::Transition(*C().vkList, *r.resource, vk::Use::Sampled);
-    ReadbackBarrier(*C().vkList);
+    // (The host barrier: here, or with REGPU_READBACK_BARRIER_DEFER=1 FlushReadbackBarrier, before the list closes.)
+    static const bool barrierNow = !(getenv("REGPU_READBACK_BARRIER_DEFER") && strcmp(getenv("REGPU_READBACK_BARRIER_DEFER"), "0") != 0);
+    if (barrierNow || C().worker)
+        ReadbackBarrier(*C().vkList);
+    else
+        g_readbackPending = true;
     w.base = base;
     w.width = width;
     w.height = height;
@@ -18873,6 +18896,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent);
     g_occlusionPaused = false;
     ReadbackBarrier(*C().vkList); // (query results and readbacks, for the host once the frame has completed)
+    g_readbackPending = false;
     // The frame's end where the replay reaches it: the copy into the swap chain, the end of the buffer, its submission
     // (after the lists queued before it) and, with REGPU_ASYNC_PRESENT, the present and the frame's fence.
     if (asyncPresent)
