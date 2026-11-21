@@ -101,6 +101,15 @@ and vertex shaders under `REGPU_DYNAMIC_VFETCH` / `REGPU_LEAN_VFETCH` / `REGPU_P
 - GPU: the RX 7900 XTX's 4K race 4-5% faster (238-240 fps against 229); the 9800X3D's graphics ~4% slower (54 against
   56.6). VK_AMD_shader_info (register counts per pipeline) would show whether register use costs RDNA2 occupancy.
 
+## Pipelines: dynamic state, libraries
+
+- Depth, stencil, cull and depth bias are dynamic for the draws' pipelines (renderer.cpp DynamicDrawState,
+  PipelineLookupKey, vk::DrawState): FM3's cold boot to the grid 17.6 s against 26.3, 2,938 pipelines against 3,800,
+  +3% GPU at 1080p. Blend dynamic too with `REGPU_VK_DYNAMIC_BLEND=1` (EDS3; +10% GPU at 1080p on an RX 7900 XTX).
+- Graphics pipeline libraries (VK_EXT_graphics_pipeline_library): tried, not committed. Fast-linked pipelines hung the
+  RX 7900 XTX's driver at FM3's first frames (device lost), while a standalone test of the same code drew correctly.
+  Needs a crash dump (Radeon GPU Detective) to find the pipeline. See RESUME.md in the workspace.
+
 ## Not done yet
 
 - **VR (OpenXR):** the session is on Vulkan (`XR_KHR_vulkan_enable`, else enable2; render/xr.cpp). Checked against a
