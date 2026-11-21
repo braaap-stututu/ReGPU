@@ -759,7 +759,20 @@ constexpr UINT kDescriptorsPerFrame = 8192; // per frame: ring + guest memory vi
 constexpr UINT kBindless = 1u << 16;      // permanent texture descriptors (0 null 2D, 1 null cube)
 constexpr UINT kBindlessBase = kDescriptorsPerFrame * 3;
 // The EDRAM colour target: half floats hold the title's HDR (7e3) range.
-constexpr VkFormat kVkColorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+// REGPU_EXP_COLOR_FORMAT=b10g11r11|rgba8|rgb10a2 (start-time; EXPERIMENT, the picture is wrong where alpha, range or
+// precision matter): every colour surface in that 32-bit format instead, to measure what 64-bit surfaces cost.
+const VkFormat kVkColorFormat = [] {
+    const char* v = getenv("REGPU_EXP_COLOR_FORMAT");
+    if (!v)
+        return VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (!strcmp(v, "b10g11r11"))
+        return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    if (!strcmp(v, "rgba8"))
+        return VK_FORMAT_R8G8B8A8_UNORM;
+    if (!strcmp(v, "rgb10a2"))
+        return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    return VK_FORMAT_R16G16B16A16_SFLOAT;
+}();
 constexpr UINT kMaxSurfaces = 64; // EDRAM bases with host surfaces
 // Samples per pixel of the scene surfaces (anti-aliasing, Settings::msaa). The blits that
 // read them use multisampled shaders when this is above 1.
@@ -3093,6 +3106,7 @@ struct SurfaceUse
 {
     LONG right = 0, bottom = 0;
     uint32_t msaaModes = 0, draws = 0, active = 0;
+    uint32_t formatDraws[16] = {}; // colour: draws by guest format (RB_COLOR_INFO bits 16-19), colour writes on
 };
 std::mutex g_surfaceUseMutex;
 std::map<std::pair<bool, uint32_t>, SurfaceUse> g_surfaceUse;
@@ -3113,6 +3127,8 @@ void TraceSurfaceUse(const Rect& r)
         u.msaaModes |= 1u << msaa;
         u.draws++;
         u.active += (d ? depthOn : colourOn) ? 1 : 0;
+        if (!d && colourOn)
+            u.formatDraws[(gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF]++;
     }
 }
 void LogSurfaceUse()
@@ -3124,8 +3140,17 @@ void LogSurfaceUse()
     std::lock_guard lock(g_surfaceUseMutex);
     Log("surface use: %zu surfaces of %ux%u x%u (draws since the last line; corner in host pixels)", g_surfaceUse.size(), SurfaceWidth(), SurfaceHeight(), g_msaa);
     for (auto& [k, u] : g_surfaceUse)
-        Log("surface use: %s %06X corner %ld,%ld guest msaa modes %X draws %u writing %u", k.first ? "depth " : "colour", k.second, u.right, u.bottom,
-            u.msaaModes, u.draws, u.active);
+    {
+        // (Colour: the guest formats drawn, as "format:draws": 0 8_8_8_8, 1 8_8_8_8_GAMMA, 2 2_10_10_10, 3 2_10_10_10_FLOAT
+        // (7e3), 4 16_16, 5 16_16_16_16, 6 16_16_FLOAT, 7 16_16_16_16_FLOAT, 12 2_10_10_10_FLOAT_AS_16_16_16_16, 14 32_FLOAT,
+        // 15 32_32_FLOAT.)
+        std::string formats;
+        for (uint32_t f = 0; f < 16; f++)
+            if (u.formatDraws[f])
+                formats += " " + std::to_string(f) + ":" + std::to_string(u.formatDraws[f]);
+        Log("surface use: %s %06X corner %ld,%ld guest msaa modes %X draws %u writing %u%s%s", k.first ? "depth " : "colour", k.second, u.right, u.bottom,
+            u.msaaModes, u.draws, u.active, formats.empty() ? "" : " formats", formats.c_str());
+    }
     g_surfaceUse.clear();
 }
 
