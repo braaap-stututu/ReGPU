@@ -15976,10 +15976,40 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         ti[1] = fetch.Width();
         ti[2] = fetch.Height();
+        // Packed depth through a colour fetch (from the FM4 port's ReGPU; tinfo.z bits 16-23, hlsl.cpp DepthAsColor and
+        // the SPIR-V translator's): on the console a depth copy resolved to EDRAM stays a 24-bit word over a stencil byte,
+        // and a k_8_8_8_8 fetch of it hands back those bytes; here the copy holds float depth (R32), which the shader packs
+        // back. REGPU_DEPTH_AS_8888=1 (live) turns it on; _RGB / _REVERSED / _FLOAT20E4 / _STENCIL0 are older guesses of
+        // the byte layout and the 20e4 float packing. Slots listed in REGPU_CASCADE_SLOTS=<n,n...> (start-time) read the
+        // channels REGPU_CASCADE_R_LIT / _G_LIT / _B_LIT (live) as fully lit (FM4's soft car-shadow tiles).
+        {
+            static LiveSwitch depthAs8888("REGPU_DEPTH_AS_8888"), depthRgb("REGPU_DEPTH_AS_8888_RGB"), depthRev("REGPU_DEPTH_AS_8888_REVERSED"),
+                depthFloat("REGPU_DEPTH_AS_8888_FLOAT20E4"), depthStencil("REGPU_DEPTH_AS_8888_STENCIL0"), litR("REGPU_CASCADE_R_LIT"),
+                litG("REGPU_CASCADE_G_LIT"), litB("REGPU_CASCADE_B_LIT");
+            static const uint32_t cascadeSlots = [] {
+                uint32_t m = 0;
+                for (const char* p = getenv("REGPU_CASCADE_SLOTS"); p && *p;)
+                {
+                    char* end = nullptr;
+                    const unsigned long v = strtoul(p, &end, 10);
+                    if (end == p)
+                        break;
+                    if (v < 32)
+                        m |= 1u << v;
+                    p = *end == ',' ? end + 1 : end;
+                }
+                return m;
+            }();
+            if (depthAs8888 && onGpu && resolvedPtr && resolvedPtr->format == VK_FORMAT_R32_SFLOAT && fetch.Format() == 6)
+                ti[2] |= (1u << 20) | (depthRgb ? 1u << 21 : 0u) | (depthRev ? 1u << 22 : 0u) | (depthFloat ? 1u << 23 : 0u) |
+                    (depthStencil ? 1u << 19 : 0u);
+            if ((cascadeSlots >> slot) & 1)
+                ti[2] |= ((litR ? 1u : 0u) | (litG ? 2u : 0u) | (litB ? 4u : 0u)) << 16;
+        }
         // REGPU_LEAN_FETCH=2 (hlsl.cpp TFetch2DV2): bit 7 marks a plain 2D texture, whose fetch is one sample: no
         // 16-bit fixed conversion (bit 6), exponent (8-13), border (16-17), single-axis clamp (18-19), gamma
         // (24-27) or mirror (28-31), no shader swizzle other than the identity, the whole image.
-        if (LeanFetchLevel() >= 2 && (ti[3] & 0xFFu) == 1 && !(ti[0] & 0xFF0F3F40u) && tb[2] == 1.0f && tb[3] == 1.0f &&
+        if (LeanFetchLevel() >= 2 && (ti[3] & 0xFFu) == 1 && !(ti[0] & 0xFF0F3F40u) && !(ti[2] >> 16) && tb[2] == 1.0f && tb[3] == 1.0f &&
             (!(ti[3] >> 31) || ((ti[3] >> 8) & 0xFFFu) == 0x688u))
             ti[0] |= 1u << 7;
         memcpy(memo.fetch, fetch.dwords, sizeof(memo.fetch));
@@ -16264,7 +16294,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             const uint32_t slot = uint32_t(std::countr_zero(m));
             const uint32_t* ti = pc->tinfo[slot];
             const float* tb = pc->tbias[slot];
-            if ((ti[3] & 0xFFu) == 1 && !(ti[0] & 0xFF0F3F40u) && tb[2] == 1.0f && tb[3] == 1.0f && (!(ti[3] >> 31) || ((ti[3] >> 8) & 0xFFFu) == 0x688u))
+            if ((ti[3] & 0xFFu) == 1 && !(ti[0] & 0xFF0F3F40u) && !(ti[2] >> 16) && tb[2] == 1.0f && tb[3] == 1.0f &&
+                (!(ti[3] >> 31) || ((ti[3] >> 8) & 0xFFFu) == 0x688u))
                 plain |= 1u << slot;
         }
         // REGPU_TRACE_FETCH_PLAIN=1 (live; session 33): once per pixel shader and mask, the slots it reads, those plain

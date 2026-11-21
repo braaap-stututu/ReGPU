@@ -279,10 +279,61 @@ float4 Fixed16Fetch(float4 v, uint info)
     return use ? r : v;
 }
 
+// A depth copy fetched as an 8-bit colour texture (tinfo.z bit 20; from the FM4 port's ReGPU): the console keeps depth as a
+// 24-bit word above a stencil byte, and such a fetch hands back the word's bytes lowest first (stencil, depth low, mid,
+// top), which the title's swizzle then reorders; the copy here holds float depth, so it is packed back. Copies cleared to
+// all ones test a byte for being saturated, so depth 1.0 packs as all ones. 24-bit fixed point by default. mode bit 0:
+// bytes as R, G, B, stencil; bit 1: A, R, G; bit 3: the 20e4 float packing; bit 4: the stencil byte reads 0 (else 1).
+float4 DepthAsColor(float d, uint mode)
+{
+    d = saturate(d);
+    uint raw;
+    if (d >= 1.0)
+        raw = 0xFFFFFFu;
+    else if ((mode & 8u) == 0u)
+        raw = min(uint(d * 16777215.0 + 0.5), 16777215u);
+    else if (d <= 0.0)
+        raw = 0u;
+    else
+    {
+        int e = int(floor(log2(d))) + 15;
+        if (e < 1)
+            raw = uint(d * exp2(14.0) * 1048576.0) & 0xFFFFFu;
+        else
+        {
+            e = min(e, 15);
+            raw = (uint(e) << 20) | (uint((d * exp2(float(15 - e)) - 1.0) * 1048576.0 + 0.5) & 0xFFFFFu);
+        }
+    }
+    const float b0 = float((raw >> 16) & 255u) / 255.0, b1 = float((raw >> 8) & 255u) / 255.0, b2 = float(raw & 255u) / 255.0;
+    const float st = (mode & 16u) != 0u ? 0.0 : 1.0;
+    if ((mode & 1u) != 0u)
+        return float4(b0, b1, b2, st);
+    if ((mode & 2u) != 0u)
+        return float4(b1, b2, st, b0);
+    return float4(st, b2, b1, b0);
+}
+
+// Channels read as fully lit (tinfo.z bits 16-18: red, green, blue; REGPU_CASCADE_*_LIT).
+float4 LitChannels(float4 r, uint z)
+{
+    const uint lit = (z >> 16) & 7u;
+    if (lit != 0u)
+    {
+        if (lit & 1u) r.x = 1.0;
+        if (lit & 2u) r.y = 1.0;
+        if (lit & 4u) r.z = 1.0;
+    }
+    return r;
+}
+
 float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)
 {
     gBorderHit = false;
     float4 v = TFetchRaw(slot, coord, denorm, vertexStage, bias, texel);
+    const uint dz = tinfo[slot].z;
+    if ((dz >> 20) & 1u)
+        v = DepthAsColor(v.x, ((dz >> 21) & 1u) | (((dz >> 22) & 1u) << 1) | (((dz >> 23) & 1u) << 3) | (((dz >> 19) & 1u) << 4));
     // A texel of a resolved 16-bit fixed image, converted as the fetch reads it; the border colour is not.
     if (!gBorderHit)
         v = Fixed16Fetch(v, tinfo[slot].x);
@@ -299,14 +350,14 @@ float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias
     if (expAdjust != 0) v *= exp2(float(expAdjust));
     uint w = tinfo[slot].w;
     if (!(w >> 31))
-        return v;
+        return LitChannels(v, dz);
     float4 r;
     [unroll] for (uint c = 0; c < 4; c++)
     {
         uint sel = (w >> (8 + 3 * c)) & 7u;
         r[c] = sel < 4u ? v[sel] : (sel == 5u ? 1.0 : 0.0);
     }
-    return r;
+    return LitChannels(r, dz);
 }
 
 // The lean 2D path (REGPU_LEAN_FETCH) folds as TFetchRaw does (bits set in renderer.cpp, REGPU_NO_TEXTURE_MIRROR).

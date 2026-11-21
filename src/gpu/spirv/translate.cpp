@@ -551,6 +551,7 @@ struct Translator
         // (A specialised slot's words are literals: the driver folds every path its constant doesn't take.)
         const SpirvFetchSpec* spec = Spec(slot);
         const uint32_t info = spec ? U(spec->info) : Comp(ti, 0, tU), w = spec ? U(spec->w) : Comp(ti, 3, tU);
+        const uint32_t tiz = Comp(ti, 2, tU); // (bits 16-23: packed depth and lit channels, renderer.cpp; never specialised)
         const uint32_t index = b.Op(spv::OpBitcast, tU, { Comp(tb, 1) });
         const uint32_t dim = UBits(w, 0, 0xFF);
         const uint32_t result = b.Variable(pFnV4), border = b.Variable(pFnB);
@@ -658,6 +659,18 @@ struct Translator
         // TFetch: the 16-bit fixed conversion (not of the border colour), gamma, exponent, the constant's swizzle. Each
         // behind a branch on its (uniform) condition, as the HLSL is: computed and selected, every step's values stayed
         // live and the pixel shaders took ~20% more vector registers (RDNA2's occupancy, the 9800X3D's graphics).
+        // hlsl.cpp's DepthAsColor (tinfo.z bit 20): float depth packed back into the console's depth word's bytes (24-bit
+        // fixed point; the 20e4 float packing, bit 23, is the HLSL path's only).
+        b.If(UBit(tiz, 20), [&] {
+            const uint32_t d = b.Ext(tF, GLSLstd450FClamp, { Comp(Load(tV4, result), 0), F(0), F(1) });
+            const uint32_t fixed = b.Ext(tU, GLSLstd450UMin, { b.Op(spv::OpConvertFToU, tU, { FAdd(FMulS(d, F(16777215.0f)), F(0.5f)) }), U(16777215u) });
+            const uint32_t raw = SelU(Bin(spv::OpFOrdGreaterThanEqual, tB, d, F(1)), U(0xFFFFFFu), fixed);
+            auto byteOf = [&](uint32_t shift) { return FMulS(b.Op(spv::OpConvertUToF, tF, { UBits(raw, shift, 255) }), F(1.0f / 255.0f)); };
+            const uint32_t b0 = byteOf(16), b1 = byteOf(8), b2 = byteOf(0);
+            const uint32_t st = SelF(UBit(tiz, 19), F(0), F(1));
+            const uint32_t rgb = UBit(tiz, 21), rev = UBit(tiz, 22);
+            Store(result, Vec4(SelF(rgb, b0, SelF(rev, b1, st)), SelF(rgb, b1, b2), SelF(rgb, b2, SelF(rev, st, b1)), SelF(rgb, st, b0)));
+        });
         b.If(And(UBit(info, 6), Not(Load(tB, border))), [&] { Store(result, Fixed16(Load(tV4, result), info)); });
         const uint32_t gamma = UBits(info, 24, 15);
         b.If(Bin(spv::OpINotEqual, tB, gamma, U(0)), [&] {
@@ -681,6 +694,12 @@ struct Translator
                 c[i] = SelF(Bin(spv::OpULessThan, tB, sel, U(4)), picked, SelF(UEq(sel, 5), F(1), F(0)));
             }
             Store(result, Vec4(c[0], c[1], c[2], c[3]));
+        });
+        // hlsl.cpp's LitChannels (tinfo.z bits 16-18): those channels read as fully lit.
+        const uint32_t lit = UBits(tiz, 16, 7);
+        b.If(Bin(spv::OpINotEqual, tB, lit, U(0)), [&] {
+            const uint32_t t = Load(tV4, result);
+            Store(result, Vec4(SelF(UBit(lit, 0), F(1), Comp(t, 0)), SelF(UBit(lit, 1), F(1), Comp(t, 1)), SelF(UBit(lit, 2), F(1), Comp(t, 2)), Comp(t, 3)));
         });
         return Load(tV4, result);
     }
