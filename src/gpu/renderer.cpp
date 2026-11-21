@@ -5014,7 +5014,63 @@ bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, I
         return false;
     static LiveSwitch sampledIndexHash("REGPU_INDEX_SAMPLED_HASH");
     const uint8_t* src = GuestPtr<uint8_t>(GpuPhysToGuest(base));
-    const uint64_t hash = sampledIndexHash ? ContentHash(src, bytes) : FullHash(src, bytes);
+    // Write-watched index buffers (Host::watchArm / watchClean, as the vertex arena): a buffer none of whose pages was
+    // written since its last hash keeps that hash, without reading it again. Every index buffer was hashed in full at
+    // its first draw of each frame (FM3 race, 1440p: ~3% of the draw thread, whose time sets the 1% lows in the
+    // ~2,900-draw stretches). One that changes is hashed for 120 frames before it is watched again (a fault per write
+    // otherwise). REGPU_INDEX_NO_WATCH=1 (live): hashed every frame, as before. REGPU_INDEX_VERIFY=1 (diagnostic):
+    // hashed anyway, and a change with no write seen is logged.
+    const regpu::Host& host = regpu::GetHost();
+    static LiveSwitch noWatch("REGPU_INDEX_NO_WATCH");
+    static LiveSwitch verifyWatch("REGPU_INDEX_VERIFY");
+    struct Watched
+    {
+        uint64_t hash = 0, seq = 0, dynamicUntil = 0;
+        bool armed = false;
+    };
+    thread_local std::unordered_map<uint64_t, Watched> watched;
+    const bool watch = host.watchArm && host.watchClean && host.watchSeq && !noWatch && !sampledIndexHash && !C().worker;
+    const uint32_t physical = base & 0x1FFFFFFF;
+    Watched* w = watch ? &watched[key] : nullptr;
+    uint64_t hash = 0;
+    if (w && w->armed && host.watchClean(physical, bytes, w->seq))
+    {
+        hash = w->hash;
+        if (verifyWatch)
+            if (const uint64_t now = FullHash(src, bytes); now != hash)
+            {
+                static int logged = 0;
+                if (logged++ < 20)
+                    Log("index watch: %08X (%u bytes, frame %llu) changed with no write seen", base, bytes, (unsigned long long)g_r.frame);
+                hash = now;
+                w->armed = false;
+            }
+    }
+    else
+    {
+        // Armed before the hash: a write after it faults and is seen.
+        if (w)
+        {
+            w->armed = false;
+            if (g_r.frame >= w->dynamicUntil)
+            {
+                w->seq = host.watchSeq() + 1; // (a write from now on counts)
+                w->armed = host.watchArm(physical, bytes);
+                if (!w->armed)
+                    w->dynamicUntil = g_r.frame + 600; // (memory that can't be watched: not tried every frame)
+            }
+        }
+        hash = sampledIndexHash ? ContentHash(src, bytes) : FullHash(src, bytes);
+        if (w)
+        {
+            if (w->hash && w->hash != hash)
+            {
+                w->dynamicUntil = g_r.frame + 120; // (changing: hashed, not watched, for a while)
+                w->armed = false;
+            }
+            w->hash = hash;
+        }
+    }
     std::lock_guard textureLock(g_textureMutex);
     g_indexChanging = false;
     if (!GetIndexBufferLocked(base, count, is32, endian, view, hash))
