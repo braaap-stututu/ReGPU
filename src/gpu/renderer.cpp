@@ -6660,6 +6660,7 @@ std::string SpecVariant(const std::string& hlsl, uint32_t id)
     return out;
 }
 
+void RunOnPipelinePool(std::function<void()> job);
 const CompiledShader* FetchVariantOf(const CompiledShader& base, uint32_t mask)
 {
     const uint64_t id = base.cacheKey * 0x9E3779B97F4A7C15ull ^ mask;
@@ -6675,7 +6676,6 @@ const CompiledShader* FetchVariantOf(const CompiledShader& base, uint32_t mask)
     cs->pixel = true;
     cs->ucodeBE = base.ucodeBE; // the pipeline manifest stores the base microcode
     cs->info = base.info;
-    cs->info.hlsl = (mask >> 31) ? SpecVariant(base.info.hlsl, mask) : FetchVariant(base.info.hlsl, mask);
     SpirvOptions options;
     options.noAlphaTest = base.directNoKill;
     if (mask >> 31)
@@ -6687,7 +6687,35 @@ const CompiledShader* FetchVariantOf(const CompiledShader& base, uint32_t mask)
     }
     else
         options.plainFetchMask = mask;
-    if (base.direct && ((mask >> 31) == 0 || !options.specs.empty()) && DirectVariant(base, options, *cs, uint64_t(mask) << 1 | (base.directNoKill ? 1 : 0)))
+    const uint64_t seed = uint64_t(mask) << 1 | (base.directNoKill ? 1 : 0);
+    const bool directable = base.direct && ((mask >> 31) == 0 || !options.specs.empty());
+    // A direct shader's variant is made on a pipeline-pool thread, not here on the draw thread (21 Nov 2026, FM3: a new
+    // scene's dozens of spec variants, ~1 ms each plus the HLSL text edit, made 40-60 ms frames). The draw keeps the base
+    // shader until it's ready (FetchShader). REGPU_VARIANT_INLINE=1: made here, as before.
+    static const bool inlineVariants = getenv("REGPU_VARIANT_INLINE") != nullptr;
+    if (directable && !inlineVariants)
+    {
+        g_fetchVariantCount[base.cacheKey]++;
+        cs->state = CompiledShader::Pending;
+        CompiledShader* made = cs.get();
+        const CompiledShader* from = &base; // (shaders are never freed)
+        RunOnPipelinePool([made, from, options, mask, seed] {
+            if (DirectVariant(*from, options, *made, seed))
+                return;
+            made->info.hlsl = (mask >> 31) ? SpecVariant(from->info.hlsl, mask) : FetchVariant(from->info.hlsl, mask);
+            if (made->info.hlsl.empty())
+            {
+                made->state = CompiledShader::Failed;
+                return;
+            }
+            made->cacheKey = Fnv(made->info.hlsl.data(), made->info.hlsl.size(), 5);
+            made->loadFirst = true;
+            g_compiler.Push(made, false);
+        });
+        return g_fetchShaders.emplace(id, std::move(cs)).first->second.get();
+    }
+    cs->info.hlsl = (mask >> 31) ? SpecVariant(base.info.hlsl, mask) : FetchVariant(base.info.hlsl, mask);
+    if (directable && DirectVariant(base, options, *cs, seed))
         g_fetchVariantCount[base.cacheKey]++;
     else if (cs->info.hlsl.empty())
         cs->state = CompiledShader::Failed;
@@ -6892,6 +6920,7 @@ PipelinePool& Pipelines()
     static PipelinePool pool;
     return pool;
 }
+void RunOnPipelinePool(std::function<void()> job) { Pipelines().Push(std::move(job), true); }
 
 // A draw's blend, depth, stencil, cull and depth-bias state from its key (the console's registers), as Vulkan's.
 void StateFromKey(const PipelineKey& key, vk::PipelineDesc& pd)
@@ -7458,7 +7487,7 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
 // Pipeline stalls (21 Nov 2026, FM3 on an RX 7900 XTX: a race load drew 69 new pipelines in one frame, each built in
 // turn on the draw thread, 2 s; in the race 150-280 ms frames).
 //
-// REGPU_DEFERRED_PIPELINES=1 (start-time): a draw that has to wait for its pipeline doesn't wait on the draw thread. It
+// REGPU_DEFERRED_PIPELINES (start-time; on by default since 21 Nov 2026, =0 off): a draw that has to wait for its pipeline doesn't wait on the draw thread. It
 // records a deferred bind (RecordedList::BindPipelineDeferred), its build goes to the front of the pool, and the draw
 // thread goes on; the replay thread waits for the build when it reaches the bind. A frame's new pipelines then build on
 // all the pool's threads at once instead of one by one. (Not with REGPU_NO_RECORD_THREAD: that list replays at once.)
@@ -7466,11 +7495,12 @@ bool DeferredPipelines()
 {
     static const bool on = [] {
         const char* v = getenv("REGPU_DEFERRED_PIPELINES");
-        return v && *v && strcmp(v, "0") != 0;
+        return !v || !*v || strcmp(v, "0") != 0;
     }();
     return on;
 }
-// REGPU_PIPELINE_BUDGET_MS=<ms> (start-time): once a frame has spent that long on pipeline builds it waits for (or, with
+// REGPU_PIPELINE_BUDGET_MS=<ms> (start-time; default 0 since 21 Nov 2026, "off" or a negative value: no budget, draws
+// wait as before): once a frame has spent that long on pipeline builds it waits for (or, with
 // deferred pipelines, has that much estimated build time ahead of it: new pipelines times the recent average build), a
 // draw into the screen-wide pass whose pipeline isn't built is dropped for the frame instead of waiting; its build goes
 // on in the background. The pass is drawn again next frame, so the drop shows as an object missing for a frame or
@@ -7480,18 +7510,22 @@ double PipelineBudgetMs()
 {
     static const double ms = [] {
         const char* v = getenv("REGPU_PIPELINE_BUDGET_MS");
-        return v && *v ? std::max(0.0, atof(v)) : -1.0;
+        if (!v || !*v)
+            return 0.0;
+        if (strcmp(v, "off") == 0)
+            return -1.0;
+        return atof(v);
     }();
     return ms;
 }
-// REGPU_BUDGET_OFFSCREEN=1 (start-time, with a budget): once the game has settled (no load hold for 4 s, GameSettled),
+// REGPU_BUDGET_OFFSCREEN (start-time, with a budget; on by default since 21 Nov 2026, =0 off): once the game has settled (no load hold for 4 s, GameSettled),
 // off-screen and depth-only draws over the budget are dropped too (shadow maps, reflections and post passes, redrawn
 // every frame). During loads they still wait: a car's livery is built once then, and a layer dropped there stays missing.
 bool BudgetOffscreen()
 {
     static const bool on = [] {
         const char* v = getenv("REGPU_BUDGET_OFFSCREEN");
-        return v && *v && strcmp(v, "0") != 0;
+        return !v || !*v || strcmp(v, "0") != 0;
     }();
     return on;
 }
@@ -7632,7 +7666,16 @@ VkPipeline GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool 
             if (!g_seedKeys.count(listed) && g_drawnUnseeded++ < 64) // (manifest format, for the seed)
                 Log("seed coverage: not in the seed: P %llx %llx %x %x %x %x %x %x %x", (unsigned long long)key.vs, (unsigned long long)key.ps, key.blend,
                     key.depth, key.stencilMaskMode, key.flags, key.biasScale, key.biasOffset, key.fetchMask);
-            g_drawnUnprepared += it == g_r.pipelines.end();
+            // (Not a fetch specialisation: it can't be built ahead, its constants come with the draw, and the draw uses its
+            // base pipeline until it's built. 21 Nov 2026, FM3: they were nearly all of the "built while drawing".)
+            const bool unprepared = it == g_r.pipelines.end() && !(key.fetchMask >> 31);
+            g_drawnUnprepared += unprepared;
+            // REGPU_LOG_UNPREPARED=1: the first 40 drawn pipelines that weren't built ahead (manifest format).
+            if (static const bool logUnprepared = getenv("REGPU_LOG_UNPREPARED") != nullptr; logUnprepared && unprepared)
+                if (static int told = 0; told++ < 40)
+                    Log("seed coverage: not built ahead: P %llx %llx %x %x %x %x %x %x %x%s", (unsigned long long)key.vs, (unsigned long long)key.ps,
+                        key.blend, key.depth, key.stencilMaskMode, key.flags, key.biasScale, key.biasOffset, key.fetchMask,
+                        g_seedKeys.count(listed) ? " (in the seed)" : "");
         }
         if (it != g_r.pipelines.end() && it->second->state.load(std::memory_order_acquire) == 1)
         {
@@ -11581,6 +11624,7 @@ void PredictBeginImpl()
 }
 
 std::vector<PipelineKey> g_seedLater; // seed pipelines waiting for a shader the game makes at run time
+std::vector<PipelineKey> g_precompileSkipped; // stored pipelines the warm-up skipped for a shader not there yet
 
 // Seed pipelines (Host::pipelineSeed) whose shaders the game has made since the boot: started in the
 // background, checked about once a second.
@@ -17371,14 +17415,36 @@ bool g_precompileDone = false;
 // shaders are compiled by then can be; the rest wait in g_seedLater for the game to make their shader.
 void BuildSeedPipelines()
 {
+    // (The stored pipelines the warm-up skipped for a static shader: built here too, REGPU_NO_SKIPPED_PREBUILD=1 not.)
+    std::vector<PipelineKey> skipped;
+    skipped.swap(g_precompileSkipped);
+    if (getenv("REGPU_NO_SKIPPED_PREBUILD"))
+        skipped.clear();
     const regpu::Host& host = regpu::GetHost();
-    if (!host.pipelineSeed || getenv("REGPU_NO_SEED_PIPELINES"))
+    if ((!host.pipelineSeed && skipped.empty()) || getenv("REGPU_NO_SEED_PIPELINES"))
         return;
     const auto start = std::chrono::steady_clock::now();
     std::vector<std::pair<PipelineKey, std::pair<const CompiledShader*, const CompiledShader*>>> todo;
     size_t listed = 0, known = 0, missing = 0;
     std::unordered_set<uint64_t> missingShaders, seen;
-    for (const char* p = host.pipelineSeed(); p && *p;)
+    // Started already (by its lookup key: dynamic state is not in it). Known to the manifest is not enough: the warm-up
+    // skips stored pipelines whose shaders weren't there yet.
+    auto started = [](const PipelineKey& k) { return g_r.pipelines.count(PipelineLookupKey(k)) != 0; };
+    size_t skippedTodo = 0;
+    for (const PipelineKey& key : skipped)
+    {
+        if (!seen.insert(PipelineKeyHash{}(key)).second || started(key))
+            continue;
+        const auto vsIt = g_r.shaders.find(key.vs), psIt = g_r.shaders.find(key.ps);
+        if (vsIt == g_r.shaders.end() || psIt == g_r.shaders.end())
+        {
+            g_seedLater.push_back(key); // (a shader the game makes at run time: started when it does)
+            continue;
+        }
+        todo.push_back({ key, { vsIt->second.get(), psIt->second.get() } });
+        skippedTodo++;
+    }
+    for (const char* p = host.pipelineSeed ? host.pipelineSeed() : nullptr; p && *p;)
     {
         const char* end = strchr(p, '\n');
         const std::string line(p, end ? end : p + strlen(p));
@@ -17391,11 +17457,11 @@ void BuildSeedPipelines()
         key.vs = vs;
         key.ps = ps;
         key.biasOffset = RoundedBias(key.biasOffset);
+        g_seedKeys.insert(PipelineLookupKey(key));
         if (!seen.insert(PipelineKeyHash{}(key)).second)
             continue;
-        g_seedKeys.insert(PipelineLookupKey(key));
         listed++;
-        if (g_manifest.known.count(key) || g_r.pipelines.count(key))
+        if (started(key))
         {
             known++;
             continue;
@@ -17410,8 +17476,8 @@ void BuildSeedPipelines()
         }
         todo.push_back({ key, { vsIt->second.get(), psIt->second.get() } });
     }
-    Log("seed pipelines: %zu listed, %zu already built, %zu to build, %zu need %zu shaders the game makes at run time", listed, known,
-        todo.size(), missing, missingShaders.size());
+    Log("seed pipelines: %zu listed, %zu already built, %zu to build (%zu of them stored ones the warm-up skipped), %zu need %zu shaders the game makes at run time",
+        listed, known, todo.size(), skippedTodo, missing, missingShaders.size());
     if (todo.empty())
         return;
     // Flag 0x400 pipelines use the pixel shader's alpha-test-free variant (ManifestPixelShader), as the warm-up
@@ -17546,6 +17612,16 @@ void PrecompileAll()
                 code.clear();
                 if (!ps && Manifest::LoadShader(true, key.ps, code))
                     ps = &GetShader(key.ps, code, true);
+            }
+            // A shader not stored here: a static one (Host::staticShaders), installed after this. Kept for the seed step
+            // (BuildSeedPipelines), which runs once they are (21 Nov 2026, FM3: ~2,700 of 7,280 stored pipelines were
+            // skipped this way and never built ahead, so the races built them while drawing).
+            if (!vs || !ps)
+            {
+                g_precompileSkipped.push_back(key);
+                nextKey++;
+                g_stats.warmDone++;
+                continue;
             }
             // A shader not stored (a static one from Host::staticShaders, installed after this): skip the
             // pipeline. Waiting for it, as before, waited for good (FH1 on the FX: a black screen).

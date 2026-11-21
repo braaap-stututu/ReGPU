@@ -127,23 +127,31 @@ re-check both after a driver update.
 ## Pipeline stalls
 
 New pipelines are built when a draw first needs them; on an RX 7900 XTX a build that misses the driver's cache takes
-100-250 ms. FM3 (21 Nov 2026): a race load drew 69 new pipelines in one frame (2 s), races had 150-280 ms frames. All
-start-time switches, off by default until compared in play:
-- `REGPU_DEFERRED_PIPELINES=1`: a draw that must wait for its pipeline records a deferred bind
+100-250 ms. FM3 (21 Nov 2026): a race load drew 69 new pipelines in one frame (2 s), races had 150-280 ms frames.
+Start-time switches; the first three are on by default since the user compared presets in play (21 Nov 2026: no
+pipeline stalls left in races, new pipelines show as a frame or two of pop-in):
+- `REGPU_DEFERRED_PIPELINES` (`0` off): a draw that must wait for its pipeline records a deferred bind
   (`RecordedList::BindPipelineDeferred`) and the draw thread goes on; the build goes to the front of the pool and the
   replay thread waits for it. A frame's new pipelines build in parallel instead of one by one.
-- `REGPU_PIPELINE_BUDGET_MS=<ms>`: past that much build time in a frame (waited, or estimated for deferred binds),
+- `REGPU_PIPELINE_BUDGET_MS=<ms>` (default 0; `off`: draws wait as before): past that much build time in a frame (waited, or estimated for deferred binds),
   screen-pass draws whose pipeline isn't built are dropped for the frame and built in the background. Off-screen
   passes and clears still wait (they may be drawn once and kept). `0`: screen-pass draws never wait.
 - `REGPU_COMPILE_PRIORITY=<Win32 level>` (default -1; -2 lowest, -15 idle) for the shader and pipeline threads,
   `REGPU_COMPILE_THREADS=<n>` shader compile workers (default all threads but one), `REGPU_PIPELINE_THREADS=<n>`.
-- `REGPU_BUDGET_OFFSCREEN=1` (with a budget): once the game has settled (no load hold for 4 s), off-screen and
+- `REGPU_BUDGET_OFFSCREEN` (`0` off; with a budget): once the game has settled (no load hold for 4 s), off-screen and
   depth-only draws over the budget are dropped too. During loads they still wait: liveries are built once then.
 - `pipelines: draw waits for <vs>/<ps>: <why>`: the first 200 draws a run that waited for a pipeline, and why they
   couldn't skip (off-screen pass, depth only, clear, must-draw screen pass, during a load).
 - The log line `pipelines: last second N draws dropped by the budget, M deferred binds (average build X ms)`.
 - The direct translator (above) makes shaders and their variants in ~1 ms, where DXC took 200-1600 ms for each spec
   variant (the draw's constants baked in, so new ones come with each new scene).
+- The warm-up (PrecompileAll) skips stored pipelines whose shaders aren't there yet (static shaders come later); the
+  seed step (BuildSeedPipelines) builds them, and counts a pipeline as built only when it was started (it took any
+  the manifest knew).
+- Direct shaders' fetch and spec variants are made on a pipeline-pool thread, not the draw thread
+  (`REGPU_VARIANT_INLINE=1`: as before). Spec variants can't be built ahead (their constants come with the draw); the
+  draw uses the base pipeline meanwhile, and "seed coverage: built while drawing" no longer counts them.
+  `REGPU_LOG_UNPREPARED=1` logs the first 40 drawn pipelines that weren't built ahead.
 - Pipelines built during play don't hit the driver cache when their create info changes: a complete pipeline's dynamic
   states must stay in the same order (28a4d62).
 
