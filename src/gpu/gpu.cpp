@@ -222,7 +222,12 @@ void WaitHead(uint64_t old)
     g_head.wait(old, std::memory_order_seq_cst);
     g_headWaiters.fetch_sub(1, std::memory_order_relaxed);
 }
-void WaitTail(uint64_t old)
+// The tail the command processor waits for (WaitTail's want): the draw thread wakes it only once its tail reaches that,
+// not at every publish before (a Drain waited through each one: the wake-up was ~2% of the draw thread on 2 cores, and
+// the command processor woke to sleep again). REGPU_TAIL_NOTIFY_ALL=1 (start-time): every publish wakes it, as before.
+alignas(64) std::atomic<uint64_t> g_tailWant{ 0 };
+const bool g_tailNotifyAll = getenv("REGPU_TAIL_NOTIFY_ALL") != nullptr;
+void WaitTail(uint64_t old, uint64_t want = 0)
 {
     for (int i = 0, spins = HandoffSpin(); i < spins; i++)
     {
@@ -230,6 +235,7 @@ void WaitTail(uint64_t old)
             return;
         _mm_pause();
     }
+    g_tailWant.store(g_tailNotifyAll ? 0 : want, std::memory_order_seq_cst); // (before the waiter count: the publisher reads both after its store)
     g_tailWaiters.fetch_add(1, std::memory_order_seq_cst);
     g_tail.wait(old, std::memory_order_seq_cst);
     g_tailWaiters.fetch_sub(1, std::memory_order_relaxed);
@@ -243,7 +249,7 @@ void PublishHead(uint64_t head)
 void PublishTail(uint64_t tail)
 {
     g_tail.store(tail, std::memory_order_seq_cst);
-    if (g_alwaysNotify || g_tailWaiters.load(std::memory_order_seq_cst))
+    if (g_alwaysNotify || (g_tailWaiters.load(std::memory_order_seq_cst) && tail >= g_tailWant.load(std::memory_order_seq_cst)))
         g_tail.notify_all();
 }
 
@@ -256,7 +262,7 @@ uint32_t* Begin(uint32_t type, uint32_t words)
     {
         const uint64_t pad = kWords - head % kWords;
         while (head + pad - g_tail.load(std::memory_order_acquire) > kWords)
-            WaitTail(g_tail.load(std::memory_order_acquire));
+            WaitTail(g_tail.load(std::memory_order_acquire), head + pad - kWords);
         g_ring[head % kWords] = (kPad << 24) | uint32_t(pad - 1);
         head += pad;
         PublishHead(head);
@@ -265,7 +271,7 @@ uint32_t* Begin(uint32_t type, uint32_t words)
     {
         const uint64_t tail = g_tail.load(std::memory_order_acquire);
         if (head + need - tail > kWords)
-            WaitTail(tail);
+            WaitTail(tail, head + need - kWords);
     }
     uint32_t* p = &g_ring[head % kWords];
     p[0] = (type << 24) | words;
@@ -294,7 +300,7 @@ void Drain(int site = 3)
     const auto t0 = waits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const uint64_t head = g_head.load(std::memory_order_relaxed);
     for (uint64_t tail; (tail = g_tail.load(std::memory_order_acquire)) != head;)
-        WaitTail(tail);
+        WaitTail(tail, head);
     if (waits)
         g_drainUs[site & 3].fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count()),
             std::memory_order_relaxed);
