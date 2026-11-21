@@ -5,6 +5,8 @@
 // spun out (for the frame limiter and vblanks; guest sleeps don't spin).
 #include <windows.h>
 
+#include <regpu/wine_wait.h>
+
 #include <chrono>
 #include <thread>
 
@@ -20,7 +22,10 @@ inline void PreciseSleepUntil(std::chrono::steady_clock::time_point deadline, in
         std::this_thread::sleep_until(deadline);
         return;
     }
-    if (left > spinUs)
+    // REGPU_WINE_WAITS (Wine): a nanosleep instead of a wineserver timer (regpu/wine_wait.h).
+    if (left > spinUs && regpu::winewait::On())
+        regpu::winewait::SleepUs(left - spinUs);
+    else if (left > spinUs)
     {
         LARGE_INTEGER due;
         due.QuadPart = -int64_t(left - spinUs) * 10; // relative, 100 ns units

@@ -3,6 +3,7 @@
 // (memory writes, fences, interrupts, waits) and skips everything that would
 // draw. Vblank interrupts run at 60 Hz. Phase 2 replaces drawing with a
 // native renderer hooked at the D3D level.
+#include <regpu/wine_wait.h>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -2196,7 +2197,9 @@ void CommandProcessorLoop(PPCContext& ctx)
                     Log("gpu: command processor idle wait: %s%d us", us > 0 ? "sleeps after " : "spins (", us > 0 ? us : 0);
                 sleepAfterUs = us;
             }
-            if (sleepAfterUs > 0 && now - emptySince >= std::chrono::microseconds(sleepAfterUs))
+            if (sleepAfterUs > 0 && now - emptySince >= std::chrono::microseconds(sleepAfterUs) && regpu::winewait::On())
+                regpu::winewait::SleepUs(100); // REGPU_WINE_WAITS: no wineserver timer (regpu/wine_wait.h)
+            else if (sleepAfterUs > 0 && now - emptySince >= std::chrono::microseconds(sleepAfterUs))
             {
                 thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
                 LARGE_INTEGER due;
@@ -2313,7 +2316,14 @@ void VblankLoop()
             // next tick is a full period away. (No spinning: the kicks set the pace when it matters.)
             thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
             const auto left = std::chrono::duration_cast<std::chrono::microseconds>(next - Clock::now()).count();
-            if (left > 0)
+            // REGPU_WINE_WAITS (Wine): the kick event with a timeout, one ntsync wait instead of a wineserver timer
+            // per tick (regpu/wine_wait.h).
+            if (left > 0 && regpu::winewait::On())
+            {
+                if (regpu::winewait::WaitUs(VblankKickEvent(), left) == WAIT_OBJECT_0)
+                    next = Clock::now();
+            }
+            else if (left > 0)
             {
                 LARGE_INTEGER due;
                 due.QuadPart = -int64_t(left) * 10;
