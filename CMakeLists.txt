@@ -161,7 +161,10 @@ target_compile_definitions(regpu PRIVATE REGPU_POSTAA_FILTERS=${REGPU_POSTAA_FIL
 if(REGPU_POSTAA_FILTERS)
     target_include_directories(regpu PRIVATE "${REGPU_AA_DIR}/smaa") # AreaTex.h, SearchTex.h
 endif()
-target_compile_options(regpu PRIVATE -msse4.1 -fno-strict-aliasing -gline-tables-only)
+# -mcx16: MSVC's <atomic> marks its functions target("cx16") (for 16-byte atomics), and clang-cl doesn't inline a
+# function with a target feature its caller lacks: every std::atomic load and store was a call (7-byte functions,
+# from every hot path). cmpxchg16b is on every x64 CPU 64-bit Windows 8.1 and later runs on.
+target_compile_options(regpu PRIVATE -msse4.1 -mcx16 -fno-strict-aliasing -gline-tables-only)
 target_link_libraries(regpu PUBLIC ws2_32 winmm synchronization onecore)
 if(REGPU_FSR3)
     target_compile_definitions(regpu PRIVATE REGPU_FSR3=1)

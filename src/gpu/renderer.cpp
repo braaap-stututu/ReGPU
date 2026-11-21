@@ -4422,6 +4422,8 @@ struct IndexArena
         VkDeviceSize stagedOffset = 0;
         uint64_t stagedFrame = ~0ull;
         bool changing = false; // seen changing: checked at every draw, not once a frame
+        bool armed = false;    // write-watched since watchSeq (Host::watchArm)
+        uint64_t watchSeq = 0, quietUntil = 0;
     };
     std::unordered_map<uint64_t, Entry> entries;
     bool full = false;
@@ -4704,7 +4706,7 @@ uint64_t VertexCache(uint32_t address, uint32_t bytes, bool& arenaHit)
 
 // The view of the guest index buffer at physical address `base` (count indices), swapped
 // into the arena; false when it cannot be cached (the draw fetches indices itself).
-bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, IndexView& view, uint64_t hash);
+bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, IndexView& view, uint64_t hash, bool watch = false);
 thread_local bool g_indexChanging = false; // set by GetIndexBufferLocked: the entry is checked at every draw
 // Each thread remembers this frame's index buffers (checked once per frame), except ones seen changing.
 // ---- Hyper mesh decimation and vertex-cache order (from the FM2 port's hyper-prototype, MIT; FM3 port session 43).
@@ -5014,66 +5016,14 @@ bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, I
         return false;
     static LiveSwitch sampledIndexHash("REGPU_INDEX_SAMPLED_HASH");
     const uint8_t* src = GuestPtr<uint8_t>(GpuPhysToGuest(base));
-    // Write-watched index buffers (Host::watchArm / watchClean, as the vertex arena): a buffer none of whose pages was
-    // written since its last hash keeps that hash, without reading it again. Every index buffer was hashed in full at
-    // its first draw of each frame (FM3 race, 1440p: ~3% of the draw thread, whose time sets the 1% lows in the
-    // ~2,900-draw stretches). One that changes is hashed for 120 frames before it is watched again (a fault per write
-    // otherwise). REGPU_INDEX_NO_WATCH=1 (live): hashed every frame, as before. REGPU_INDEX_VERIFY=1 (diagnostic):
-    // hashed anyway, and a change with no write seen is logged.
+    // Write-watched index buffers (GetIndexBufferLocked): hashed there, under the lock, only when written since.
     const regpu::Host& host = regpu::GetHost();
     static LiveSwitch noWatch("REGPU_INDEX_NO_WATCH");
-    static LiveSwitch verifyWatch("REGPU_INDEX_VERIFY");
-    struct Watched
-    {
-        uint64_t hash = 0, seq = 0, dynamicUntil = 0;
-        bool armed = false;
-    };
-    thread_local std::unordered_map<uint64_t, Watched> watched;
     const bool watch = host.watchArm && host.watchClean && host.watchSeq && !noWatch && !sampledIndexHash && !C().worker;
-    const uint32_t physical = base & 0x1FFFFFFF;
-    Watched* w = watch ? &watched[key] : nullptr;
-    uint64_t hash = 0;
-    if (w && w->armed && host.watchClean(physical, bytes, w->seq))
-    {
-        hash = w->hash;
-        if (verifyWatch)
-            if (const uint64_t now = FullHash(src, bytes); now != hash)
-            {
-                static int logged = 0;
-                if (logged++ < 20)
-                    Log("index watch: %08X (%u bytes, frame %llu) changed with no write seen", base, bytes, (unsigned long long)g_r.frame);
-                hash = now;
-                w->armed = false;
-            }
-    }
-    else
-    {
-        // Armed before the hash: a write after it faults and is seen.
-        if (w)
-        {
-            w->armed = false;
-            if (g_r.frame >= w->dynamicUntil)
-            {
-                w->seq = host.watchSeq() + 1; // (a write from now on counts)
-                w->armed = host.watchArm(physical, bytes);
-                if (!w->armed)
-                    w->dynamicUntil = g_r.frame + 600; // (memory that can't be watched: not tried every frame)
-            }
-        }
-        hash = sampledIndexHash ? ContentHash(src, bytes) : FullHash(src, bytes);
-        if (w)
-        {
-            if (w->hash && w->hash != hash)
-            {
-                w->dynamicUntil = g_r.frame + 120; // (changing: hashed, not watched, for a while)
-                w->armed = false;
-            }
-            w->hash = hash;
-        }
-    }
+    const uint64_t hash = watch ? 0 : sampledIndexHash ? ContentHash(src, bytes) : FullHash(src, bytes);
     std::lock_guard textureLock(g_textureMutex);
     g_indexChanging = false;
-    if (!GetIndexBufferLocked(base, count, is32, endian, view, hash))
+    if (!GetIndexBufferLocked(base, count, is32, endian, view, hash, watch))
         return false;
     if (!g_indexChanging)
     {
@@ -5143,7 +5093,7 @@ void NoteInPlace(uint32_t address, uint32_t bytes, bool index, uint64_t vs)
         overwrite::g_ranges[slot].push_back({ address, bytes, FullHash(GuestPtr<uint8_t>(GpuPhysToGuest(address)), bytes), vs, index });
 }
 
-bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, IndexView& view, uint64_t hash)
+bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, IndexView& view, uint64_t hash, bool watch)
 {
     IndexArena& arena = g_indexArena;
     const uint32_t bytes = count * (is32 ? 4 : 2);
@@ -5209,6 +5159,47 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
     // geometry into the same address and size can change only words between the samples, and the old
     // indices drew on (FM2 port, report #4: black wedges of track). REGPU_INDEX_SAMPLED_HASH=1 samples
     // every 256 bytes as before (A/B).)
+    // watch (Host::watchArm / watchClean, as the vertex arena): a buffer none of whose pages was written since its
+    // last hash keeps that hash, without reading it again; every index buffer was hashed in full at its first draw of
+    // each frame (FM3 races: ~3% of the draw thread, whose time sets the 1% lows in the ~2,900-draw stretches). One
+    // that changes is hashed for 120 frames before it is watched again (a fault per write otherwise); memory that
+    // can't be watched is tried again after 600. REGPU_INDEX_NO_WATCH=1 (live): hashed every frame, as before.
+    // REGPU_INDEX_VERIFY=1 (diagnostic): hashed anyway, and a change with no write seen is logged.
+    if (watch)
+    {
+        const regpu::Host& host = regpu::GetHost();
+        const uint32_t physical = base & 0x1FFFFFFF;
+        if (!inserted && e.armed && host.watchClean(physical, bytes, e.watchSeq))
+        {
+            hash = e.hash;
+            if (static LiveSwitch verify("REGPU_INDEX_VERIFY"); verify)
+                if (const uint64_t now = FullHash(src, bytes); now != hash)
+                {
+                    static int logged = 0;
+                    if (logged++ < 20)
+                        Log("index watch: %08X (%u bytes, frame %llu) changed with no write seen", base, bytes, (unsigned long long)g_r.frame);
+                    hash = now;
+                    e.armed = false;
+                }
+        }
+        else
+        {
+            e.armed = false;
+            if (g_r.frame >= e.quietUntil)
+            {
+                e.watchSeq = host.watchSeq() + 1; // (armed before the hash: a write after it faults and is seen)
+                e.armed = host.watchArm(physical, bytes);
+                if (!e.armed)
+                    e.quietUntil = g_r.frame + 600;
+            }
+            hash = FullHash(src, bytes);
+            if (!inserted && hash != e.hash)
+            {
+                e.quietUntil = g_r.frame + 120;
+                e.armed = false;
+            }
+        }
+    }
     if (!inserted && hash == e.hash)
     {
         if (e.stagedFrame == g_r.frame)
@@ -7717,11 +7708,13 @@ void PipelineBudgetFrameStart()
 // handle; a tag bit can: AMD's handles use bit 0). BindGraphicsPipeline records it as a deferred bind.
 std::mutex g_deferredMutex;
 std::unordered_set<VkPipeline> g_deferredTokens; // (entries are never freed)
+std::atomic<uint32_t> g_deferredTokenGen{ 0 };     // bumped by every new token (BindGraphicsPipeline's memo)
 VkPipeline DeferredToken(PipelineEntry* e)
 {
     const VkPipeline t = reinterpret_cast<VkPipeline>(e);
     std::lock_guard lock(g_deferredMutex);
-    g_deferredTokens.insert(t);
+    if (g_deferredTokens.insert(t).second)
+        g_deferredTokenGen.fetch_add(1, std::memory_order_release);
     return t;
 }
 VkPipeline ResolveDeferred(void* ctx)
@@ -7737,8 +7730,32 @@ void BindGraphicsPipeline(vk::RecordedList& list, VkPipeline p)
     bool token = false;
     if (DeferredPipelines())
     {
-        std::lock_guard lock(g_deferredMutex);
-        token = g_deferredTokens.count(p) != 0;
+        // Each thread remembers its recent answers (a lock and a set lookup at every bind were ~1% of the draw
+        // thread), forgotten whenever a token is made or the pipelines are replaced.
+        struct Memo
+        {
+            VkPipeline p = VK_NULL_HANDLE;
+            bool token = false;
+        };
+        thread_local Memo memo[256];
+        thread_local uint32_t memoGen = ~0u, memoPipelineGen = ~0u;
+        const uint32_t gen = g_deferredTokenGen.load(std::memory_order_acquire), pipelineGen = g_pipelineGen.load(std::memory_order_acquire);
+        if (gen != memoGen || pipelineGen != memoPipelineGen)
+        {
+            for (Memo& m : memo)
+                m = {};
+            memoGen = gen, memoPipelineGen = pipelineGen;
+        }
+        const uintptr_t h = reinterpret_cast<uintptr_t>(p);
+        Memo& m = memo[(h ^ h >> 8 ^ h >> 16) & 255];
+        if (m.p == p && p)
+            token = m.token;
+        else
+        {
+            std::lock_guard lock(g_deferredMutex);
+            token = g_deferredTokens.count(p) != 0;
+            m = { p, token };
+        }
     }
     if (token)
         list.BindPipelineDeferred(VK_PIPELINE_BIND_POINT_GRAPHICS, ResolveDeferred, reinterpret_cast<void*>(p));
