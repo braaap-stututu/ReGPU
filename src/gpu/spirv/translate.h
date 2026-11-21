@@ -37,6 +37,12 @@ struct SpirvOptions
     // doesn't issue a shader's samples together (faster where vector registers are plenty: the RX 7900 XTX's 4K race
     // +4%; on RDNA2 graphics their registers cost occupancy: the 9800X3D's ~4% slower). The renderer's choice per GPU.
     bool fetchBranches = false;
+    // The motion-vector variant for temporal upscalers (renderer.cpp MotionVariant, the HLSL path's): the vertex shader
+    // also runs the guest program with last frame's constants (vcPrev, set 0 binding 2) and outputs this and last
+    // frame's clip positions (locations 17, 18; the drawn position jittered by vjitter, the VS block's member 13); the
+    // pixel shader writes the motion (location 1, RG) and the reactive mask (location 2, R). Combines with the other
+    // options, so a motion draw keeps its alpha-test-free and fetch variants.
+    bool motion = false;
 };
 
 // hlslInfo: the HLSL path's result for the same shader (TranslateShader, after the renderer's PackConstants): its

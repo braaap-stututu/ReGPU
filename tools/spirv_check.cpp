@@ -37,12 +37,17 @@ double Ms(std::chrono::steady_clock::duration d) { return std::chrono::duration<
 int main(int argc, char** argv)
 {
     bool dxc = true;
+    SpirvOptions options; // --motion: the motion-vector variants (SpirvOptions::motion); --no-kill: alpha-test-free
     std::filesystem::path keep;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++)
     {
         if (!strcmp(argv[i], "--no-dxc"))
             dxc = false;
+        else if (!strcmp(argv[i], "--motion"))
+            options.motion = true;
+        else if (!strcmp(argv[i], "--no-kill"))
+            options.noAlphaTest = true;
         else if (!strcmp(argv[i], "--keep") && i + 1 < argc)
             keep = argv[++i];
         else
@@ -74,7 +79,7 @@ int main(int argc, char** argv)
         std::vector<uint32_t> words;
         std::string why;
         const auto t0 = std::chrono::steady_clock::now();
-        const bool ok = TranslateSpirv(shader, info, words, why);
+        const bool ok = TranslateSpirv(shader, info, words, why, options);
         const auto t1 = std::chrono::steady_clock::now();
         if (!ok)
         {

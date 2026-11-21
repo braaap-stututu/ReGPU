@@ -124,6 +124,34 @@ make that combination all the time and render right, so the trigger is narrower 
 the driver, and the same GPU is the one the pipeline libraries hang. A candidate for an AMD report, and a reason to
 re-check both after a driver update.
 
+### Motion vectors (temporal upscalers)
+
+TAA, FSR 3/4 and XeSS need motion vectors, so the scene's draws use motion variants of their shaders. The vertex shader
+runs the guest program a second time with last frame's constants (`vcPrev`, set 0 binding 2) and outputs both clip
+positions (locations 17 and 18). The pixel shader adds the motion target (location 1) and the reactive mask (location 2).
+
+The HLSL motion variants were made from the base shader, so motion draws lost the alpha-test-free, plain-fetch and
+specialised fetch variants. A direct shader's motion variant now comes from the direct translator: `SpirvOptions::motion`
+on top of the variant's own options. It is made on a pipeline-pool thread and falls back to HLSL.
+`REGPU_MOTION_HLSL=1` gives the HLSL motion variants, as before.
+
+FM3 race grid, 1440p, RX 7900 XTX (21 Nov 2026):
+
+| | GPU ms per frame, HLSL motion | GPU ms per frame, direct motion |
+|---|---|---|
+| TAA | 2.72 | 2.27 |
+| FSR 3 Quality | 2.79 | 2.40 |
+| native 4x MSAA (no motion) | 2.21 | 2.21 |
+
+- The draw thread does about 0.2 ms a frame more: a motion draw now picks its fetch variant, as non-motion draws do.
+  On the CPU-bound grid that is 306 fps against 327.
+- In the same work, two draw-thread costs that hit every MSAA-off configuration:
+  - `StateFromKey` called `getenv("REGPU_NO_ALPHA_DITHER")` on every pipeline lookup: 27% of the draw thread with TAA.
+  - The temporal stats were locked increments: about 7%.
+- Why upscaling saves little in FM3: the scene's main pass costs about 1.5 ms at 1440p and barely depends on its pixel
+  count (4x MSAA +0.04 ms, 4x the pixels +0.6 ms), while FSR 3's pass is 0.45 ms (Quality) and FSR 4's about 2 ms on
+  RDNA 3. Most of the pass is fixed cost: vertex work and per-draw overhead.
+
 ## Pipeline stalls
 
 New pipelines are built when a draw first needs them; on an RX 7900 XTX a build that misses the driver's cache takes

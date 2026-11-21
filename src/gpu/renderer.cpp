@@ -181,6 +181,9 @@ struct TemporalStats
         motion{ 0 }, known{ 0 }, resolves{ 0 }, resolveFullWidth{ 0 }, sceneDone{ 0 }, evaluated{ 0 }, depthCopies{ 0 }, depthNoTarget{ 0 }, depthEmpty{ 0 }, cuts{ 0 },
         cutSamples{ 0 }, cutHits{ 0 };
 } g_tstat;
+// A temporal-stats count (logged once a second): a plain relaxed load and store, not a locked increment. Several a draw:
+// as locked increments they were ~7% of the draw thread (FM3 with TAA); a rare lost count is harmless here.
+inline void Bump(std::atomic<uint32_t>& v) { v.store(v.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
 // A Vulkan image or buffer shared the way D3D12 resources were (ComPtr<ID3D12Resource>): an intrusive count, so a raw
 // pointer handed out (GetTexture) can become a reference again (the bindless table keeps one). The last reference
 // buries it on the device timeline (Renderer::vkGraveyard, after everything submitted so far); the frame garbage
@@ -847,6 +850,7 @@ struct CompiledShader
     uint32_t tag = 0; // the game's mark for this shader (Host::rewriteShader), passed to Host::onDraw
     bool direct = false; // its SPIR-V came from the direct translator (REGPU_SPIRV_DIRECT), not HLSL and DXC
     bool directNoKill = false; // ... as the alpha-test-free variant (its fetch variants are too)
+    SpirvOptions directOptions; // ... the direct translator's options it was made with (its motion variant adds motion)
     bool IsReady() const { return state.load(std::memory_order_acquire) == Ready; }
 };
 
@@ -6097,6 +6101,7 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
             code->words = std::move(words);
             cs.code = std::move(code);
             cs.direct = true;
+            cs.directOptions = options;
             cs.cacheKey = Fnv(cs.info.hlsl.data(), cs.info.hlsl.size(), 3); // (apart from the HLSL path's)
             cs.state = CompiledShader::Ready;
             static std::atomic<uint32_t> count{ 0 };
@@ -6227,8 +6232,55 @@ const CompiledShader* MotionShader(const CompiledShader& base)
     return m;
 }
 
+bool DirectVariant(const CompiledShader& base, const SpirvOptions& options, CompiledShader& cs, uint64_t seed);
+void RunOnPipelinePool(std::function<void()> job);
+// A direct shader's motion variant (REGPU_SPIRV_DIRECT): the direct translator with its own options plus `motion`, so an
+// alpha-test-free or fetch variant keeps what it is (the HLSL motion variant is made from the base shader's HLSL, without
+// them: TAA and FSR drew the race grid's main pass in 1.89 ms where the same shaders' variants take 1.50). Made on a
+// pipeline-pool thread; the draw has no motion until it's ready. Falls back to the HLSL motion variant.
+// REGPU_MOTION_HLSL=1 (start-time): the HLSL motion variants, as before.
+const CompiledShader* DirectMotionShader(const CompiledShader& base)
+{
+    // (By the shader object, not its cache key: a vertex shader's patched copies share their base's key, but each bakes
+    // its own vertex fetch layout.)
+    static std::unordered_map<const CompiledShader*, std::unique_ptr<CompiledShader>> made;
+    static std::mutex madeMutex;
+    std::lock_guard lock(madeMutex);
+    auto [it, inserted] = made.try_emplace(&base);
+    if (!inserted)
+        return it->second->state.load(std::memory_order_acquire) == CompiledShader::Failed ? nullptr : it->second.get();
+    it->second = std::make_unique<CompiledShader>();
+    CompiledShader* cs = it->second.get();
+    cs->hash = base.hash;
+    cs->pixel = base.pixel;
+    cs->ucodeBE = base.ucodeBE;
+    cs->info = base.info;
+    cs->state = CompiledShader::Pending;
+    SpirvOptions options = base.directOptions;
+    options.motion = true;
+    const CompiledShader* from = &base; // (shaders are never freed)
+    RunOnPipelinePool([cs, from, options] {
+        if (DirectVariant(*from, options, *cs, 0x6D6F74696F6Eull))
+            return;
+        cs->info.hlsl = MotionVariant(from->info.hlsl, from->pixel);
+        if (cs->info.hlsl.empty())
+        {
+            cs->state = CompiledShader::Failed;
+            return;
+        }
+        cs->direct = false;
+        cs->cacheKey = Fnv(cs->info.hlsl.data(), cs->info.hlsl.size(), from->pixel ? 1 : 2);
+        cs->loadFirst = true;
+        g_compiler.PushQuiet(cs);
+    });
+    return cs;
+}
+
 const CompiledShader* MotionShaderLookup(const CompiledShader& base)
 {
+    static const bool hlslMotion = getenv("REGPU_MOTION_HLSL") != nullptr;
+    if (base.direct && !base.ucodeBE.empty() && !hlslMotion)
+        return DirectMotionShader(base);
     const CompiledShader& source = base.hlslSource ? *base.hlslSource : base;
     auto [it, inserted] = g_motionShaders.try_emplace(source.cacheKey);
     if (!inserted)
@@ -6303,14 +6355,15 @@ bool DirectVariant(const CompiledShader& base, const SpirvOptions& options, Comp
 {
     if (!base.direct || base.ucodeBE.empty())
         return false;
-    const ucode::Shader parsed = ucode::Parse(base.ucodeBE.data(), uint32_t(base.ucodeBE.size()), true);
+    // (By the shader's own stage: motion variants are made of vertex shaders too.)
+    const ucode::Shader parsed = ucode::Parse(base.ucodeBE.data(), uint32_t(base.ucodeBE.size()), base.pixel);
     std::vector<uint32_t> words;
     std::string why;
     SpirvOptions o = options;
     o.fetchBranches = DirectFetchBranches();
     if (!TranslateSpirv(parsed, base.info, words, why, o))
     {
-        LOG_ONCE("spirv direct: a variant of ps %016llx takes the HLSL path: %s", (unsigned long long)base.hash, why.c_str());
+        LOG_ONCE("spirv direct: a variant of %s %016llx takes the HLSL path: %s", base.pixel ? "ps" : "vs", (unsigned long long)base.hash, why.c_str());
         return false;
     }
     auto code = std::make_shared<SpirvCode>();
@@ -6318,6 +6371,7 @@ bool DirectVariant(const CompiledShader& base, const SpirvOptions& options, Comp
     cs.code = std::move(code);
     cs.direct = true;
     cs.directNoKill = options.noAlphaTest;
+    cs.directOptions = o;
     cs.cacheKey = base.cacheKey * 0x9E3779B97F4A7C15ull ^ seed;
     cs.state = CompiledShader::Ready;
     return true;
@@ -6988,7 +7042,10 @@ void StateFromKey(const PipelineKey& key, vk::PipelineDesc& pd)
     rt.alphaOp = VkBlendOpFor(opA);
     rt.writeMask = VkColorComponentFlags(mask); // RB_COLOR_MASK's RGBA bits are Vulkan's R G B A bits
     // (One sample: dithered in the pixel shader instead, see DrawImpl, unless REGPU_NO_ALPHA_DITHER.)
-    pd.alphaToCoverage = alphaToMask && (g_msaa > 1 || getenv("REGPU_NO_ALPHA_DITHER"));
+    // (getenv once: this runs for every pipeline lookup whose key changed, ~10 us a call; FM3 with TAA, MSAA off: 27% of
+    // the draw thread.)
+    static const bool noAlphaDither = getenv("REGPU_NO_ALPHA_DITHER") != nullptr;
+    pd.alphaToCoverage = alphaToMask && (g_msaa > 1 || noAlphaDither);
     pd.depthClip = !((key.flags >> 2) & 1);
     if (key.biasScale | key.biasOffset)
     {
@@ -9770,12 +9827,12 @@ void CopySceneDepth(const Rect& gameRect)
     const Rect r = ToHost(gameRect);
     if (!g_upscale.depth || !C().vkDepth)
     {
-        g_tstat.depthNoTarget++;
+        Bump(g_tstat.depthNoTarget);
         return;
     }
     if (r.right <= r.left || r.bottom <= r.top)
     {
-        g_tstat.depthEmpty++;
+        Bump(g_tstat.depthEmpty);
         return;
     }
     uint32_t c[24] = {};
@@ -9789,7 +9846,7 @@ void CopySceneDepth(const Rect& gameRect)
         (c[21] + 7) / 8);
     vk::Transition(*C().vkList, *C().vkDepth, vk::Use::DepthTarget);
     g_drawState.Invalidate(); // the compute pipeline replaced the draw's
-    g_tstat.depthCopies++;
+    Bump(g_tstat.depthCopies);
 }
 
 float Halton(uint32_t index, uint32_t base)
@@ -9806,7 +9863,7 @@ float Halton(uint32_t index, uint32_t base)
 // Start of a temporal frame: jitter, a cleared motion target, the next constants map.
 void BeginTemporalFrame()
 {
-    g_tstat.frames++;
+    Bump(g_tstat.frames);
     g_upscale.cutSamples = g_upscale.cutHits = 0;
     static auto statsLogged = std::chrono::steady_clock::now();
     if (const auto now = std::chrono::steady_clock::now(); now - statsLogged >= std::chrono::seconds(1))
@@ -9936,7 +9993,7 @@ bool EvaluateTemporal(uint32_t base, bool dlss, bool xess = false)
     g_tstat.cutHits += g_upscale.cutHits;
     if (g_upscale.cut)
     {
-        g_tstat.cuts++;
+        Bump(g_tstat.cuts);
         static uint32_t logged = 0;
         if (logged++ < 20)
             Log("temporal: camera cut at frame %llu (%u of %u sampled draws)%s", (unsigned long long)g_r.frame, g_upscale.cutHits, g_upscale.cutSamples,
@@ -9992,7 +10049,7 @@ bool EvaluateTemporal(uint32_t base, bool dlss, bool xess = false)
                 &job);
     }
     if (ok)
-        g_tstat.evaluated++;
+        Bump(g_tstat.evaluated);
     g_upscale.viewValid = ok; // (REGPU_VIEW_MOTION / _DEPTH / _REACTIVE show them at the end of the frame)
     g_upscale.viewWidth = inWidth;
     g_upscale.viewHeight = inHeight;
@@ -11255,9 +11312,9 @@ void Resolve()
         // Temporal upscaling: each tile of the main view keeps its depth before it is cleared.
         if (g_temporal && g_scenePhase && !depth)
         {
-            g_tstat.resolves++;
+            Bump(g_tstat.resolves);
             if (width >= FrameW() && rect.left == 0 && rect.right >= LONG(FrameW()))
-                g_tstat.resolveFullWidth++;
+                Bump(g_tstat.resolveFullWidth);
         }
         if (g_temporal && g_scenePhase && !depth && width >= FrameW() && rect.left == 0 && rect.right >= LONG(FrameW()))
             CopySceneDepth(rect);
@@ -11265,7 +11322,7 @@ void Resolve()
         if (g_scenePhase && !depth && width >= FrameW() && rect.left == 0 && rect.right >= LONG(FrameW()) && rect.bottom >= LONG(FrameH()))
         {
             if (g_temporal)
-                g_tstat.sceneDone++;
+                Bump(g_tstat.sceneDone);
             UpscaleScene(base);
         }
         g_r.resolved[base].swapped = swapRB;
@@ -14907,22 +14964,36 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const bool cullable = (initiator & 0x3F) != 8 && (initiator & 0x3F) != 1;
     const bool wantMotion = g_temporal && g_scenePhase && edramMode == 4 && WidePass() && !g_hyperProbe;
     g_plainRectDraw = (initiator & 0x3F) == 8 && !ps.info.usedTextureSlots && !vs.info.usedTextureSlots;
+    // REGPU_SPLIT_ALPHA_TEST (NoKillShader): with the alpha test (RB_COLORCONTROL bit 3, a function other than "always")
+    // and alpha-to-mask (bit 4) off, the pixel shader's variant without the alpha-test kill; a motion draw takes that
+    // variant's motion variant (REGPU_MOTION_HLSL: the base shader's, as before).
+    const CompiledShader* psPicked = &ps;
+    if (static LiveSwitch splitAlphaTest("REGPU_SPLIT_ALPHA_TEST"); splitAlphaTest && !IsPsEditAlias(C().psHash))
+    {
+        const uint32_t cc = gpureg::Get(RB_COLORCONTROL);
+        const bool alphaTest = ((cc >> 3) & 1) && (cc & 7) != 7;
+        if (!alphaTest && !((cc >> 4) & 1))
+            if (const CompiledShader* k = NoKillShader(ps))
+                psPicked = k;
+    }
+    static const bool hlslMotion = getenv("REGPU_MOTION_HLSL") != nullptr;
+    const CompiledShader* motionPs = hlslMotion ? &ps : psPicked;
     const CompiledShader* mvs = wantMotion ? MotionShader(vs) : nullptr;
-    const CompiledShader* mps = wantMotion ? MotionShader(ps) : nullptr;
+    const CompiledShader* mps = wantMotion ? MotionShader(*motionPs) : nullptr;
     bool motion = mvs && mps && mvs->IsReady() && mps->IsReady();
     if (g_temporal && g_scenePhase)
     {
-        g_tstat.draws++;
+        Bump(g_tstat.draws);
         if (edramMode == 4)
-            g_tstat.edram4++;
+            Bump(g_tstat.edram4);
         if (WidePass())
-            g_tstat.widePass++;
+            Bump(g_tstat.widePass);
         if (wantMotion)
-            g_tstat.wantMotion++;
+            Bump(g_tstat.wantMotion);
         if (wantMotion && !(mvs && mps))
-            g_tstat.shaderMissing++;
+            Bump(g_tstat.shaderMissing);
         else if (wantMotion && !motion)
-            g_tstat.shaderNotReady++;
+            Bump(g_tstat.shaderNotReady);
     }
     // Last frame's vertex constants of this draw (b2): at this offset of the previous slot's ring (motionKnown), else
     // this draw's own (no motion).
@@ -14930,24 +15001,16 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     bool motionKnown = false;
     // The bound pipeline's dynamic draw state (DynamicDrawState), and the occlusion coverage draw's.
     vk::DrawState drawDyn{}, coverDyn{};
-    VkPipeline pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true, stripCut && directIndex, false, false, 0, &drawDyn) : VK_NULL_HANDLE;
-    const CompiledShader* psUsed = nullptr; // the pixel shader drawn with, when not a motion pipeline
+    VkPipeline pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true, stripCut && directIndex, false, motionPs != &ps, 0, &drawDyn) : VK_NULL_HANDLE;
+    // The pixel shader drawn with (its fetch variants are picked from it below), motion or not; null for an HLSL motion
+    // variant (REGPU_MOTION_HLSL), which has no fetch variants.
+    const CompiledShader* psUsed = pso && !hlslMotion ? psPicked : nullptr;
     if (wantMotion && motion && !pso)
-        g_tstat.noPipeline++;
+        Bump(g_tstat.noPipeline);
     if (!pso)
     {
         motion = false;
-        // REGPU_SPLIT_ALPHA_TEST (NoKillShader): with the alpha test (RB_COLORCONTROL bit 3, a function other
-        // than "always") and alpha-to-mask (bit 4) off, the pixel shader's variant without the alpha-test kill.
-        psUsed = &ps;
-        if (static LiveSwitch splitAlphaTest("REGPU_SPLIT_ALPHA_TEST"); splitAlphaTest && !IsPsEditAlias(C().psHash))
-        {
-            const uint32_t cc = gpureg::Get(RB_COLORCONTROL);
-            const bool alphaTest = ((cc >> 3) & 1) && (cc & 7) != 7;
-            if (!alphaTest && !((cc >> 4) & 1))
-                if (const CompiledShader* k = NoKillShader(ps))
-                    psUsed = k;
-        }
+        psUsed = psPicked;
         // A depth-only rectangle (EDRAM mode 5, no textures: a depth/stencil reset) whose depth surface starts at the
         // colour surface's EDRAM base writes the EDRAM that colour surface reads: the console has one EDRAM, and its
         // depth words land in the colour pixels there. Titles rely on it to zero a colour target with a stencil reset.
@@ -15162,9 +15225,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             const bool known = entry.frame + 1 == g_upscale.constantsFrame && !g_upscale.reset && entry.slot[parity ^ 1] == prevSlot;
             motionKnown = known;
             motionOffset = known ? entry.offset[parity ^ 1] : uint32_t(vsOffset);
-            g_tstat.motion++;
+            Bump(g_tstat.motion);
             if (known)
-                g_tstat.known++;
+                Bump(g_tstat.known);
             // Camera cut detection (see Upscale::cut): the frame's first kCutSamples draws with motion.
             constexpr uint32_t kCutSamples = 48;
             if (g_upscale.cutSamples < kCutSamples && nv >= 4)
@@ -16174,7 +16237,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             if (const CompiledShader* f = FetchShader(*psUsed, plain))
             {
                 vk::DrawState fetchDyn{};
-                if (VkPipeline fp = GetPipeline(vs, *f, edramMode == 5, cullable, false, stripCut && directIndex, false, psUsed != &ps, plain, &fetchDyn))
+                // A motion draw: the fetch variant's motion variant (once both are ready; until then the motion draw above).
+                const CompiledShader* mf = motion ? MotionShader(*f) : nullptr;
+                VkPipeline fp = VK_NULL_HANDLE;
+                if (!motion)
+                    fp = GetPipeline(vs, *f, edramMode == 5, cullable, false, stripCut && directIndex, false, psUsed != &ps, plain, &fetchDyn);
+                else if (mf && mf->IsReady())
+                    fp = GetPipeline(*mvs, *mf, false, cullable, true, stripCut && directIndex, false, psUsed != &ps, plain, &fetchDyn);
+                if (fp)
                 {
                     pso = fp;
                     drawDyn = fetchDyn;

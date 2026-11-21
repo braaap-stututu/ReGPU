@@ -28,9 +28,11 @@ struct Translator
     // Globals.
     uint32_t cb = 0, inO = 0, inPcoord = 0, inPos = 0, outColor = 0, outDepth = 0;
     uint32_t cbTex = 0; // the block with tinfo / tbias (PSConstants: cb in a pixel shader, binding 1 in a vertex shader)
+    uint32_t constCb = 0; // where float constants are read when not cb (GuestVSPrev: VSPrevious, vcPrev[256])
+    uint32_t inMcur = 0, inMprev = 0, outMv = 0, outReactive = 0; // motion variants (SpirvOptions::motion)
     // Vertex shaders: the guest program's outputs (GuestVS), the vertex-fetch state as hlsl.cpp's Emitter keeps it, the
     // guest memory buffers (set 0 binding 100 gmem, 101 gphys).
-    uint32_t oPos = 0, oArr = 0, oPts = 0, vfi = 0, gmemV = 0, gphysV = 0, pSbU = 0;
+    uint32_t oPos = 0, oArr = 0, oPts = 0, vfi = 0, gmemV = 0, gphysV = 0, pSbU = 0, prevCb = 0;
     uint32_t lastConst = 0, lastStride = 0, lastSrc = 0, lastSrcSwizzle = 0;
     bool lastRound = false;
     // Function variables.
@@ -108,7 +110,7 @@ struct Translator
         }
         else
             idx = I(int32_t(info.packedConstants ? rank[index & 255] : (index & 255)));
-        return Load(tV4, b.Op(spv::OpAccessChain, pUniV4, { cb, I(0), idx }));
+        return Load(tV4, b.Op(spv::OpAccessChain, pUniV4, { constCb ? constCb : cb, I(0), idx }));
     }
 
     uint32_t Src(const Source& s)
@@ -1121,6 +1123,18 @@ struct Translator
         outColor = b.GlobalVariable(b.TypePointer(spv::StorageClassOutput, tV4), spv::StorageClassOutput);
         b.Decorate(outColor, spv::DecorationLocation, { 0 });
         std::vector<uint32_t> io{ inPos, inO, inPcoord, outColor };
+        if (options.motion)
+        {
+            inMcur = b.GlobalVariable(pInV4, spv::StorageClassInput);
+            b.Decorate(inMcur, spv::DecorationLocation, { 17 });
+            inMprev = b.GlobalVariable(pInV4, spv::StorageClassInput);
+            b.Decorate(inMprev, spv::DecorationLocation, { 18 });
+            outMv = b.GlobalVariable(b.TypePointer(spv::StorageClassOutput, tV2), spv::StorageClassOutput);
+            b.Decorate(outMv, spv::DecorationLocation, { 1 });
+            outReactive = b.GlobalVariable(b.TypePointer(spv::StorageClassOutput, tF), spv::StorageClassOutput);
+            b.Decorate(outReactive, spv::DecorationLocation, { 2 });
+            io.insert(io.end(), { inMcur, inMprev, outMv, outReactive });
+        }
         if (exportsDepth)
         {
             outDepth = b.GlobalVariable(b.TypePointer(spv::StorageClassOutput, tF), spv::StorageClassOutput);
@@ -1220,6 +1234,17 @@ struct Translator
                 WriteMasked(oC[0], Splat(Bin(spv::OpFMul, tF, Comp(c, 3), Comp(c, 3))), 8);
             });
             Store(outColor, Load(tV4, oC[0]));
+            if (options.motion)
+            {
+                // (renderer.cpp MotionVariant) mv = (prev - cur) * (0.5, -0.5) in NDC; the reactive mask from the colour's
+                // alpha (scaled by mcur.z) or brightness (by mprev.z).
+                const uint32_t mc = Load(tV4, inMcur), mp = Load(tV4, inMprev), c = Load(tV4, oC[0]);
+                const uint32_t cx = FDiv(Comp(mc, 0), Comp(mc, 3)), cy = FDiv(Comp(mc, 1), Comp(mc, 3));
+                const uint32_t qx = FDiv(Comp(mp, 0), Comp(mp, 3)), qy = FDiv(Comp(mp, 1), Comp(mp, 3));
+                Store(outMv, Vec2(FMulS(FSub(qx, cx), F(0.5f)), FMulS(FSub(qy, cy), F(-0.5f))));
+                const uint32_t bright = b.Ext(tF, GLSLstd450FMax, { Comp(c, 0), b.Ext(tF, GLSLstd450FMax, { Comp(c, 1), Comp(c, 2) }) });
+                Store(outReactive, Saturate(FAdd(FMulS(Comp(mc, 2), Comp(c, 3)), FMulS(Comp(mp, 2), bright)), false));
+            }
             if (exportsDepth)
                 Store(outDepth, Saturate(Comp(Load(tV4, oD), 0), false));
         }
@@ -1491,15 +1516,26 @@ struct Translator
                            aVfl = b.TypeArray(tUV4, 32), aUser = b.TypeArray(tV4, 4);
             for (uint32_t a : { aC, aB, aL8, aVf, aVfl, aUser })
                 b.Decorate(a, spv::DecorationArrayStride, { 16 });
-            const uint32_t block = b.TypeStruct({ aC, aB, aL8, aVf, tUV4, tV4, tV4, tV4, tUV4, aVfl, aUser, tV4, tV4 });
+            const uint32_t block = b.TypeStruct({ aC, aB, aL8, aVf, tUV4, tV4, tV4, tV4, tUV4, aVfl, aUser, tV4, tV4, tV4 });
             b.Decorate(block, spv::DecorationBlock);
-            const uint32_t offsets[] = { 0, 4096, 4128, 4256, 5792, 5808, 5824, 5840, 5856, 5872, 6384, 6448, 6464 };
-            for (uint32_t m = 0; m < 13; m++)
+            const uint32_t offsets[] = { 0, 4096, 4128, 4256, 5792, 5808, 5824, 5840, 5856, 5872, 6384, 6448, 6464, 6480 };
+            for (uint32_t m = 0; m < 14; m++)
                 b.MemberDecorate(block, m, spv::DecorationOffset, { offsets[m] });
             b.Name(block, "VSConstants");
             cb = b.GlobalVariable(b.TypePointer(spv::StorageClassUniform, block), spv::StorageClassUniform);
             b.Decorate(cb, spv::DecorationDescriptorSet, { 0 });
             b.Decorate(cb, spv::DecorationBinding, { 0 });
+            // Motion: last frame's float constants (HLSL cbuffer VSPrevious : register(b2), vcPrev[256]).
+            if (options.motion)
+            {
+                const uint32_t prevBlock = b.TypeStruct({ aC });
+                b.Decorate(prevBlock, spv::DecorationBlock);
+                b.MemberDecorate(prevBlock, 0, spv::DecorationOffset, { 0 });
+                b.Name(prevBlock, "VSPrevious");
+                prevCb = b.GlobalVariable(b.TypePointer(spv::StorageClassUniform, prevBlock), spv::StorageClassUniform);
+                b.Decorate(prevCb, spv::DecorationDescriptorSet, { 0 });
+                b.Decorate(prevCb, spv::DecorationBinding, { 2 });
+            }
         }
         // PSConstants for the fetch constants (tinfo, tbias), binding 1, as the HLSL vertex shaders read them.
         {
@@ -1547,6 +1583,14 @@ struct Translator
         b.Decorate(outO, spv::DecorationLocation, { 0 });
         const uint32_t outPc = b.GlobalVariable(b.TypePointer(spv::StorageClassOutput, tV2), spv::StorageClassOutput);
         b.Decorate(outPc, spv::DecorationLocation, { 16 });
+        uint32_t outMcur = 0, outMprev = 0;
+        if (options.motion)
+        {
+            outMcur = b.GlobalVariable(b.TypePointer(spv::StorageClassOutput, tV4), spv::StorageClassOutput);
+            b.Decorate(outMcur, spv::DecorationLocation, { 17 });
+            outMprev = b.GlobalVariable(b.TypePointer(spv::StorageClassOutput, tV4), spv::StorageClassOutput);
+            b.Decorate(outMprev, spv::DecorationLocation, { 18 });
+        }
 
         // GuestVS(vindex): the guest program, returning (opos, o[16], opts).
         const uint32_t tRet = b.TypeStruct({ tV4, tA16, tV4 });
@@ -1554,8 +1598,11 @@ struct Translator
         const uint32_t zeroA16 = b.ConstComposite(tA16, std::vector<uint32_t>(16, Zero4()));
         const uint32_t guest = b.Id();
         b.Name(guest, "GuestVS");
-        {
-            const std::vector<uint32_t> params = b.BeginFunction(guest, tRet, b.TypeFunction(tRet, { tU }), { tU });
+        auto emitGuest = [&](uint32_t fn) {
+            // (The vertex-fetch bookkeeping refers to this function's values: start each copy clean.)
+            lastConst = lastStride = lastSrc = lastSrcSwizzle = 0;
+            lastRound = false;
+            const std::vector<uint32_t> params = b.BeginFunction(fn, tRet, b.TypeFunction(tRet, { tU }), { tU });
             r = b.Variable(b.TypePointer(spv::StorageClassFunction, b.TypeArray(tV4, regCount)));
             ps = b.Variable(pFnF);
             p = b.Variable(pFnB);
@@ -1581,11 +1628,24 @@ struct Translator
             EmitProgram(reachable, linear, forward, loops);
             b.ReturnValue(b.Op(spv::OpCompositeConstruct, tRet, { Load(tV4, oPos), Load(tA16, oArr), Load(tV4, oPts) }));
             b.EndFunction();
+        };
+        emitGuest(guest);
+        uint32_t guestPrev = 0;
+        if (options.motion)
+        {
+            guestPrev = b.Id();
+            b.Name(guestPrev, "GuestVSPrev");
+            constCb = prevCb;
+            emitGuest(guestPrev);
+            constCb = 0;
         }
 
         const uint32_t entry = b.Id();
         b.Name(entry, "main");
-        b.EntryPoint(spv::ExecutionModelVertex, entry, "main", { inVid, outPos, outO, outPc });
+        std::vector<uint32_t> vsIo{ inVid, outPos, outO, outPc };
+        if (options.motion)
+            vsIo.insert(vsIo.end(), { outMcur, outMprev });
+        b.EntryPoint(spv::ExecutionModelVertex, entry, "main", vsIo);
         b.BeginFunction(entry, tVoid, b.TypeFunction(tVoid));
         const uint32_t vteX = VsU(8, 0), vteY = VsU(8, 1), vteZ = VsU(8, 2), vteW = VsU(8, 3), vinfoX = VsU(4, 0), vinfoY = VsU(4, 1);
         const uint32_t id = b.Op(spv::OpBitcast, tU, { Load(tI, inVid) });
@@ -1739,8 +1799,9 @@ struct Translator
             Store(pointOffset, Vec2(off(cx, dx), off(cy, dy)));
         });
 
-        // The Xenos viewport transform (PA_CL_VTE_CNTL), Hor+ for wide passes, back to clip space (hlsl.cpp's main).
-        const uint32_t pos = Load(tV4, rPos);
+        // The Xenos viewport transform (PA_CL_VTE_CNTL), Hor+ for wide passes, back to clip space (hlsl.cpp's main; the
+        // motion variant's ToClip).
+        auto toClip = [&](const uint32_t pos) -> uint32_t {
         const uint32_t flat = Bin(spv::OpFOrdLessThanEqual, tB, FAbs(FSub(Comp(pos, 3), F(1))), F(1e-4f));
         uint32_t px = SelF(flat, Comp(pos, 0), FMulS(Comp(pos, 0), VsF(12, 0)));
         uint32_t py = SelF(flat, Comp(pos, 1), FMulS(Comp(pos, 1), VsF(12, 1)));
@@ -1788,7 +1849,27 @@ struct Translator
         const uint32_t zh = FAdd(FMulS(posZ, SelF(UBit(vteX, 4), VsF(6, 2), F(1))), FMulS(SelF(UBit(vteX, 5), VsF(7, 2), F(0)), w));
         zc = SelF(homogeneous, zh, zc);
         zc = FAdd(zc, FMulS(VsF(11, 0), w));
-        Store(outPos, Vec4(FMulS(ndcX, w), FMulS(ndcY, w), zc, w));
+        return Vec4(FMulS(ndcX, w), FMulS(ndcY, w), zc, w);
+        };
+        const uint32_t clip = toClip(Load(tV4, rPos));
+        if (!options.motion)
+            Store(outPos, clip);
+        else
+        {
+            // (renderer.cpp MotionVariant) mcur = the clip position, mprev = last frame's (points and rectangles: the same),
+            // the drawn position jittered; their z carry the reactive scales.
+            const uint32_t mprev = b.Variable(pFnV4);
+            Store(mprev, clip);
+            b.If(And(Not(isPoint), Not(rect)), [&] {
+                const uint32_t res = b.Op(spv::OpFunctionCall, tRet, { guestPrev, e });
+                Store(mprev, toClip(Comp(res, 0, tV4)));
+            });
+            const uint32_t jw = Comp(clip, 3);
+            Store(outPos, Vec4(FAdd(Comp(clip, 0), FMulS(VsF(13, 0), jw)), FAdd(Comp(clip, 1), FMulS(VsF(13, 1), jw)), Comp(clip, 2), jw));
+            Store(outMcur, Vec4(Comp(clip, 0), Comp(clip, 1), VsF(13, 2), jw));
+            const uint32_t mp = Load(tV4, mprev);
+            Store(outMprev, Vec4(Comp(mp, 0), Comp(mp, 1), VsF(13, 3), Comp(mp, 3)));
+        }
         Store(outO, Load(tA16, rO));
         Store(outPc, Load(tV2, rPc));
         b.EndFunction();
