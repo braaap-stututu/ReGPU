@@ -83,6 +83,13 @@ struct PipelineDesc
     bool dynamicBlend = false;
 };
 
+// Graphics pipeline libraries (VK_EXT_graphics_pipeline_library, Device::pipelineLibrary): one part of a pipeline from
+// the desc's state for that part (`parts`: VK_GRAPHICS_PIPELINE_LIBRARY_*_BIT_EXT), and a pipeline linked from the four
+// (fast: no optimisation across them; `optimize`: as optimised as a complete build, which needs parts made with
+// `retain`). Each dynamic state goes in the part that owns it.
+VkPipeline CreateGraphicsLibrary(Device& d, const PipelineDesc& desc, VkGraphicsPipelineLibraryFlagsEXT parts, bool retain, const char* name = nullptr);
+VkPipeline LinkGraphicsPipeline(Device& d, const VkPipeline* libraries, uint32_t count, VkPipelineLayout layout, bool optimize, const char* name = nullptr);
+
 // Builds the pipeline (through the device's pipeline cache). VK_NULL_HANDLE and a log line on failure.
 VkPipeline CreateGraphicsPipeline(Device& d, const PipelineDesc& desc, const char* name = nullptr);
 VkPipeline CreateComputePipeline(Device& d, VkPipelineLayout layout, VkShaderModule cs, const char* name = nullptr);

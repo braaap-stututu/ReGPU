@@ -414,6 +414,11 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     const bool derivativesNv = !derivativesKhr && optional(VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     d.mutableDescriptors = optional(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
     const bool eds3 = optional(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+    // (Only when asked for: REGPU_VK_PIPELINE_LIBRARY=1, the renderer's opt-in. FM3's pipelines linked from libraries hung the
+    // RX 7900 XTX's driver at the first frames, 21 Nov 2026.)
+    const bool gpl = getenv("REGPU_VK_PIPELINE_LIBRARY") && strcmp(getenv("REGPU_VK_PIPELINE_LIBRARY"), "0") != 0 &&
+        HasExtension(deviceExt, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && optional(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+        optional(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
     // VR (REGPU_VR): what OpenXR runtimes ask of an application's device to share its swapchain images and to sync with
     // its compositor (render/xr.cpp logs the runtime's own list at the session).
     if (const char* vr = getenv("REGPU_VR"); vr && *vr && strcmp(vr, "0") != 0 && strcmp(vr, "off") != 0)
@@ -458,6 +463,12 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     {
         haveEds3.pNext = haveCond.pNext;
         haveCond.pNext = &haveEds3;
+    }
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT haveGpl{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT };
+    if (gpl)
+    {
+        haveGpl.pNext = haveCond.pNext;
+        haveCond.pNext = &haveGpl;
     }
     vkGetPhysicalDeviceFeatures2(d.physical, &have);
     const VkPhysicalDeviceFeatures& h = have.features;
@@ -578,7 +589,21 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     d.dynamicBlend = eds3 && dyn3.extendedDynamicState3ColorBlendEnable && dyn3.extendedDynamicState3ColorBlendEquation &&
         dyn3.extendedDynamicState3ColorWriteMask;
     if (eds3)
+    {
         *tail = &dyn3;
+        tail = &dyn3.pNext;
+    }
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gplOn{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT };
+    gplOn.graphicsPipelineLibrary = haveGpl.graphicsPipelineLibrary;
+    if (gpl && haveGpl.graphicsPipelineLibrary)
+    {
+        VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gplProps{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT };
+        VkPhysicalDeviceProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        p2.pNext = &gplProps;
+        vkGetPhysicalDeviceProperties2(d.physical, &p2);
+        d.pipelineLibrary = gplProps.graphicsPipelineLibraryFastLinking;
+        *tail = &gplOn;
+    }
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
@@ -634,10 +659,11 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     for (uint32_t i = 0; i < d.memory.memoryHeapCount; i++)
         if (d.memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
             local = std::max<uint64_t>(local, d.memory.memoryHeaps[i].size);
-    Log("presenter: Vulkan on %s (%s %s), %llu MB video memory, %s%s; conditional rendering %s, host memory import %s, push descriptors %s, dynamic blend %s",
+    Log("presenter: Vulkan on %s (%s %s), %llu MB video memory, %s%s; conditional rendering %s, host memory import %s, push descriptors %s, dynamic blend %s, pipeline libraries %s",
         d.name.c_str(), d.driver.driverName, d.driver.driverInfo, (unsigned long long)(local >> 20),
         d.uma ? "UMA (shared system memory)" : "discrete", d.largeBar ? ", host-visible VRAM (resizable BAR)" : "",
-        d.conditionalRendering ? "yes" : "no", d.externalMemoryHost ? "yes" : "no", d.pushDescriptor ? "yes" : "no", d.dynamicBlend ? "yes" : "no");
+        d.conditionalRendering ? "yes" : "no", d.externalMemoryHost ? "yes" : "no", d.pushDescriptor ? "yes" : "no", d.dynamicBlend ? "yes" : "no",
+        d.pipelineLibrary ? "yes" : "no");
 }
 
 size_t SavePipelineCache(Device& d)

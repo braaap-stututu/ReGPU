@@ -68,7 +68,7 @@ Each builds as its own target and must pass with `REGPU_VK_VALIDATION=2` and no 
 | `regpu_vkprobe` | The device, a timeline submission, the translator's preamble to SPIR-V. |
 | `regpu_vkrecord` | `vk::RecordedList`: clears inside and outside passes, an empty query. |
 | `regpu_vkresources` | Every format the renderer uses, an upload and readback round trip, a depth clear, the graveyard. |
-| `regpu_vkdraw` | A draw through the translated shaders' bindings: set 0's constants, gmem, gphys and a bindless texture. |
+| `regpu_vkdraw` | A draw through the translated shaders' bindings: set 0's constants, gmem, gphys and a bindless texture. `REGPU_VKDRAW_GPL=1`/`2`: from pipeline libraries; `REGPU_VKDRAW_VSOUT=1`: the XTX miscompile below; `REGPU_VKDRAW_DUMP=1`: the SPIR-V to files. |
 | `regpu_vkpasses` | A compute and a graphics pass from HLSL, their layouts from SPIR-V, transient sets, read back. |
 
 ## Checked with a game (FM3, 20 Nov 2026)
@@ -106,9 +106,22 @@ and vertex shaders under `REGPU_DYNAMIC_VFETCH` / `REGPU_LEAN_VFETCH` / `REGPU_P
 - Depth, stencil, cull and depth bias are dynamic for the draws' pipelines (renderer.cpp DynamicDrawState,
   PipelineLookupKey, vk::DrawState): FM3's cold boot to the grid 17.6 s against 26.3, 2,938 pipelines against 3,800,
   +3% GPU at 1080p. Blend dynamic too with `REGPU_VK_DYNAMIC_BLEND=1` (EDS3; +10% GPU at 1080p on an RX 7900 XTX).
-- Graphics pipeline libraries (VK_EXT_graphics_pipeline_library): tried, not committed. Fast-linked pipelines hung the
-  RX 7900 XTX's driver at FM3's first frames (device lost), while a standalone test of the same code drew correctly.
-  Needs a crash dump (Radeon GPU Detective) to find the pipeline. See RESUME.md in the workspace.
+- Graphics pipeline libraries (VK_EXT_graphics_pipeline_library): in the code, off. `REGPU_VK_PIPELINE_LIBRARY=1`
+  enables the extension and builds the draws' pipelines from four cached parts, fast-linked, with an optimised (LTO)
+  build swapped in later on a low-priority thread (`REGPU_VK_NO_LTO=1`: fast links only). Do not turn it on for play:
+  on the RX 7900 XTX (driver 26.11.2) FM3 loses the device at its first frames, with or without LTO, dynamic state or
+  a pipeline cache, while `regpu_vkdraw` with `REGPU_VKDRAW_GPL=1` / `2` draws correctly. Finding the pipeline needs a
+  crash dump (Radeon GPU Detective), not more boots.
+
+### A shader compiler fault on the RX 7900 XTX
+
+`regpu_vkdraw` with `REGPU_VKDRAW_VSOUT=1` draws with the translated shaders' interface (VSOut). Its pixel shader reads
+one interpolant and all four bindings (constants, gmem, gphys, a bindless texture). On the RX 7900 XTX (driver
+26.11.2, LLPC) it writes (0, 0, 0, 0). Drop any one of the five reads and it is right; the SPIR-V validates and is
+plain; the integrated Radeon (the same driver release, AMD's other shader compiler) draws it correctly. FM3's shaders
+make that combination all the time and render right, so the trigger is narrower than this; but it is a miscompile in
+the driver, and the same GPU is the one the pipeline libraries hang. A candidate for an AMD report, and a reason to
+re-check both after a driver update.
 
 ## Not done yet
 

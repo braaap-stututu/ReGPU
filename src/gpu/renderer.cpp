@@ -12,6 +12,7 @@
 #include <meshoptimizer.h>
 #endif
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <immintrin.h>
 #include <atomic>
@@ -1066,6 +1067,14 @@ struct BoundTexture
 struct PipelineEntry
 {
     VkPipeline vk = VK_NULL_HANDLE;
+    // The link-time-optimised build of a pipeline linked fast from libraries (PipelineLibraries), once it is done:
+    // drawn with from then on (Current).
+    std::atomic<VkPipeline> optimized{ VK_NULL_HANDLE };
+    VkPipeline Current() const
+    {
+        const VkPipeline o = optimized.load(std::memory_order_acquire);
+        return o ? o : vk;
+    }
     std::atomic<int> state{ 0 }; // 0 building, 1 ready, 2 failed
     // The build, run once by whoever claims it first: a pool thread, or a draw that must wait for it
     // (WaitForPipeline), so that draw doesn't wait behind every build queued before it.
@@ -3370,6 +3379,8 @@ void BeginFrameIfNeeded()
     ApplyMsaa();
     void FinishDeferredWritebacks(UINT frameIndex);
     FinishDeferredWritebacks(UINT(&f - g_r.frames)); // this slot's previous frame has completed
+    void PipelineLibrariesFrameStart();
+    PipelineLibrariesFrameStart(); // (optimised pipeline builds that landed reach the draws)
     static LiveSwitch perf("REGPU_PERF");
     const UINT frameIndex = UINT(&f - g_r.frames);
     if (!g_occlusionPending[frameIndex].empty())
@@ -6987,6 +6998,204 @@ vk::DrawState DrawStateFromKey(const PipelineKey& key)
     return d;
 }
 
+
+// Graphics pipeline libraries (VK_EXT_graphics_pipeline_library with fast linking, vk::Device::pipelineLibrary): a draw's
+// pipeline is linked from four parts, each made once for the state it holds (vertex input; the vertex shader and
+// rasteriser; the pixel shader with depth, stencil and multisampling; blend and the targets) instead of compiling every
+// shader pair again for every state it is drawn with. The link takes well under a millisecond; a link-time-optimised
+// build follows in the background at low priority (REGPU_VK_NO_LTO=1: not), drawn with once done. REGPU_VK_NO_PIPELINE_LIBRARY=1
+// (start-time): every pipeline built whole, as before.
+namespace PipelineLibraries
+{
+bool On()
+{
+    // (Opt-in, REGPU_VK_PIPELINE_LIBRARY=1, until its first run's GPU hang (device lost during the boot's precompile,
+    // FM3 on an RX 7900 XTX) is understood.)
+    static const bool on = g_r.vkd && g_r.vkd->pipelineLibrary && getenv("REGPU_VK_PIPELINE_LIBRARY") &&
+        strcmp(getenv("REGPU_VK_PIPELINE_LIBRARY"), "0") != 0;
+    return on;
+}
+bool Optimize()
+{
+    static const bool on = !(getenv("REGPU_VK_NO_LTO") && strcmp(getenv("REGPU_VK_NO_LTO"), "0") != 0);
+    return on;
+}
+struct Part
+{
+    std::once_flag made;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+std::mutex g_mutex;
+std::unordered_map<std::string, std::unique_ptr<Part>> g_parts;
+std::atomic<uint32_t> g_made{ 0 }, g_linked{ 0 }, g_optimizedDone{ 0 };
+std::atomic<bool> g_optimizedLanded{ false };
+
+template <typename T> void Add(std::string& k, const T& v) { k.append(reinterpret_cast<const char*>(&v), sizeof(v)); }
+
+// The part for these flags and this state (made on first use, by whichever thread asks first).
+VkPipeline Get(const vk::PipelineDesc& pd, VkGraphicsPipelineLibraryFlagsEXT part)
+{
+    std::string k;
+    Add(k, part);
+    Add(k, pd.colorCount);
+    for (uint32_t i = 0; i < pd.colorCount; i++)
+        Add(k, pd.colorFormats[i]);
+    Add(k, pd.depthFormat);
+    Add(k, pd.samples);
+    Add(k, pd.dynamicDepthStencil);
+    if (part == VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT)
+    {
+        Add(k, pd.topology);
+        Add(k, pd.primitiveRestart);
+    }
+    else if (part == VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT)
+    {
+        Add(k, pd.vs);
+        Add(k, pd.layout);
+        Add(k, pd.depthClip);
+        Add(k, pd.wireframe);
+        if (!pd.dynamicDepthStencil)
+        {
+            Add(k, pd.cull);
+            Add(k, pd.frontFace);
+            Add(k, pd.depthBiasConstant);
+            Add(k, pd.depthBiasClamp);
+            Add(k, pd.depthBiasSlope);
+        }
+    }
+    else if (part == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT)
+    {
+        Add(k, pd.ps);
+        Add(k, pd.layout);
+        Add(k, pd.alphaToCoverage);
+        if (!pd.dynamicDepthStencil)
+        {
+            Add(k, pd.depthTest);
+            Add(k, pd.depthWrite);
+            Add(k, pd.depthCompare);
+            Add(k, pd.stencilTest);
+            Add(k, pd.stencilReadMask);
+            Add(k, pd.stencilWriteMask);
+            Add(k, pd.front);
+            Add(k, pd.back);
+        }
+    }
+    else
+    {
+        Add(k, pd.alphaToCoverage);
+        Add(k, pd.dynamicBlend);
+        Add(k, pd.independentBlend);
+        for (uint32_t i = 0; i < (pd.independentBlend ? pd.colorCount : 1); i++)
+        {
+            const vk::BlendTarget& t = pd.blend[i]; // (field by field: a bool's padding is no part of the state)
+            Add(k, uint32_t(t.enable));
+            Add(k, t.srcColor), Add(k, t.dstColor), Add(k, t.colorOp), Add(k, t.srcAlpha), Add(k, t.dstAlpha), Add(k, t.alphaOp);
+            Add(k, t.writeMask);
+        }
+    }
+    Part* part_ = nullptr;
+    {
+        std::lock_guard lock(g_mutex);
+        auto& slot = g_parts[k];
+        if (!slot)
+            slot = std::make_unique<Part>();
+        part_ = slot.get();
+    }
+    std::call_once(part_->made, [&] {
+        part_->pipeline = vk::CreateGraphicsLibrary(*g_r.vkd, pd, part, Optimize());
+        g_made.fetch_add(1, std::memory_order_relaxed);
+    });
+    return part_->pipeline;
+}
+
+// A low-priority pool for the optimised builds (a quarter of the threads): they redo a full compile, off the draws'
+// critical path.
+struct OptimizePool
+{
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::function<void()>> queue;
+    OptimizePool()
+    {
+        const unsigned n = std::max(1u, std::thread::hardware_concurrency() / 4);
+        for (unsigned i = 0; i < n; i++)
+            std::thread([this] {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                for (;;)
+                {
+                    std::function<void()> job;
+                    {
+                        std::unique_lock lock(mutex);
+                        cv.wait(lock, [this] { return !queue.empty(); });
+                        job = std::move(queue.front());
+                        queue.pop_front();
+                    }
+                    job();
+                }
+            }).detach();
+    }
+    void Push(std::function<void()> job)
+    {
+        {
+            std::lock_guard lock(mutex);
+            queue.push_back(std::move(job));
+        }
+        cv.notify_one();
+    }
+};
+
+// The draw's pipeline linked from its parts (fast), and its optimised build queued. VK_NULL_HANDLE if a part failed.
+VkPipeline Link(const vk::PipelineDesc& pd, PipelineEntry* entry, const char* name)
+{
+    const VkPipeline parts[4] = { Get(pd, VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT),
+        Get(pd, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT), Get(pd, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT),
+        Get(pd, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT) };
+    for (VkPipeline part : parts)
+        if (!part)
+            return VK_NULL_HANDLE;
+    const VkPipeline linked = vk::LinkGraphicsPipeline(*g_r.vkd, parts, 4, pd.layout, false, name);
+    if (!linked)
+        return VK_NULL_HANDLE;
+    g_linked.fetch_add(1, std::memory_order_relaxed);
+    if (Optimize())
+    {
+        static OptimizePool pool;
+        const std::array<VkPipeline, 4> keep{ parts[0], parts[1], parts[2], parts[3] };
+        std::string label = name ? name : "";
+        pool.Push([entry, keep, layout = pd.layout, label] {
+            if (const VkPipeline o = vk::LinkGraphicsPipeline(*g_r.vkd, keep.data(), 4, layout, true, label.c_str()))
+            {
+                entry->optimized.store(o, std::memory_order_release);
+                g_optimizedDone.fetch_add(1, std::memory_order_relaxed);
+                g_optimizedLanded = true;
+                g_newPipelines.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    return linked;
+}
+
+// At a frame's start: optimised builds that landed reach the draws (GetPipeline's per-thread caches start over: at
+// most once a second).
+void FrameStart()
+{
+    static auto last = std::chrono::steady_clock::now();
+    if (!g_optimizedLanded.load(std::memory_order_relaxed) || std::chrono::steady_clock::now() - last < std::chrono::seconds(1))
+        return;
+    last = std::chrono::steady_clock::now();
+    g_optimizedLanded = false;
+    g_pipelineGen++;
+    static auto lastLog = last;
+    if (last - lastLog > std::chrono::seconds(10))
+    {
+        lastLog = last;
+        Log("pipeline libraries: %u parts made, %u pipelines linked, %u optimised builds done", g_made.load(), g_linked.load(), g_optimizedDone.load());
+    }
+}
+}
+
+void PipelineLibrariesFrameStart() { PipelineLibraries::FrameStart(); }
+
 std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const CompiledShader& ps, const PipelineKey& fullKey)
 {
     const PipelineKey key = PipelineLookupKey(fullKey);
@@ -7053,7 +7262,9 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
         pd.ps = psKeep->Module(*g_r.vkd);
         char name[48];
         snprintf(name, sizeof(name), "%016llx/%016llx", (unsigned long long)key.vs, (unsigned long long)key.ps);
-        entry->vk = pd.vs && pd.ps ? vk::CreateGraphicsPipeline(*g_r.vkd, pd, name) : VK_NULL_HANDLE;
+        entry->vk = !(pd.vs && pd.ps) ? VK_NULL_HANDLE
+            : PipelineLibraries::On() ? PipelineLibraries::Link(pd, entry, name)
+                                      : vk::CreateGraphicsPipeline(*g_r.vkd, pd, name);
         if (entry->vk)
             g_newPipelines.fetch_add(1, std::memory_order_relaxed);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStart).count();
@@ -7088,7 +7299,7 @@ VkPipeline WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry, bool for
     if (static LiveSwitch noInline("REGPU_NO_INLINE_PIPELINE"); !noInline)
         entry->Build();
     WaitHoldingImpl([&] { return entry->state.load(std::memory_order_acquire) != 0; });
-    return entry->state.load() == 1 ? entry->vk : VK_NULL_HANDLE;
+    return entry->state.load() == 1 ? entry->Current() : VK_NULL_HANDLE;
 }
 
 PipelineKey MakePipelineKey(uint64_t vsHash, uint64_t psHash, bool depthOnly, bool cullable)
@@ -7296,8 +7507,9 @@ VkPipeline GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool 
         }
         if (it != g_r.pipelines.end() && it->second->state.load(std::memory_order_acquire) == 1)
         {
-            ready.emplace(key, it->second->vk);
-            return it->second->vk;
+            const VkPipeline current = it->second->Current();
+            ready.emplace(key, current);
+            return current;
         }
         entry = EnsurePipeline(vs, ps, key);
     }

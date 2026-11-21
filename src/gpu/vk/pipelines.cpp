@@ -30,12 +30,64 @@ void Destroy(Device& d, ShaderModule& m)
     m = {};
 }
 
-VkPipeline CreateGraphicsPipeline(Device& d, const PipelineDesc& p, const char* name)
+// REGPU_SHADER_STATS (see below), for a complete or linked pipeline.
+static void LogShaderStats(Device& d, VkPipeline pipeline, const char* name)
 {
+    // REGPU_SHADER_STATS=1 (AMD, VK_AMD_shader_info): each stage's registers, scratch and code size, to compare shader
+    // translations (gpu/spirv against HLSL): "shader stats: <name> vs vgpr V sgpr S scratch B isa N | ps ...".
+    if (d.shaderInfo && vkGetShaderInfoAMD)
+    {
+        std::string line;
+        for (const VkShaderStageFlagBits stage : { VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT })
+        {
+            VkShaderStatisticsInfoAMD st{};
+            size_t size = sizeof(st);
+            if (vkGetShaderInfoAMD(d.device, pipeline, stage, VK_SHADER_INFO_TYPE_STATISTICS_AMD, &size, &st) != VK_SUCCESS)
+                continue;
+            size_t isa = 0;
+            vkGetShaderInfoAMD(d.device, pipeline, stage, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &isa, nullptr);
+            char part[160];
+            snprintf(part, sizeof(part), "%s%s vgpr %u sgpr %u scratch %zu isa %zu", line.empty() ? "" : " | ", stage == VK_SHADER_STAGE_VERTEX_BIT ? "vs" : "ps",
+                st.resourceUsage.numUsedVgprs, st.resourceUsage.numUsedSgprs, st.resourceUsage.scratchMemUsageInBytes, isa);
+            line += part;
+        }
+        Log("shader stats: %s %s", name ? name : "?", line.c_str());
+        // REGPU_SHADER_ISA=<part of a pipeline name>: its pixel shader's disassembly to out/isa/<name>.txt.
+        static const char* isaWant = getenv("REGPU_SHADER_ISA");
+        if (isaWant && name && strstr(name, isaWant))
+        {
+            size_t size = 0;
+            if (vkGetShaderInfoAMD(d.device, pipeline, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &size, nullptr) == VK_SUCCESS && size)
+            {
+                std::string text(size, '\0');
+                vkGetShaderInfoAMD(d.device, pipeline, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &size, text.data());
+                std::string file = std::string("out/isa_") + name + ".txt";
+                for (char& ch : file)
+                    if (ch == '/')
+                        ch = '_';
+                if (FILE* f = fopen(file.c_str(), "wb"))
+                {
+                    fwrite(text.data(), 1, strlen(text.c_str()), f);
+                    fclose(f);
+                }
+            }
+        }
+    }
+}
+
+// A complete pipeline (parts 0) or the parts of a library (with flags VK_PIPELINE_CREATE_LIBRARY_BIT_KHR ...).
+static VkPipeline BuildGraphics(Device& d, const PipelineDesc& p, const char* name, VkGraphicsPipelineLibraryFlagsEXT parts, VkPipelineCreateFlags flags)
+{
+    const bool all = parts == 0;
+    const bool vi = all || (parts & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT);
+    const bool pre = all || (parts & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT);
+    const bool frag = all || (parts & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT);
+    const bool out = all || (parts & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT);
     VkPipelineShaderStageCreateInfo stages[2]{};
     uint32_t stageCount = 0;
-    stages[stageCount++] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, p.vs, p.vsEntry, nullptr };
-    if (p.ps)
+    if (pre)
+        stages[stageCount++] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, p.vs, p.vsEntry, nullptr };
+    if (p.ps && frag)
         stages[stageCount++] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, p.ps, p.psEntry, nullptr };
 
     // No vertex buffers: the translated shaders fetch their vertices from gmem / gphys (as on D3D12, no input layout).
@@ -100,16 +152,32 @@ VkPipeline CreateGraphicsPipeline(Device& d, const PipelineDesc& p, const char* 
     cb.attachmentCount = p.colorCount;
     cb.pAttachments = blend;
 
-    std::vector<VkDynamicState> dynamic = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-        VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY };
-    if (p.dynamicDepthStencil)
-        dynamic.insert(dynamic.end(), { VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
-                                          VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
-                                          VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
-                                          VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE });
-    if (p.dynamicBlend)
-        dynamic.insert(dynamic.end(), { VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
-                                          VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT });
+    // Each dynamic state in the part that owns it (a library lists only its own).
+    std::vector<VkDynamicState> dynamic;
+    if (vi)
+        dynamic.push_back(VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY);
+    if (pre)
+    {
+        dynamic.insert(dynamic.end(), { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR });
+        if (p.dynamicDepthStencil)
+            dynamic.insert(dynamic.end(), { VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_BIAS,
+                                              VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE });
+    }
+    if (frag)
+    {
+        dynamic.push_back(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
+        if (p.dynamicDepthStencil)
+            dynamic.insert(dynamic.end(), { VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+                                              VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+                                              VK_DYNAMIC_STATE_STENCIL_WRITE_MASK });
+    }
+    if (out)
+    {
+        dynamic.push_back(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
+        if (p.dynamicBlend)
+            dynamic.insert(dynamic.end(), { VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
+                                              VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT });
+    }
     VkPipelineDynamicStateCreateInfo dyn{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
     dyn.dynamicStateCount = uint32_t(dynamic.size());
     dyn.pDynamicStates = dynamic.data();
@@ -123,19 +191,25 @@ VkPipeline CreateGraphicsPipeline(Device& d, const PipelineDesc& p, const char* 
     rendering.depthAttachmentFormat = depth ? p.depthFormat : VK_FORMAT_UNDEFINED;
     rendering.stencilAttachmentFormat = stencil ? p.depthFormat : VK_FORMAT_UNDEFINED;
 
+    VkGraphicsPipelineLibraryCreateInfoEXT library{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT };
+    library.flags = parts;
+    if (!all)
+        rendering.pNext = &library;
     VkGraphicsPipelineCreateInfo gi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    gi.flags = flags;
     gi.pNext = &rendering;
     gi.stageCount = stageCount;
-    gi.pStages = stages;
-    gi.pVertexInputState = &vertexInput;
-    gi.pInputAssemblyState = &ia;
-    gi.pViewportState = &viewport;
-    gi.pRasterizationState = &rs;
-    gi.pMultisampleState = &ms;
-    gi.pDepthStencilState = depth ? &ds : nullptr;
-    gi.pColorBlendState = &cb;
-    gi.pDynamicState = &dyn;
-    gi.layout = p.layout;
+    gi.pStages = stageCount ? stages : nullptr;
+    gi.pVertexInputState = vi ? &vertexInput : nullptr;
+    gi.pInputAssemblyState = vi ? &ia : nullptr;
+    gi.pViewportState = pre ? &viewport : nullptr;
+    gi.pRasterizationState = pre ? &rs : nullptr;
+    gi.pMultisampleState = frag || out ? &ms : nullptr;
+    // (A fragment-shader library takes the depth/stencil state even without a depth target: VUID-...-09035.)
+    gi.pDepthStencilState = frag && (depth || !all) ? &ds : nullptr;
+    gi.pColorBlendState = out ? &cb : nullptr;
+    gi.pDynamicState = dynamic.empty() ? nullptr : &dyn;
+    gi.layout = pre || frag ? p.layout : VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     const VkResult result = vkCreateGraphicsPipelines(d.device, d.pipelineCache, 1, &gi, nullptr, &pipeline);
     if (result != VK_SUCCESS)
@@ -145,46 +219,41 @@ VkPipeline CreateGraphicsPipeline(Device& d, const PipelineDesc& p, const char* 
     }
     if (name)
         SetName(d, VK_OBJECT_TYPE_PIPELINE, uint64_t(pipeline), name);
-    // REGPU_SHADER_STATS=1 (AMD, VK_AMD_shader_info): each stage's registers, scratch and code size, to compare shader
-    // translations (gpu/spirv against HLSL): "shader stats: <name> vs vgpr V sgpr S scratch B isa N | ps ...".
-    if (d.shaderInfo && vkGetShaderInfoAMD)
+    if (all)
+        LogShaderStats(d, pipeline, name);
+    return pipeline;
+}
+
+VkPipeline CreateGraphicsPipeline(Device& d, const PipelineDesc& p, const char* name)
+{
+    return BuildGraphics(d, p, name, 0, 0);
+}
+
+VkPipeline CreateGraphicsLibrary(Device& d, const PipelineDesc& p, VkGraphicsPipelineLibraryFlagsEXT parts, bool retain, const char* name)
+{
+    return BuildGraphics(d, p, name, parts,
+        VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | (retain ? VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT : 0));
+}
+
+VkPipeline LinkGraphicsPipeline(Device& d, const VkPipeline* libraries, uint32_t count, VkPipelineLayout layout, bool optimize, const char* name)
+{
+    VkPipelineLibraryCreateInfoKHR li{ VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR };
+    li.libraryCount = count;
+    li.pLibraries = libraries;
+    VkGraphicsPipelineCreateInfo gi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    gi.pNext = &li;
+    gi.flags = optimize ? VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT : 0;
+    gi.layout = layout;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VkResult result = vkCreateGraphicsPipelines(d.device, d.pipelineCache, 1, &gi, nullptr, &pipeline);
+    if (result != VK_SUCCESS)
     {
-        std::string line;
-        for (const VkShaderStageFlagBits stage : { VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT })
-        {
-            VkShaderStatisticsInfoAMD st{};
-            size_t size = sizeof(st);
-            if (vkGetShaderInfoAMD(d.device, pipeline, stage, VK_SHADER_INFO_TYPE_STATISTICS_AMD, &size, &st) != VK_SUCCESS)
-                continue;
-            size_t isa = 0;
-            vkGetShaderInfoAMD(d.device, pipeline, stage, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &isa, nullptr);
-            char part[160];
-            snprintf(part, sizeof(part), "%s%s vgpr %u sgpr %u scratch %zu isa %zu", line.empty() ? "" : " | ", stage == VK_SHADER_STAGE_VERTEX_BIT ? "vs" : "ps",
-                st.resourceUsage.numUsedVgprs, st.resourceUsage.numUsedSgprs, st.resourceUsage.scratchMemUsageInBytes, isa);
-            line += part;
-        }
-        Log("shader stats: %s %s", name ? name : "?", line.c_str());
-        // REGPU_SHADER_ISA=<part of a pipeline name>: its pixel shader's disassembly to out/isa/<name>.txt.
-        static const char* isaWant = getenv("REGPU_SHADER_ISA");
-        if (isaWant && name && strstr(name, isaWant))
-        {
-            size_t size = 0;
-            if (vkGetShaderInfoAMD(d.device, pipeline, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &size, nullptr) == VK_SUCCESS && size)
-            {
-                std::string text(size, ' ');
-                vkGetShaderInfoAMD(d.device, pipeline, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &size, text.data());
-                std::string file = std::string("out/isa_") + name + ".txt";
-                for (char& ch : file)
-                    if (ch == '/')
-                        ch = '_';
-                if (FILE* f = fopen(file.c_str(), "wb"))
-                {
-                    fwrite(text.data(), 1, strlen(text.c_str()), f);
-                    fclose(f);
-                }
-            }
-        }
+        Log("vk: pipeline %s not linked: %s", name ? name : "?", ResultName(result));
+        return VK_NULL_HANDLE;
     }
+    if (name)
+        SetName(d, VK_OBJECT_TYPE_PIPELINE, uint64_t(pipeline), name);
+    LogShaderStats(d, pipeline, name);
     return pipeline;
 }
 
