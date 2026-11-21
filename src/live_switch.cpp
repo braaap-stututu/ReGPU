@@ -55,6 +55,7 @@ bool LiveSwitch::Set(const std::string& name, bool on)
             s->value_.store(on, std::memory_order_relaxed);
             found = true;
         }
+    generation_.fetch_add(1, std::memory_order_relaxed);
     if (!found)
         r.pending[name] = on;
     Log("switch: %s %s%s", name.c_str(), on ? "on" : "off", found ? "" : " (not reached yet: kept for when it is)");

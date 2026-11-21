@@ -7790,38 +7790,55 @@ VkPipeline GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool 
     if (stripCut)
         key.flags |= 0x100; // strips restart at index 0xFFFF (DrawImpl)
     // The draw's dynamic state (DynamicDrawState), from the full key; the pipeline is found by the rest.
+    // Direct-mapped memos (each thread's): a draw's dynamic state by its full key, and the ready pipeline by its lookup
+    // key, in front of the map. Draws alternate between a few states: the one-entry memo before missed at most draws,
+    // and DrawStateFromKey (StateFromKey) plus the map's lookup were ~4% of the draw thread (FM3 grid, 2 cores).
+    // Forgotten when the pipelines are replaced (g_pipelineGen), the MSAA level changes or any live switch is set
+    // (StateFromKey reads some).
+    thread_local uint32_t gen = ~0u, switchGen = ~0u, memoMsaa = 0;
+    struct StateMemo
+    {
+        PipelineKey key;
+        vk::DrawState state;
+        bool valid = false;
+    };
+    struct ReadyMemo
+    {
+        PipelineKey key;
+        VkPipeline pso = VK_NULL_HANDLE;
+    };
+    thread_local StateMemo stateMemo[512];
+    thread_local ReadyMemo readyMemo[1024];
+    thread_local std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> ready; // (cleared when the pipelines are replaced: g_pipelineGen)
+    if (const uint32_t now = g_pipelineGen.load(std::memory_order_acquire), sw = LiveSwitch::Generation();
+        now != gen || sw != switchGen || g_msaa != memoMsaa)
+    {
+        gen = now, switchGen = sw, memoMsaa = g_msaa;
+        ready.clear();
+        for (StateMemo& m : stateMemo)
+            m.valid = false;
+        for (ReadyMemo& m : readyMemo)
+            m.pso = VK_NULL_HANDLE;
+    }
     if (DynamicDrawState())
     {
-        thread_local PipelineKey lastFull{};
-        thread_local vk::DrawState lastState{};
-        thread_local bool have = false;
-        if (!have || memcmp(&key, &lastFull, sizeof(key)) != 0)
+        StateMemo& m = stateMemo[PipelineKeyHash{}(key) & 511];
+        if (!m.valid || memcmp(&key, &m.key, sizeof(key)) != 0)
         {
-            lastFull = key;
-            lastState = DrawStateFromKey(key);
-            have = true;
+            m.key = key;
+            m.state = DrawStateFromKey(key);
+            m.valid = true;
         }
         if (state)
-            *state = lastState;
+            *state = m.state;
         key = PipelineLookupKey(key);
     }
-    thread_local std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> ready; // (cleared when the pipelines are replaced: g_pipelineGen)
-    // Runs of draws share a pipeline: the last one's answer first, before the map.
-    thread_local PipelineKey lastKey{};
-    thread_local VkPipeline lastPso = VK_NULL_HANDLE;
-    thread_local uint32_t gen = 0;
-    if (const uint32_t now = g_pipelineGen.load(std::memory_order_acquire); now != gen)
-    {
-        gen = now;
-        ready.clear();
-        lastPso = nullptr;
-    }
-    if (lastPso && memcmp(&key, &lastKey, sizeof(key)) == 0)
-        return lastPso;
+    ReadyMemo& memo = readyMemo[PipelineKeyHash{}(key) & 1023];
+    if (memo.pso && memcmp(&key, &memo.key, sizeof(key)) == 0)
+        return memo.pso;
     if (auto r = ready.find(key); r != ready.end())
     {
-        lastKey = key;
-        lastPso = r->second;
+        memo = { key, r->second };
         return r->second;
     }
     std::shared_ptr<PipelineEntry> entry;

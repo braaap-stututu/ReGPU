@@ -566,7 +566,7 @@ bool Enabled()
 }
 
 // A shader load on the thread that translates (the command processor, or the draw thread).
-void SegShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress)
+void SegShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress, bool unchanged = false)
 {
     if (seg::Enabled())
     {
@@ -581,17 +581,29 @@ void SegShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords
             return;
         }
     }
-    FrameOnShaderLoad(type, microcodeBE, dwords, guestAddress);
+    FrameOnShaderLoad(type, microcodeBE, dwords, guestAddress, unchanged);
 }
 
-void SubmitShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress)
+void SubmitShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress, bool fromMemory = false)
 {
     static std::vector<uint32_t> last[2]; // the last load of each type sent to the draw thread
     static uint32_t lastAddress[2] = {};
+    // Write-watched loads (Host::watchArm / watchClean): what each guest address's last load sent (this thread only).
+    // (A direct-mapped table, forgotten by a generation: a map lookup and clear at every load cost the command
+    // processor ~7% of the frame rate on 2 cores; ~850K loads a second in FM3 races.)
+    struct Sent
+    {
+        uint64_t key = 0, seq = 0;
+        uint32_t dwords = 0, quiet = 0, generation = 0;
+        bool armed = false;
+    };
+    static Sent sent[4096];
+    static uint32_t sentGeneration = 1;
     if (!work::Active())
     {
         last[0].clear(); // (loads on this thread: the memo no longer says what the draw thread has)
         last[1].clear();
+        sentGeneration++;
         SegShaderLoad(type, microcodeBE, dwords, guestAddress);
         return;
     }
@@ -628,8 +640,48 @@ void SubmitShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwo
             lastAddress[t] = guestAddress;
         }
     }
+    // An IM_LOAD from guest memory none of whose pages was written since this address's last load was sent is
+    // flagged unchanged (bit 8 of the record's type): the draw thread then takes its copy of that load without
+    // comparing the microcode word for word (FrameOnShaderLoad; ~2% of the draw thread in FM3 races). Its pages are
+    // watched from that load on; an address found written is not watched for its next 4096 loads (a fault per write
+    // otherwise). Not inline loads (IM_LOAD_IMMEDIATE: the ring buffer is rewritten all the time).
+    // REGPU_NO_SHADER_WATCH=1 (live): compared at every load, as before.
+    bool unchanged = false;
+    {
+        static LiveSwitch noWatch("REGPU_NO_SHADER_WATCH");
+        const regpu::Host& host = regpu::GetHost();
+        if (noWatch || !host.watchArm || !host.watchClean || !host.watchSeq)
+            sentGeneration++;
+        else if (fromMemory && uint32_t(type) <= 1)
+        {
+            const uint64_t key = uint64_t(guestAddress) << 1 | uint32_t(type);
+            Sent& e = sent[((key * 0x9E3779B97F4A7C15ull) >> 52) & 4095];
+            if (e.key != key || e.generation != sentGeneration)
+                e = { key, 0, 0, 0, sentGeneration, false };
+            const uint32_t physical = guestAddress & 0x1FFFFFFF, bytes = dwords * 4;
+            if (e.armed && e.dwords == dwords && host.watchClean(physical, bytes, e.seq))
+                unchanged = true;
+            else
+            {
+                if (e.armed)
+                    e.quiet = 4096; // (written since: rewritten often, maybe)
+                e.armed = false;
+                e.dwords = dwords;
+                if (e.quiet)
+                    e.quiet--;
+                else
+                {
+                    // (Armed before the copy below: a write after this faults and is seen.)
+                    e.seq = host.watchSeq() + 1;
+                    e.armed = host.watchArm(physical, bytes);
+                    if (!e.armed)
+                        e.quiet = 4096;
+                }
+            }
+        }
+    }
     uint32_t* p = work::Begin(work::kShader, dwords + 3);
-    p[0] = uint32_t(type);
+    p[0] = uint32_t(type) | (unchanged ? 0x100u : 0u);
     p[1] = guestAddress;
     p[2] = dwords;
     memcpy(p + 3, microcodeBE, size_t(dwords) * 4);
@@ -843,7 +895,7 @@ void Replay()
             memcpy(work::g_file.data() + a[0] * 4, a + 1, size_t(words - 1) * 4);
             break;
         case work::kShader:
-            FrameOnShaderLoad(ShaderType(a[0]), a + 3, a[2], a[1]);
+            FrameOnShaderLoad(ShaderType(a[0] & 0xFF), a + 3, a[2], a[1]);
             break;
         case work::kDraw:
             if (!inQuery)
@@ -969,8 +1021,8 @@ void WorkerLoop()
                     seg::Append(seg::kRegs, a, words);
                 break;
             case work::kShader:
-                stereo::OnShader(a[0], a[1], a + 3, a[2]);
-                SegShaderLoad(ShaderType(a[0]), a + 3, a[2], a[1]);
+                stereo::OnShader(a[0] & 0xFF, a[1], a + 3, a[2]);
+                SegShaderLoad(ShaderType(a[0] & 0xFF), a + 3, a[2], a[1], (a[0] >> 8) & 1);
                 break;
             case work::kDraw:
                 stereo::BeforeDraw();
@@ -1833,7 +1885,7 @@ uint32_t ExecutePacket(uint32_t ptr)
     {
         const uint32_t address = GpuPhysToGuest(arg(0) & ~3u);
         const uint32_t dwords = arg(1) & 0xFFFF;
-        SubmitShaderLoad(ShaderType(arg(0) & 3), GuestPtr<uint32_t>(address), dwords, address);
+        SubmitShaderLoad(ShaderType(arg(0) & 3), GuestPtr<uint32_t>(address), dwords, address, true);
         break;
     }
     case 0x2B: // IM_LOAD_IMMEDIATE: type, start/size, microcode

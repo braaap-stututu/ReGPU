@@ -29,8 +29,11 @@ public:
     // The debug server's side: false if the name was never a switch (it's then kept for when one registers).
     static bool Set(const std::string& name, bool on);
     static std::vector<std::pair<std::string, bool>> List(); // the switches registered so far
+    // Bumped by every Set: a memo of something a switch feeds is stale when it changed.
+    static uint32_t Generation() { return generation_.load(std::memory_order_relaxed); }
 
 private:
     const char* name_;
     std::atomic<bool> value_;
+    static inline std::atomic<uint32_t> generation_{ 0 };
 };

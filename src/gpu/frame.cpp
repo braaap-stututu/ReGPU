@@ -187,7 +187,10 @@ void CompositorLoop()
 
 const bool g_textureView = getenv("REGPU_TEXVIEW") != nullptr;
 
-void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress)
+// unchanged: the command processor saw none of the load's guest pages written since this address's last load
+// (SubmitShaderLoad's write watch): the slot's copy is taken without comparing it. REGPU_SHADER_WATCH_VERIFY=1
+// (diagnostic): compared anyway, and a difference is logged.
+void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress, bool unchanged)
 {
     if (!dwords || dwords > 0x10000)
         return;
@@ -200,7 +203,15 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
         ShaderUpload* u = slot.upload && g_rotations <= slot.rotation + 1 ? slot.upload : FindUpload(slot.key);
         if (u && u != slot.upload)
             slot.upload = u, slot.rotation = g_rotations;
-        if (u && u->words.size() == dwords && memcmp(u->words.data(), microcodeBE, dwords * 4) == 0)
+        static LiveSwitch verifyWatch("REGPU_SHADER_WATCH_VERIFY");
+        if (unchanged && verifyWatch && u && u->words.size() == dwords && memcmp(u->words.data(), microcodeBE, dwords * 4) != 0)
+        {
+            static int logged = 0;
+            if (logged++ < 20)
+                Log("shader watch: %s at %08X (%u dwords) changed with no write seen", type == ShaderType::Vertex ? "vs" : "ps", guestAddress, dwords);
+            unchanged = false;
+        }
+        if (u && u->words.size() == dwords && ((unchanged && !verifyWatch) || memcmp(u->words.data(), microcodeBE, dwords * 4) == 0))
         {
             RendererSetShader(uint32_t(type), microcodeBE, u->used, u->hash);
             return;
