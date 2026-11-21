@@ -152,18 +152,33 @@ static VkPipeline BuildGraphics(Device& d, const PipelineDesc& p, const char* na
     cb.attachmentCount = p.colorCount;
     cb.pAttachments = blend;
 
-    // Each dynamic state in the part that owns it (a library lists only its own).
+    // Each dynamic state in the part that owns it (a library lists only its own). A complete pipeline lists them in the
+    // order it always has: the driver's pipeline cache keys on the create info as given, so a new order misses every
+    // cached pipeline (FM3, 21 Nov 2026: ~3,700 rebuilt in play, 100+ ms each on an RX 7900 XTX).
     std::vector<VkDynamicState> dynamic;
-    if (vi)
+    if (all)
+    {
+        dynamic = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY };
+        if (p.dynamicDepthStencil)
+            dynamic.insert(dynamic.end(), { VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+                                              VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+                                              VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                                              VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE });
+        if (p.dynamicBlend)
+            dynamic.insert(dynamic.end(), { VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
+                                              VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT });
+    }
+    if (!all && vi)
         dynamic.push_back(VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY);
-    if (pre)
+    if (!all && pre)
     {
         dynamic.insert(dynamic.end(), { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR });
         if (p.dynamicDepthStencil)
             dynamic.insert(dynamic.end(), { VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_BIAS,
                                               VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE });
     }
-    if (frag)
+    if (!all && frag)
     {
         dynamic.push_back(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
         if (p.dynamicDepthStencil)
@@ -171,7 +186,7 @@ static VkPipeline BuildGraphics(Device& d, const PipelineDesc& p, const char* na
                                               VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
                                               VK_DYNAMIC_STATE_STENCIL_WRITE_MASK });
     }
-    if (out)
+    if (!all && out)
     {
         dynamic.push_back(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
         if (p.dynamicBlend)
