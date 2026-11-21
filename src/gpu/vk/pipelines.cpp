@@ -52,19 +52,21 @@ static void LogShaderStats(Device& d, VkPipeline pipeline, const char* name)
             line += part;
         }
         Log("shader stats: %s %s", name ? name : "?", line.c_str());
-        // REGPU_SHADER_ISA=<part of a pipeline name>: its pixel shader's disassembly to out/isa/<name>.txt.
+        // REGPU_SHADER_ISA=<part of a pipeline name>: its shaders' disassembly to out/isa_<name>_vs.txt and _ps.txt.
         static const char* isaWant = getenv("REGPU_SHADER_ISA");
         if (isaWant && name && strstr(name, isaWant))
+            for (const VkShaderStageFlagBits stage : { VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT })
         {
             size_t size = 0;
-            if (vkGetShaderInfoAMD(d.device, pipeline, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &size, nullptr) == VK_SUCCESS && size)
+            if (vkGetShaderInfoAMD(d.device, pipeline, stage, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &size, nullptr) == VK_SUCCESS && size)
             {
                 std::string text(size, '\0');
-                vkGetShaderInfoAMD(d.device, pipeline, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &size, text.data());
-                std::string file = std::string("out/isa_") + name + ".txt";
-                for (char& ch : file)
+                vkGetShaderInfoAMD(d.device, pipeline, stage, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &size, text.data());
+                std::string base = name; // (the name's '/' only: "out/" stays a folder)
+                for (char& ch : base)
                     if (ch == '/')
                         ch = '_';
+                const std::string file = "out/isa_" + base + (stage == VK_SHADER_STAGE_VERTEX_BIT ? "_vs" : "_ps") + ".txt";
                 if (FILE* f = fopen(file.c_str(), "wb"))
                 {
                     fwrite(text.data(), 1, strlen(text.c_str()), f);

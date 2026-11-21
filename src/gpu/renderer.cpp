@@ -7743,6 +7743,7 @@ VkPipeline ResolveDeferred(void* ctx)
         std::this_thread::sleep_for(std::chrono::microseconds(100));
     return e->state.load() == 1 ? e->Current() : VK_NULL_HANDLE;
 }
+thread_local bool g_pipelineBoundSinceDraw = false; // (REGPU_EXP_DRAW 5 and 6)
 void BindGraphicsPipeline(vk::RecordedList& list, VkPipeline p)
 {
     bool token = false;
@@ -7775,6 +7776,7 @@ void BindGraphicsPipeline(vk::RecordedList& list, VkPipeline p)
             m = { p, token };
         }
     }
+    g_pipelineBoundSinceDraw = true;
     if (token)
         list.BindPipelineDeferred(VK_PIPELINE_BIND_POINT_GRAPHICS, ResolveDeferred, reinterpret_cast<void*>(p));
     else
@@ -17121,7 +17123,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             }
             // REGPU_EXP_DRAW=N (live, FM3 port session 33, measuring what a draw costs on a small GPU; picture wrong):
             // 1 = no draw call (all its state still set), 2 = one triangle per draw (fixed per-draw cost),
-            // 3 = 1x1 scissor (vertex work, no pixels).
+            // 3 = 1x1 scissor (vertex work, no pixels), 4 = one triangle drawn twice (against 2: what a draw call costs with no
+            // state change between, so the rest of 2's time is the state changes).
             static const auto expDraw = [] {
                 thread_local uint64_t frame = ~0ull;
                 thread_local int v = 0;
@@ -17141,12 +17144,23 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 C().vkList->SetScissors(1, &r);
                 g_drawState.scissor = one;
             }
-            if (exp == 1)
-                ;
-            else if (indexedCount)
-                C().vkList->DrawIndexed(exp == 2 ? std::min<UINT>(indexedCount, 3) : indexedCount, 1, startIndex, 0, 0);
-            else
-                C().vkList->Draw(exp == 2 ? std::min<UINT>(directIndex ? directVertices : UINT(list.size()), 3) : (directIndex ? directVertices : UINT(list.size())), 1, 0, 0);
+            // 5 / 6 = one triangle, only the draws with no pipeline bind since the last draw / only those right after one
+            // (what a pipeline switch costs the GPU: compare the time per draw drawn).
+            // 7 / 8 = as 6, only those whose vertex shader changed / only those where just the pixel shader did.
+            thread_local uint64_t lastVs = 0, lastPs = 0;
+            const bool vsChanged = C().vsHash != lastVs, psChanged = C().psHash != lastPs;
+            lastVs = C().vsHash, lastPs = C().psHash;
+            const bool oneTriangle = exp == 2 || exp >= 4;
+            const bool skip = (exp == 5 && g_pipelineBoundSinceDraw) || (exp >= 6 && !g_pipelineBoundSinceDraw) || (exp == 7 && !vsChanged) ||
+                (exp == 8 && (vsChanged || !psChanged));
+            g_pipelineBoundSinceDraw = false;
+            for (int call = 0; call < (exp == 4 ? 2 : 1); call++)
+                if (exp == 1 || skip)
+                    ;
+                else if (indexedCount)
+                    C().vkList->DrawIndexed(oneTriangle ? std::min<UINT>(indexedCount, 3) : indexedCount, 1, startIndex, 0, 0);
+                else
+                    C().vkList->Draw(oneTriangle ? std::min<UINT>(directIndex ? directVertices : UINT(list.size()), 3) : (directIndex ? directVertices : UINT(list.size())), 1, 0, 0);
             if (stat)
                 C().vkList->EndQuery(g_statQueries.pool, statQuery, true);
         };
@@ -17886,9 +17900,9 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         {
             // Order of vk::RecordedList's ops.
             static const char* const names[] = { "barrier", "targets", "clearcolor", "cleardepth", "pipeline", "sets", "push", "viewports",
-                "scissors", "stencilref", "blendconstants", "topology", "indexbuffer", "draw", "drawindexed", "dispatch", "copybuffer",
+                "scissors", "stencilref", "blendconstants", "topology", "drawstate", "indexbuffer", "draw", "drawindexed", "dispatch", "copybuffer",
                 "buffertoimage", "imagetobuffer", "copyimage", "resolve", "fill", "resetqueries", "beginquery", "endquery", "copyqueries",
-                "timestamp", "predication", "beginlabel", "endlabel", "handoff", "call", "switch", "endrendering" };
+                "timestamp", "predication", "beginlabel", "endlabel", "handoff", "call", "switch", "endrendering", "pipelinedeferred" };
             std::string s;
             for (size_t i = 0; i < std::size(names); i++)
                 if (const uint64_t n = vk::g_recordedOps[i].exchange(0); n >= g_perf.frames)
