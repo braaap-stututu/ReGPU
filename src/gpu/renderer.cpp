@@ -3381,6 +3381,8 @@ void BeginFrameIfNeeded()
     FinishDeferredWritebacks(UINT(&f - g_r.frames)); // this slot's previous frame has completed
     void PipelineLibrariesFrameStart();
     PipelineLibrariesFrameStart(); // (optimised pipeline builds that landed reach the draws)
+    void PipelineBudgetFrameStart();
+    PipelineBudgetFrameStart();
     static LiveSwitch perf("REGPU_PERF");
     const UINT frameIndex = UINT(&f - g_r.frames);
     if (!g_occlusionPending[frameIndex].empty())
@@ -5500,6 +5502,20 @@ bool LoadCachedBytecode(CompiledShader& cs)
     return true;
 }
 
+// REGPU_COMPILE_PRIORITY=<Win32 level> (start-time): the shader compile and pipeline build threads' priority (default -1,
+// below normal; -2 lowest, -15 idle). REGPU_COMPILE_THREADS=<n> (start-time): the shader compile workers (default all
+// hardware threads but one); REGPU_PIPELINE_THREADS the pipeline builders (default 3/4, at most 12). With the game's
+// own threads busy at a race load, fewer and lower builders leave it and the draw thread their cores (21 Nov 2026: the
+// draw thread's stalls in a load sampled waits on the heap lock while every core compiled).
+int CompilePriority()
+{
+    static const int p = [] {
+        const char* v = getenv("REGPU_COMPILE_PRIORITY");
+        return v && *v ? atoi(v) : THREAD_PRIORITY_BELOW_NORMAL;
+    }();
+    return p;
+}
+
 struct ShaderCompiler
 {
     std::mutex mutex;
@@ -5533,8 +5549,10 @@ struct ShaderCompiler
     void Start()
     {
         std::filesystem::create_directories(RegpuUserDir() / "shadercache");
-        // All but one core: the first boot compiles the whole game behind the overlay.
-        const unsigned n = std::max(2u, std::thread::hardware_concurrency() - 1);
+        // All but one core: the first boot compiles the whole game behind the overlay (REGPU_COMPILE_THREADS: n).
+        unsigned n = std::max(2u, std::thread::hardware_concurrency() - 1);
+        if (const char* v = getenv("REGPU_COMPILE_THREADS"); v && atoi(v) > 0)
+            n = unsigned(atoi(v));
         for (unsigned i = 0; i < n; i++)
             workers.emplace_back([this] { Run(); });
         for (auto& w : workers)
@@ -5605,7 +5623,7 @@ struct ShaderCompiler
 
     void Run()
     {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        SetThreadPriority(GetCurrentThread(), CompilePriority());
         for (;;)
         {
             CompiledShader* cs;
@@ -5638,7 +5656,7 @@ struct ShaderCompiler
                     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
                 Compile(*cs);
                 if (throttled)
-                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                    SetThreadPriority(GetCurrentThread(), CompilePriority());
                 {
                     std::lock_guard lock(mutex);
                     backgroundActive--;
@@ -6000,7 +6018,8 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
             Log("debug: ps alias %016llx returns %s", (unsigned long long)hash, expr.c_str());
         }
     }
-    // REGPU_SPIRV_DIRECT=1 (EXPERIMENTAL, start-time): pixel shaders straight from the microcode to SPIR-V
+    // REGPU_SPIRV_DIRECT (start-time, on by default since 21 Nov 2026; =0: everything through HLSL and DXC, the
+    // reference): shaders straight from the microcode to SPIR-V
     // (gpu/spirv/translate.h, ~1 ms here instead of HLSL and DXC's 100-900 ms), those the direct translator supports
     // and the game hasn't rewritten or a debug edit changed; the rest, and every variant (motion, no-kill, fetch), keep
     // the HLSL path. Its fetches follow the full TFetch (with the instruction's filter override) whatever
@@ -6010,7 +6029,9 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
     // bakes them.)
     static const int direct = [] {
         const char* v = getenv("REGPU_SPIRV_DIRECT");
-        if (!v || !*v || strcmp(v, "0") == 0)
+        if (!v || !*v)
+            return 3;
+        if (strcmp(v, "0") == 0)
             return 0;
         return strcmp(v, "ps") == 0 ? 1 : strcmp(v, "vs") == 0 ? 2 : 3;
     }();
@@ -6820,6 +6841,7 @@ void MaybeSavePipelineCache()
 }
 
 
+int CompilePriority();
 struct PipelinePool
 {
     std::mutex mutex;
@@ -6837,17 +6859,20 @@ struct PipelinePool
         for (unsigned i = 0; i < n; i++)
             std::thread([this] { Run(); }).detach();
     }
-    void Push(std::function<void()> job)
+    void Push(std::function<void()> job, bool front = false)
     {
         {
             std::lock_guard lock(mutex);
-            queue.push_back(std::move(job));
+            if (front)
+                queue.push_front(std::move(job));
+            else
+                queue.push_back(std::move(job));
         }
         cv.notify_one();
     }
     void Run()
     {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        SetThreadPriority(GetCurrentThread(), CompilePriority());
         for (;;)
         {
             std::function<void()> job;
@@ -6861,6 +6886,12 @@ struct PipelinePool
         }
     }
 };
+
+PipelinePool& Pipelines()
+{
+    static PipelinePool pool;
+    return pool;
+}
 
 // A draw's blend, depth, stencil, cull and depth-bias state from its key (the console's registers), as Vulkan's.
 void StateFromKey(const PipelineKey& key, vk::PipelineDesc& pd)
@@ -7248,7 +7279,7 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
         g_manifest.RecordShader(true, key.ps, ps.ucodeBE);
         g_manifest.RecordPipeline(key);
     }
-    static PipelinePool pool;
+    PipelinePool& pool = Pipelines();
     char label[64];
     snprintf(label, sizeof(label), "pipeline %08llx/%08llx", (unsigned long long)(key.vs >> 32), (unsigned long long)(key.ps >> 32));
     g_stats.Begin(label);
@@ -7269,6 +7300,8 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
             g_newPipelines.fetch_add(1, std::memory_order_relaxed);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStart).count();
         const bool hit = entry->vk && ms < 2.0;
+        void NotePipelineBuild(double ms);
+        NotePipelineBuild(ms);
         if (ms > 30.0 && getenv("REGPU_PERF"))
             Log("perf: pipeline %016llx/%016llx took %.1f ms to create (background)", (unsigned long long)key.vs, (unsigned long long)key.ps, ms);
         if (!entry->vk)
@@ -7422,6 +7455,91 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
     return !opaque || GameSettled();
 }
 
+// Pipeline stalls (21 Nov 2026, FM3 on an RX 7900 XTX: a race load drew 69 new pipelines in one frame, each built in
+// turn on the draw thread, 2 s; in the race 150-280 ms frames).
+//
+// REGPU_DEFERRED_PIPELINES=1 (start-time): a draw that has to wait for its pipeline doesn't wait on the draw thread. It
+// records a deferred bind (RecordedList::BindPipelineDeferred), its build goes to the front of the pool, and the draw
+// thread goes on; the replay thread waits for the build when it reaches the bind. A frame's new pipelines then build on
+// all the pool's threads at once instead of one by one. (Not with REGPU_NO_RECORD_THREAD: that list replays at once.)
+bool DeferredPipelines()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_DEFERRED_PIPELINES");
+        return v && *v && strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+// REGPU_PIPELINE_BUDGET_MS=<ms> (start-time): once a frame has spent that long on pipeline builds it waits for (or, with
+// deferred pipelines, has that much estimated build time ahead of it: new pipelines times the recent average build), a
+// draw into the screen-wide pass whose pipeline isn't built is dropped for the frame instead of waiting; its build goes
+// on in the background. The pass is drawn again next frame, so the drop shows as an object missing for a frame or
+// two, not a stall. Off-screen passes (drawn once and kept: liveries, baked textures) and clears still wait.
+// 0: no screen-pass draw waits at all.
+double PipelineBudgetMs()
+{
+    static const double ms = [] {
+        const char* v = getenv("REGPU_PIPELINE_BUDGET_MS");
+        return v && *v ? std::max(0.0, atof(v)) : -1.0;
+    }();
+    return ms;
+}
+std::atomic<double> g_buildAvgMs{ 20.0 }; // recent average pipeline build (cache hits included)
+void NotePipelineBuild(double ms)
+{
+    const double avg = g_buildAvgMs.load(std::memory_order_relaxed);
+    g_buildAvgMs.store(avg * 0.9 + ms * 0.1, std::memory_order_relaxed);
+}
+std::atomic<double> g_frameBuildMs{ 0 };   // this frame: build time waited for, or estimated ahead (deferred)
+std::atomic<uint32_t> g_budgetDrops{ 0 };  // draws dropped by the budget since the last log line
+std::atomic<uint32_t> g_deferredBinds{ 0 }; // deferred binds since the last log line
+void PipelineBudgetFrameStart()
+{
+    g_frameBuildMs.store(0, std::memory_order_relaxed);
+    static auto last = std::chrono::steady_clock::now();
+    if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(1))
+    {
+        last = now;
+        const uint32_t drops = g_budgetDrops.exchange(0), deferred = g_deferredBinds.exchange(0);
+        if (drops || deferred)
+            Log("pipelines: last second %u draws dropped by the budget, %u deferred binds (average build %.1f ms)", drops, deferred,
+                g_buildAvgMs.load());
+    }
+}
+// A deferred bind's token: the entry's address, passed where a VkPipeline goes so the draw's "same pipeline as bound"
+// test still works, and known as a token by being in g_deferredTokens (a live heap address can't also be a pipeline
+// handle; a tag bit can: AMD's handles use bit 0). BindGraphicsPipeline records it as a deferred bind.
+std::mutex g_deferredMutex;
+std::unordered_set<VkPipeline> g_deferredTokens; // (entries are never freed)
+VkPipeline DeferredToken(PipelineEntry* e)
+{
+    const VkPipeline t = reinterpret_cast<VkPipeline>(e);
+    std::lock_guard lock(g_deferredMutex);
+    g_deferredTokens.insert(t);
+    return t;
+}
+VkPipeline ResolveDeferred(void* ctx)
+{
+    PipelineEntry* e = static_cast<PipelineEntry*>(ctx);
+    e->Build(); // (if no pool thread has started it yet)
+    while (e->state.load(std::memory_order_acquire) == 0)
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    return e->state.load() == 1 ? e->Current() : VK_NULL_HANDLE;
+}
+void BindGraphicsPipeline(vk::RecordedList& list, VkPipeline p)
+{
+    bool token = false;
+    if (DeferredPipelines())
+    {
+        std::lock_guard lock(g_deferredMutex);
+        token = g_deferredTokens.count(p) != 0;
+    }
+    if (token)
+        list.BindPipelineDeferred(VK_PIPELINE_BIND_POINT_GRAPHICS, ResolveDeferred, reinterpret_cast<void*>(p));
+    else
+        list.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+}
+
 extern thread_local bool g_hyperProbe;
 VkPipeline GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false, bool stripCut = false,
     bool coverage = false, bool noKill = false, uint32_t fetchMask = 0, vk::DrawState* state = nullptr)
@@ -7524,6 +7642,23 @@ VkPipeline GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool 
         g_skippedPipeline++;
         return nullptr; // builds in the background; later frames draw it
     }
+    // The budget (PipelineBudgetMs): a screen-pass draw over it is dropped for the frame (not clears or must-draw passes).
+    if (const double budget = PipelineBudgetMs(); budget >= 0 && entry->state.load(std::memory_order_acquire) == 0 &&
+        g_frameBuildMs.load(std::memory_order_relaxed) >= budget && WidePass() && !PlainRectMustDraw() && !ScreenPassMustDraw())
+    {
+        Pipelines().Push([e = entry] { e->Build(); }, true);
+        g_skippedPipeline++;
+        g_budgetDrops++;
+        return nullptr;
+    }
+    // Deferred (DeferredPipelines): the replay thread waits for it, the pool builds it now.
+    if (DeferredPipelines() && entry->state.load(std::memory_order_acquire) == 0 && C().vkList && !C().vkList->Direct())
+    {
+        Pipelines().Push([e = entry] { e->Build(); }, true);
+        g_frameBuildMs.fetch_add(g_buildAvgMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        g_deferredBinds++;
+        return DeferredToken(entry.get());
+    }
     g_waitWhat = depthOnly ? "pipeline (depth only)" : "pipeline";
     g_waitBlend = key.blend;
     const auto waitStart = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -7531,7 +7666,9 @@ VkPipeline GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool 
     // (without this, async dropped opaque one-time draws too: a render-to-texture that runs once, such as a
     // baked texture, stayed black for good). REGPU_ASYNC_DROP_UNSKIPPABLE=1: dropped, as before.
     static LiveSwitch dropUnskippable("REGPU_ASYNC_DROP_UNSKIPPABLE");
+    const auto budgetStart = std::chrono::steady_clock::now();
     VkPipeline pso = WaitForPipeline(entry, PlainRectMustDraw() || !dropUnskippable);
+    g_frameBuildMs.fetch_add(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - budgetStart).count(), std::memory_order_relaxed);
     if (g_perfTiming)
         if (const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count(); ms > 2.0)
             Log("perf: GetPipeline waited %.1f ms for pipeline %016llx/%016llx (state was %d)", ms, (unsigned long long)key.vs, (unsigned long long)key.ps, 0);
@@ -15950,7 +16087,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         ds.pso = pso;
         ds.dynSet = false; // (set again with the new pipeline: another pipeline's static state may have replaced it)
         const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        C().vkList->BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
+        BindGraphicsPipeline(*C().vkList, pso);
         if (g_perfTiming)
         {
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -16517,14 +16654,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             EndOcclusionPart();
             const UINT covered = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
             C().vkList->BeginQuery(g_occlusion.pool, covered, g_r.vkd->occlusionPrecise, true);
-            C().vkList->BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, coveragePso);
+            BindGraphicsPipeline(*C().vkList, coveragePso);
             ds.dynSet = false;
             setDrawState(coverDyn);
             issue();
             C().vkList->EndQuery(g_occlusion.pool, covered, true);
             C().vkList->CopyQueryResults(g_occlusion.pool, covered, 1, g_occlusion.readback->buffer, UINT64(covered) * 8);
             g_occlusionCurrent.coverage.push_back(covered);
-            C().vkList->BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
+            BindGraphicsPipeline(*C().vkList, pso);
             ds.dynSet = false;
             setDrawState(drawDyn);
             g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;

@@ -87,13 +87,14 @@ FM3 (the `regpu-vulkan` branch of its port) on an RX 7900 XTX against its D3D12 
   (per pass) / `REGPU_GPU_SHADERS=1` (per draw, by shaders) work as on D3D12. Compare the same settings on both sides:
   a profile with a different `aa=` makes one look slower.
 
-## The direct SPIR-V translator (experimental)
+## The direct SPIR-V translator (the default)
 
 `src/gpu/spirv` translates Xenos microcode straight to SPIR-V (its own builder, no glslang, no DXC), mirroring
 hlsl.cpp: pixel shaders (ALU, control flow, texture fetches as TFetch and the lean rules under `REGPU_LEAN_FETCH`, the
 renderer's no-kill, plain-fetch and specialised variants) and vertex shaders (the guest program as a function, the
 VSOut wrapper: guest index fetch, rectangles and points, the viewport transform; baked vertex fetches).
-`REGPU_SPIRV_DIRECT` (start-time): `1` both stages, `ps` or `vs` one; shaders the game rewrote or a debug edit changed,
+`REGPU_SPIRV_DIRECT` (start-time; on by default since 21 Nov 2026): unset or `1` both stages, `ps` or `vs` one, `0`
+none (everything through HLSL and DXC, the reference); shaders the game rewrote or a debug edit changed,
 and vertex shaders under `REGPU_DYNAMIC_VFETCH` / `REGPU_LEAN_VFETCH` / `REGPU_PLAIN_MUL_VS` / triple / stereo, keep HLSL.
 `regpu_spirv_check` runs it over captured microcode with spirv-val.
 - FM3, both stages: ~0.7 ms a shader against 100-900 ms through DXC; a cold boot reaches the race grid in 12 s (as warm)
@@ -122,6 +123,25 @@ plain; the integrated Radeon (the same driver release, AMD's other shader compil
 make that combination all the time and render right, so the trigger is narrower than this; but it is a miscompile in
 the driver, and the same GPU is the one the pipeline libraries hang. A candidate for an AMD report, and a reason to
 re-check both after a driver update.
+
+## Pipeline stalls
+
+New pipelines are built when a draw first needs them; on an RX 7900 XTX a build that misses the driver's cache takes
+100-250 ms. FM3 (21 Nov 2026): a race load drew 69 new pipelines in one frame (2 s), races had 150-280 ms frames. All
+start-time switches, off by default until compared in play:
+- `REGPU_DEFERRED_PIPELINES=1`: a draw that must wait for its pipeline records a deferred bind
+  (`RecordedList::BindPipelineDeferred`) and the draw thread goes on; the build goes to the front of the pool and the
+  replay thread waits for it. A frame's new pipelines build in parallel instead of one by one.
+- `REGPU_PIPELINE_BUDGET_MS=<ms>`: past that much build time in a frame (waited, or estimated for deferred binds),
+  screen-pass draws whose pipeline isn't built are dropped for the frame and built in the background. Off-screen
+  passes and clears still wait (they may be drawn once and kept). `0`: screen-pass draws never wait.
+- `REGPU_COMPILE_PRIORITY=<Win32 level>` (default -1; -2 lowest, -15 idle) for the shader and pipeline threads,
+  `REGPU_COMPILE_THREADS=<n>` shader compile workers (default all threads but one), `REGPU_PIPELINE_THREADS=<n>`.
+- The log line `pipelines: last second N draws dropped by the budget, M deferred binds (average build X ms)`.
+- The direct translator (above) makes shaders and their variants in ~1 ms, where DXC took 200-1600 ms for each spec
+  variant (the draw's constants baked in, so new ones come with each new scene).
+- Pipelines built during play don't hit the driver cache when their create info changes: a complete pipeline's dynamic
+  states must stay in the same order (28a4d62).
 
 ## Not done yet
 

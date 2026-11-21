@@ -212,6 +212,16 @@ public:
     }
 
     void BindPipeline(VkPipelineBindPoint point, VkPipeline p) { struct A { VkPipelineBindPoint point; VkPipeline p; } a{ point, p }; Put(kPipeline, &a, sizeof(a)); }
+    // A pipeline still being built: the replay calls resolve(ctx) when it reaches the bind (on the replay thread, so the
+    // recording goes on meanwhile) and binds what it returns. VK_NULL_HANDLE (the build failed): the draws up to the
+    // next bind are dropped.
+    using ResolveFn = VkPipeline (*)(void* ctx);
+    void BindPipelineDeferred(VkPipelineBindPoint point, ResolveFn resolve, void* ctx)
+    {
+        struct A { VkPipelineBindPoint point; ResolveFn fn; void* ctx; } a{ point, resolve, ctx };
+        Put(kPipelineDeferred, &a, sizeof(a));
+    }
+    bool Direct() const { return m_direct; }
     void BindDescriptorSets(VkPipelineBindPoint point, VkPipelineLayout layout, uint32_t first, uint32_t count, const VkDescriptorSet* sets,
         uint32_t dynamicCount = 0, const uint32_t* dynamicOffsets = nullptr)
     {
@@ -328,12 +338,14 @@ private:
     {
         kBarrier, kTargets, kClearColor, kClearDepth, kPipeline, kSets, kPush, kViewports, kScissors, kStencilRef, kBlendConstants, kTopology, kDrawState,
         kIndexBuffer, kDraw, kDrawIndexed, kDispatch, kCopyBuffer, kBufferToImage, kImageToBuffer, kCopyImage, kResolve, kFill, kResetQueries,
-        kBeginQuery, kEndQuery, kCopyQueries, kTimestamp, kPredication, kBeginLabel, kEndLabel, kHandOff, kCall, kSwitch, kEndRendering
+        kBeginQuery, kEndQuery, kCopyQueries, kTimestamp, kPredication, kBeginLabel, kEndLabel, kHandOff, kCall, kSwitch, kEndRendering,
+        kPipelineDeferred
     };
     static constexpr size_t kChunk = 64 << 10;
 
     VkCommandBuffer m_real = VK_NULL_HANDLE;
     bool m_direct = false;
+    bool m_dropDraws = false; // replay: a deferred pipeline failed, the draws until the next bind are dropped
     RecordBytes m_current;
     std::mutex m_mutex;
     std::condition_variable m_work, m_idle;
@@ -614,6 +626,19 @@ private:
             {
                 struct A { VkPipelineBindPoint point; VkPipeline p; };
                 vkCmdBindPipeline(cb, At<A>(a).point, At<A>(a).p);
+                if (At<A>(a).point == VK_PIPELINE_BIND_POINT_GRAPHICS)
+                    m_dropDraws = false;
+                break;
+            }
+            case kPipelineDeferred:
+            {
+                struct A { VkPipelineBindPoint point; ResolveFn fn; void* ctx; };
+                const A& d = At<A>(a);
+                const VkPipeline p = d.fn(d.ctx);
+                if (d.point == VK_PIPELINE_BIND_POINT_GRAPHICS)
+                    m_dropDraws = !p;
+                if (p)
+                    vkCmdBindPipeline(cb, d.point, p);
                 break;
             }
             case kSets:
@@ -668,6 +693,8 @@ private:
             }
             case kDraw:
             {
+                if (m_dropDraws)
+                    break;
                 const uint32_t* d = reinterpret_cast<const uint32_t*>(a);
                 EnsureRendering(cb);
                 vkCmdDraw(cb, d[0], d[1], d[2], d[3]);
@@ -675,6 +702,8 @@ private:
             }
             case kDrawIndexed:
             {
+                if (m_dropDraws)
+                    break;
                 const uint32_t* d = reinterpret_cast<const uint32_t*>(a);
                 EnsureRendering(cb);
                 vkCmdDrawIndexed(cb, d[0], d[1], d[2], int32_t(d[3]), d[4]);
