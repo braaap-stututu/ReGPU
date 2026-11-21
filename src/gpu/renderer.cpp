@@ -11257,8 +11257,11 @@ void Resolve()
         // exponent bias: half the bytes to write and to read back). The image differs by a level or two of
         // the 10-bit colours where half floats held more. Not the main view's image while the scene is
         // upscaled: the upscalers take 8888 and half floats only.
-        static LiveSwitch copies1010102("REGPU_COPIES_1010102");
-        const bool as1010102 = copies1010102 && !depth && destFormat == 7 && !(g_scenePhase && width >= FrameW());
+        // REGPU_COPIES_1010102_BIASED=1 (live): only copies with an exponent bias (the HDR scene copied down), never an
+        // unscaled one, which may be a title's front buffer (FM4 presents a k_2_10_10_10 resolve: as R10G10B10A2 the
+        // presenter, which takes 8888, showed nothing).
+        static LiveSwitch copies1010102("REGPU_COPIES_1010102"), copies1010102Biased("REGPU_COPIES_1010102_BIASED");
+        const bool as1010102 = (copies1010102 || (copies1010102Biased && bias != 0)) && !depth && destFormat == 7 && !(g_scenePhase && width >= FrameW());
         const VkFormat format = depth ? VK_FORMAT_R32_SFLOAT
             : as1010102 ? VK_FORMAT_A2B10G10R10_UNORM_PACK32
             : destFormat == 6 || (destFormat == 7 && bias == 0 && !no1010102) ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R16G16B16A16_SFLOAT;
