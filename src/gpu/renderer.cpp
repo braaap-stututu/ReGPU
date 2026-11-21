@@ -4206,7 +4206,11 @@ bool DynamicBuffer(uint32_t address, uint32_t bytes)
         }
     }
     const bool dynamic = g_r.frame <= s.dynamicUntil;
-    if (s.frame == g_r.frame)
+    // Settled for the frame either way: hashed in it, or not due in it (a buffer not due stays not due until the
+    // frame changes). Kept only when hashed before, so a quiet buffer took the lock and the map on every fetch of
+    // every draw (FM4: 9% of the draw thread). REGPU_DYNAMIC_ANSWER_HASHED=1: as before.
+    static LiveSwitch hashedOnly("REGPU_DYNAMIC_ANSWER_HASHED");
+    if (s.frame == g_r.frame || !hashedOnly)
         answered.Put(key, g_r.frame, dynamic);
     return dynamic;
 }
