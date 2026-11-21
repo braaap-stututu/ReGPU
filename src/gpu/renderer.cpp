@@ -4423,6 +4423,7 @@ struct IndexArena
         uint64_t stagedFrame = ~0ull;
         bool changing = false; // seen changing: checked at every draw, not once a frame
         bool armed = false;    // write-watched since watchSeq (Host::watchArm)
+        uint8_t falseWrites = 0; // written (its pages) but the same: it shares a 64 KB block with data rewritten often
         uint64_t watchSeq = 0, quietUntil = 0;
     };
     std::unordered_map<uint64_t, Entry> entries;
@@ -5184,6 +5185,7 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
         }
         else
         {
+            const bool written = e.armed; // (armed, not clean)
             e.armed = false;
             if (g_r.frame >= e.quietUntil)
             {
@@ -5197,6 +5199,16 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
             {
                 e.quietUntil = g_r.frame + 120;
                 e.armed = false;
+                e.falseWrites = 0;
+            }
+            // A fault disarms the 64 KB around the write: a buffer next to data the title rewrites every frame was
+            // disarmed, hashed the same and armed again at every frame, a fault a frame each (FM3 grid: ~300 a second,
+            // all of them index buffers). Twice in a row: not watched for 1200 frames.
+            else if (!inserted && written && ++e.falseWrites >= 2)
+            {
+                e.quietUntil = g_r.frame + 1200;
+                e.armed = false;
+                e.falseWrites = 0;
             }
         }
     }
