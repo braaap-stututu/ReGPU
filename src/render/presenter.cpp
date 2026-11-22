@@ -875,6 +875,9 @@ bool PresenterRecordCopy(VkCommandBuffer cb, const vk::Image* src, const vk::Ima
         black.float32[3] = 1.0f;
         const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         vkCmdClearColorImage(cb, back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        // (The picture is written over the black next: ordered after the clear, as the overlays below.)
+        ImageBarrier(cb, back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     }
     const bool canvasSize = !offsetX && !offsetY && sw == cw && sh == ch;
     if (grade && canvasSize && bw == cw && bh == ch)
@@ -915,15 +918,31 @@ bool PresenterRecordCopy(VkCommandBuffer cb, const vk::Image* src, const vk::Ima
     }
     else
         Blit(cb, src->image, back, 0, 0, int32_t(shownW), int32_t(shownH), X(offsetX), Y(offsetY), X(offsetX + shownW), Y(offsetY + shownH));
+    // The overlays are written over the picture just written, and over one another (the compile overlay is wide and
+    // reaches the fps panel's rectangle): without a barrier between two writes the transfers may run at once on the GPU
+    // (synchronization validation on a Steam Deck: SYNC-HAZARD-WRITE-AFTER-WRITE in vkCmdBlitImage at the fps panel
+    // while shaders compile), and whichever lands last wins. A barrier before each overlay that follows another write.
+    // REGPU_NO_OVERLAY_BARRIER=1: as before (A/B).
+    static LiveSwitch noOverlayBarrier("REGPU_NO_OVERLAY_BARRIER");
+    const auto afterWrite = [&] {
+        if (!noOverlayBarrier)
+            ImageBarrier(cb, back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    };
     if (overlay)
     {
+        afterWrite();
         const uint32_t x = offsetX + 24, y = offsetY + 24 + (timer ? timerH : 0);
         Blit(cb, overlay->image, back, 0, 0, int32_t(overlayW), int32_t(overlayH), X(x), Y(y), X(x + overlayW), Y(y + overlayH));
     }
     if (timer && timerW <= cw && timerH <= ch)
+    {
+        afterWrite();
         Blit(cb, timer->image, back, 0, 0, int32_t(timerW), int32_t(timerH), X(offsetX), Y(offsetY), X(offsetX + timerW), Y(offsetY + timerH));
+    }
     if (fps && fpsW <= shownW && fpsH + 12 <= ch)
     {
+        afterWrite();
         // Top centre of the picture.
         const uint32_t x = offsetX + (shownW - fpsW) / 2, y = offsetY + 12;
         Blit(cb, fps->image, back, 0, 0, int32_t(fpsW), int32_t(fpsH), X(x), Y(y), X(x + fpsW), Y(y + fpsH));
