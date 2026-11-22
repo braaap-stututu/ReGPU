@@ -87,6 +87,77 @@ FM3 (the `regpu-vulkan` branch of its port) on an RX 7900 XTX against its D3D12 
   (per pass) / `REGPU_GPU_SHADERS=1` (per draw, by shaders) work as on D3D12. Compare the same settings on both sides:
   a profile with a different `aa=` makes one look slower.
 
+## Checked with a second game (FM4, 21-22 Nov 2026)
+
+FM4 (the `regpu-vulkan` branch of braaap-stututu/Fuzzy-Rittersport-4-ReGPU-testing) moved from its own vendored
+D3D12 copy to this ReGPU. The full record, with every number: [ports/fm4-vulkan.md](ports/fm4-vulkan.md).
+- **What it needed from ReGPU:** `REGPU_TEXTURE_GAMMA=1` (gamma-signed texture components converted to linear on fetch,
+  as the console does; opt-in, set by the port), the packed-depth-through-colour-fetch and lit cascade switches
+  (`REGPU_DEPTH_AS_8888*`, `REGPU_CASCADE_*`, `0e2cfdd`), and public helpers for ports (`cee03cf`:
+  `regpu::DecodeTexture`, `WritePng`, `CompileIdle`, `BenchmarkRecord` / `BenchmarkWriteReport`, `LogCrashContext`).
+  The other features of FM4's old copy are listed in [fm4-features-to-port.md](fm4-features-to-port.md).
+- **Speed** (RX 7900 XTX + 9800X3D, AI benchmark race): FM4's D3D12 build 158.6 fps; on this ReGPU with FM3's
+  defaults 161.7; then the steps below to ~307 fps at 1440p 4x MSAA, which is the CPU ceiling (the same race at 720p
+  1x: 304 fps, 1% low 202).
+  - Resolve write-backs from half-float images (`aae02a0`, `37c283c`): F16C, column spans worked out once, SSE
+    packing, whole-word swaps, large writes in 32-row bands on the thread pool. FM4 writes a 512x512 road image back
+    every frame; the old scalar path was ~40% of the draw thread. `REGPU_WRITEBACK_VERIFY=1` checks every write
+    against the scalar path; `REGPU_SLOW_WRITEBACK=1` / `REGPU_SERIAL_WRITEBACK=1` give the old behaviour.
+    Race 161.7 -> ~238 fps, 1% low 92 -> ~166.
+  - A quiet vertex buffer's "is it changing" answer cached per thread for the frame (`e30f7cb`): 720p grid 263 -> 279.
+  - `REGPU_FETCH_SPECIALIZE` (each pixel shader's fetches compiled for the draw's fetch constants; FM4 turns it on):
+    GPU 3.59 -> 3.10 ms on the grid, race 296 -> 307 fps.
+- **GPU experiments that gained nothing on the RX 7900 XTX** (all opt-in switches, kept for weaker GPUs such as the
+  Steam Deck's): `REGPU_VS_SPECIALIZE` (vertex shaders for their draws' wrapper words; half the instructions, but races
+  lost: more pipeline switches and variants built mid-race), `REGPU_SPIRV_FINITE_MUL` (plain multiplies where no
+  infinity can reach: vertex code -17%), `REGPU_BARRIER_MERGE` / `REGPU_READBACK_BARRIER_DEFER`,
+  `REGPU_EXP_COLOR_FORMAT=b10g11r11` (every colour surface 32-bit; picture wrong, a measurement),
+  `REGPU_COPIES_1010102_BIASED`.
+- **Where a frame's GPU time goes** (`REGPU_EXP_DRAW`, live, picture wrong): FM4's 1440p grid is 3.10 ms; no draw calls
+  1.16; one triangle a draw 2.35. A draw right after a pipeline switch costs ~0.9 us against ~0.24 us without one
+  (the switches are ~0.78 ms of the 3.1); pixel shading ~1 ms. An RGP capture (readers in `tools/rgp`) shows low
+  wavefront occupancy, "not limited": the GPU waits between small draws, and all 8 hardware contexts cycle (2,794
+  context rolls in 6,048 draws). Barriers are 1.7% of the frame. The levers left are fewer pipeline switches (draw
+  reordering) and uniform vertex export counts.
+- **Measuring switches added for it:** `REGPU_FRAME_TIMES_SWAP=<file>` (frame times at the draw thread's frame end: a
+  minimized window presents nothing), `REGPU_TRACE_SURFACE_USE` (guest formats per surface), `REGPU_TRACE_VARIANTS`,
+  `REGPU_NO_GPU_WORK=1` (everything recorded, nothing submitted or presented: the CPU side alone).
+
+## CPU side (FM3 and FM4, 21-22 Nov 2026)
+
+Both races end up limited by ReGPU's draw thread (FM4 at 720p: busy 98% of the time). What took work off it, each
+behind a switch:
+- **Build with `-mcx16`** (ReGPU and the game, `24ca5d6`). Under clang-cl, MSVC's `<atomic>` marks its functions
+  `target("cx16")`, so without the flag every `std::atomic` access and fence (also the recompiled code's
+  sync/lwsync) was a call. FM3 on 2 cores +10.5%. Every clang-cl port wants it.
+- **Write watch instead of hashing** (with the port's write watch, `Host::watchArm` / `watchClean` / `watchSeq`):
+  index buffers (`1a7075a`, `REGPU_INDEX_NO_WATCH=1` off, `REGPU_INDEX_VERIFY=1` checks), shader loads whose pages
+  weren't written skip the `memcmp` (`8076bb3`, `REGPU_NO_SHADER_WATCH`, `REGPU_SHADER_WATCH_VERIFY`), and a backoff
+  for 64 KB blocks a title keeps rewriting with the same contents (`604dd2b`).
+- **Direct-mapped `GetPipeline` memos** (draw state by full key, pipeline by lookup key): +1.9%.
+- **Fewer wake-ups:** the hand-off spin only with 6 or more logical CPUs in the process's affinity (`f5860de`,
+  `REGPU_HANDOFF_SPIN` forces a count), and the draw thread wakes the command processor only at the tail it waits for
+  (`50b75c9`, `REGPU_TAIL_NOTIFY_ALL=1` as before): +1.4% and +3.2% on 2 cores.
+- **Draw state:** only the dynamic states that changed are replayed (`21699a9`); the dynamic-buffer answer cached
+  for buffers not due a check (`e30f7cb`).
+- FM3 on 2 cores of a 9800X3D: grid 259 -> ~307 fps, AI race 253.6 -> 301.5 fps (1% low 142 -> 166). Read 2-core
+  results as a contention test, not a weak CPU: what carries over is the work removed per frame. The Steam Deck is
+  the real test ([ports/fm4-steam-deck.md](ports/fm4-steam-deck.md)).
+- Tried and not kept: `WriteWatchClean` without its lock (-7%), a lock-free index fast path, write-watching
+  UploadGuest's repeats, draw workers in FM3 (`REGPU_DRAW_WORKERS`; FM3's limit was elsewhere: untested for FM4,
+  where the draw thread is the limit).
+- What is left on the draw thread is spread thin: DrawImpl's own code ~17%, guest-data hashing ~8%, index buffers
+  ~4%, pipeline keys ~5%. The plan from there is in [ports/fm4-vulkan.md](ports/fm4-vulkan.md), "Next".
+
+## Research
+
+Background reports written during the conversion, with their sources:
+- [research/vulkan-porting-and-optimization.md](research/vulkan-porting-and-optimization.md): Vulkan 1.3/1.4
+  features, performance guidance per vendor, moving a D3D12 renderer to Vulkan, native Linux, shader compilation and
+  pipeline caching.
+- [research/console-and-dos-recompilation.md](research/console-and-dos-recompilation.md): the static recompilation
+  landscape for consoles and DOS, background for [modular-runtimes.md](modular-runtimes.md).
+
 ## The direct SPIR-V translator (the default)
 
 `src/gpu/spirv` translates Xenos microcode straight to SPIR-V (its own builder, no glslang, no DXC), mirroring

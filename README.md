@@ -6,13 +6,21 @@ The Xbox 360 GPU (Xenos), on Vulkan, for native PC ports of Xbox 360 games made 
 
 ReGPU takes the GPU's half of a port off your hands. The recompiled game talks to it exactly as it
 talked to the console: it writes command packets into a ring buffer and calls the kernel's `Vd*` video
-functions. ReGPU runs the command processor, translates the Xenos shader microcode to HLSL, emulates
+functions. ReGPU runs the command processor, translates the Xenos shader microcode straight to SPIR-V
+(or through HLSL and DXC, the reference path), emulates
 EDRAM, resolves, MSAA and the texture formats, presents the frames, and can upscale them (FSR 1,
 optionally FSR 3/4, DLSS and XeSS).
 
 It came out of a working port, Forza Motorsport 2, where it renders the whole game. Everything
 specific to that game has been removed; what remains is the console's behaviour, plus hooks for the
 workarounds a particular game needs.
+
+Since November 2026 Vulkan is its one render backend. Forza Motorsport 3 (braaap-stututu/FM3-ReGPU) and
+Forza Motorsport 4 (braaap-stututu/Fuzzy-Rittersport-4-ReGPU-testing, branch `regpu-vulkan`) run on it, at or
+above their Direct3D 12 builds' speed. [`docs/vulkan.md`](docs/vulkan.md) has the renderer, what each game needed
+and the speed work with its numbers; [`docs/ports`](docs/ports) the ports' full records (including the Steam Deck
+briefing); [`docs/research`](docs/research) the background research. The last Direct3D 12 renderer is the tag
+`d3d12-reference` and the branch `legacy-d3d12`.
 
 ## Requirements
 
