@@ -2729,6 +2729,26 @@ void SignalFence(uint64_t value)
     const vk::SemaphoreUse s{ g_r.vkFence, value, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT };
     vk::Submit(*g_r.vkd, nullptr, 0, nullptr, 0, &s, 1);
 }
+
+// REGPU_NO_GPU_WORK=1 (start-time; a measuring switch, never for play): every frame is recorded as usual, but nothing
+// recorded reaches the GPU and nothing is presented. Queued lists are submitted empty (the queue's timeline and the
+// frame fences still advance in order, so nothing waits forever), the frame's end acquires no swap chain image and
+// presents nothing (the window keeps its last picture). The frame rate the light performance log reports
+// (REGPU_PERF_LITE, counted at the swap) is then what the command processor, draw thread and replay thread reach
+// without the GPU: the FM3 port's run R6, against the same settings without it. Hyper culling is off with it (its
+// sample counts would be stale), occlusion answers and read-back pixels are stale, and the boot and loading screens'
+// own presents may show garbage.
+bool NoGpuWork()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_NO_GPU_WORK");
+        const bool b = v && *v && strcmp(v, "0") != 0;
+        if (b)
+            Log("renderer: REGPU_NO_GPU_WORK: nothing is sent to the GPU or presented (measuring only)");
+        return b;
+    }();
+    return on;
+}
 void ReleaseWithFrame(vk::Image& image); // (below)
 bool g_asyncFrameEnded = false; // the last frame's end was queued on the replay thread (REGPU_ASYNC_PRESENT)
 
@@ -12851,7 +12871,12 @@ void SubmitVkLists(uint32_t n, const VkCommandBuffer* lists)
     std::lock_guard lock(g_pendingMutex);
     g_vkPendingLists.insert(g_vkPendingLists.end(), lists, lists + n);
     if (!g_vkPendingLists.empty())
-        vk::Submit(*g_r.vkd, g_vkPendingLists.data(), uint32_t(g_vkPendingLists.size()));
+    {
+        if (NoGpuWork())
+            vk::Submit(*g_r.vkd, nullptr, 0); // (REGPU_NO_GPU_WORK: the same step on the timeline, no work)
+        else
+            vk::Submit(*g_r.vkd, g_vkPendingLists.data(), uint32_t(g_vkPendingLists.size()));
+    }
     g_vkPendingLists.clear();
 }
 void QueueVkLists(uint32_t n, const VkCommandBuffer* lists)
@@ -15334,7 +15359,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // Only draws that depth-test with a real compare and write depth (3D meshes, also blended ones that write depth
         // with CULL_ALL): a HUD's glyphs and menus redraw shared buffers with other contents every frame, and culling
         // them dropped FM3's HUD text (session 43).
-        if (!noHyperCull && (cullPasses ? (edramMode == 4 || edramMode == 5) : (edramMode == 4 && WidePass())) && (dc & 2) && (dc & 4) &&
+        if (!noHyperCull && !NoGpuWork() && (cullPasses ? (edramMode == 4 || edramMode == 5) : (edramMode == 4 && WidePass())) && (dc & 2) && (dc & 4) &&
             ((dc >> 4) & 7) != 7 && !(dc & 1) && (cullAll || opaque))
         {
             uint64_t key = 0xCBF29CE484222325ull;
@@ -18936,6 +18961,17 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         [](VkCommandBuffer cb, void* ctx) {
             AsyncEnd& e = *static_cast<AsyncEnd*>(ctx);
             regpu::xr::SetCaptureTag(e.vrTag);
+            if (NoGpuWork())
+            {
+                // (REGPU_NO_GPU_WORK: no copy into the swap chain, so no image acquired and nothing presented; the
+                // buffer is ended but not submitted, the queued lists go empty, the frame's fence still follows them.)
+                vk::Check(vkEndCommandBuffer(cb), "vkEndCommandBuffer(frame)");
+                SubmitVkLists(0, nullptr);
+                e.shownOk = false;
+                if (e.present)
+                    SignalFence(e.fence);
+                return;
+            }
             e.shownOk = e.copy && PresenterRecordCopy(cb, e.shown, e.overlay, kOverlayW, kOverlayH, e.timer, kTimerW, kTimerH, e.fps, kFpsW, kFpsH,
                 e.grade ? GradeIntoBackBuffer : nullptr, e.grade);
             // The front buffer rests sampled between frames (HoldPresent reads it so).

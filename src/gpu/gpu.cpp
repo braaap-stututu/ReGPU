@@ -26,6 +26,7 @@
 #include "regpu/driver.h"
 
 using Clock = std::chrono::steady_clock;
+bool RegpuPerfLiteOn(); // (gpu/renderer.cpp)
 #include "gpu/regs.h"
 #include "render/presenter.h"
 #include "gpu/renderer.h"
@@ -898,6 +899,31 @@ void Append(const uint32_t* record, uint32_t words)
     g_log.insert(g_log.end(), record, record + words);
 }
 
+// Draws per screen in triple mode (FM3 port M0; logged once a second with REGPU_PERF_LITE): the guest draws the draw
+// thread handled in the game's own pass ([1]: the centre screen plus the shared passes before its first main-view draw:
+// shadows, reflections, the mirror) and in each side screen's replay ([0] left, [2] right). Counted where the draws
+// arrive on the draw thread (before any draw workers), so the counts are the guest's draws, not host draw calls.
+int g_countScreen = 1;
+uint64_t g_screenDraws[3] = {};
+uint64_t g_screenFrames = 0;
+Clock::time_point g_screenLogged{};
+void LogScreenDraws()
+{
+    g_screenFrames++;
+    const auto now = Clock::now();
+    if (g_screenLogged == Clock::time_point{})
+        g_screenLogged = now;
+    if (now - g_screenLogged < std::chrono::seconds(1))
+        return;
+    const double n = double(g_screenFrames);
+    Log("triple: draws/frame: %.0f centre and shared passes, %.0f left, %.0f right (%.0f in all, %llu frames)", double(g_screenDraws[1]) / n,
+        double(g_screenDraws[0]) / n, double(g_screenDraws[2]) / n, double(g_screenDraws[0] + g_screenDraws[1] + g_screenDraws[2]) / n,
+        (unsigned long long)g_screenFrames);
+    g_screenDraws[0] = g_screenDraws[1] = g_screenDraws[2] = 0;
+    g_screenFrames = 0;
+    g_screenLogged = now;
+}
+
 // The recorded frame drawn again from its first main-view draw's state (fences, ordered stores and occlusion queries
 // with their draws are skipped: the guest saw them once).
 void Replay()
@@ -923,7 +949,10 @@ void Replay()
             break;
         case work::kDraw:
             if (!inQuery)
+            {
+                g_screenDraws[g_countScreen]++;
                 FrameOnDraw(a[0], a[1], a[2]);
+            }
             break;
         case work::kQuery:
             inQuery = a[0] == 0;
@@ -947,10 +976,14 @@ void TripleAtSwap(uint32_t frontBuffer)
         for (int side : { 0, 2 })
         {
             RendererSetTripleView(g_tripleViews[side], true);
+            g_countScreen = side;
             Replay();
+            g_countScreen = 1;
             RendererTripleCapture(side, frontBuffer);
         }
     RendererSetTripleView(nullptr, false);
+    if (RegpuPerfLiteOn())
+        LogScreenDraws();
     memcpy(work::g_file.data(), g_endFile.data(), g_endFile.size());
     g_frames++;
     g_words += g_log.size();
@@ -1049,6 +1082,7 @@ void WorkerLoop()
                 SegShaderLoad(ShaderType(a[0] & 0xFF), a + 3, a[2], a[1], (a[0] >> 8) & 1);
                 break;
             case work::kDraw:
+                stereo::g_screenDraws[1]++;
                 stereo::BeforeDraw();
                 if (stereo::g_armed && stereo::g_log.empty())
                     stereo::Append(p, words + 1); // (the draw that started the recording)
