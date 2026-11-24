@@ -896,6 +896,10 @@ struct CachedTexture
     uint32_t width = 0, height = 0;
     VkFormat format = VK_FORMAT_R8G8B8A8_UNORM; // cubes: matches their faces
     bool native = false; // block-compressed on the GPU: the shader applies the fetch swizzle
+    // Write watch (Host::watchArm / watchClean; REGPU_TEXTURE_NO_WATCH): armed since watchSeq, not before watchQuietUntil.
+    bool watchArmed = false;
+    uint8_t watchFalseWrites = 0;
+    uint64_t watchSeq = 0, watchQuietUntil = 0;
     // The texture budget's size of `resource` (its allocation's, asked once per resource: TextureBudgetBytes).
     const vk::Image* budgetFor = nullptr;
     uint64_t budgetBytes = 0;
@@ -2993,8 +2997,16 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
     // Multisampled colour surfaces stay in GENERAL for drawing, resolving (sampled) and copying: each resolve moved the
     // surface out of the attachment layout and back, and AMD's Vulkan drivers decompressed the whole surface each time
     // (FM3 on a Ryzen 9800X3D's graphics at 720p 2x: ~0.84 ms a resolve, the frame 2.7x D3D12's; D3D12's driver reads
-    // the compressed samples). REGPU_VK_NO_MSAA_GENERAL=1 (start-time): the optimal layouts, as before.
-    static const bool noGeneral = getenv("REGPU_VK_NO_MSAA_GENERAL") && strcmp(getenv("REGPU_VK_NO_MSAA_GENERAL"), "0") != 0;
+    // the compressed samples). Mesa's RADV is the other way round: it resolves from the optimal layouts without a
+    // decompression and in GENERAL it can't fast-clear (FM3 on a Steam Deck: the main scene's clear after each resolve
+    // 0.66 ms in GENERAL against 0.23 ms, the race +4.3%), so on RADV they stay in the optimal layouts.
+    // REGPU_VK_NO_MSAA_GENERAL=1 / =0 (start-time) forces the optimal layouts / GENERAL on any driver.
+    static const bool noGeneral = [] {
+        const char* v = getenv("REGPU_VK_NO_MSAA_GENERAL");
+        if (v && *v)
+            return strcmp(v, "0") != 0;
+        return g_r.vkd->driver.driverID == VK_DRIVER_ID_MESA_RADV;
+    }();
     s.vk.general = !depth && desc.samples > VK_SAMPLE_COUNT_1_BIT && !noGeneral;
     CountCreate(depth ? "depth surface" : "colour surface");
     // Starts as a target, as D3D12's did (created in RENDER_TARGET / DEPTH_WRITE), in order with the recorded commands.
@@ -8583,6 +8595,38 @@ GpuImage* GetTextureLocked(const TextureFetch& fetch, VkFormat& format, bool& na
     LiveSwitch &stagger = g_sw_REGPU_TEXTURE_CHECK_STAGGER;
     const bool checkAlways = !stagger;
     const uint64_t textureKey = TextureKey(fetch.Address(), fetch.Format(), w, h);
+    // Write watch (Host::watchArm / watchClean, as the index buffers and the vertex arena): a texture none of whose
+    // pages was written since its last hash is unchanged, known without reading it, so it is checked at every frame
+    // for nothing (no stagger delay for it, no hashing ahead). Textures were hashed at their checks, staggered or not,
+    // most of them ahead on three worker threads: on a Steam Deck's frozen FM4 grid ~0.5 of a core, every frame. One
+    // that changes is hashed for 120 frames before it is watched again (a fault per write otherwise); one whose pages
+    // are written without its contents changing (data the title rewrites next to it) twice in a row is left alone
+    // for 1200 frames; memory that can't be watched is tried again after 600. REGPU_TEXTURE_NO_WATCH=1 (live): hashed
+    // as before. REGPU_TEXTURE_WATCH_VERIFY=1 (diagnostic): hashed anyway, and a change with no write seen is logged.
+    static LiveSwitch noTextureWatch("REGPU_TEXTURE_NO_WATCH");
+    static LiveSwitch textureWatchVerify("REGPU_TEXTURE_WATCH_VERIFY");
+    const regpu::Host& host = regpu::GetHost();
+    const bool textureWatch = host.watchArm && host.watchClean && host.watchSeq && !noTextureWatch && !forceDecode;
+    const uint32_t texturePhysical = fetch.Address() & 0x1FFFFFFF;
+    bool watchedClean = false; // (verify mode: clean by the watch, hashed anyway below)
+    if (textureWatch && cached.resource && cached.watchArmed)
+    {
+        const uint8_t* source;
+        size_t bytes, stride;
+        TextureHashSpan(fetch, w, h, source, bytes, stride);
+        if (host.watchClean(texturePhysical, uint32_t(bytes), cached.watchSeq))
+        {
+            watchedClean = true;
+            if (!textureWatchVerify)
+            {
+                cached.checkedFrame = g_r.frame;
+                cached.unchanged++;
+                format = cached.format;
+                native = cached.native;
+                return cached.resource.Get();
+            }
+        }
+    }
     // Unchanged for 300 checks (a few seconds): every 16th frame (a CPU-side update shows up at most
     // ~0.1 s late). REGPU_TEXTURE_CHECK_EVERY4=1 keeps every 4th (A/B).
     LiveSwitch &every4 = g_sw_REGPU_TEXTURE_CHECK_EVERY4;
@@ -8591,7 +8635,7 @@ GpuImage* GetTextureLocked(const TextureFetch& fetch, VkFormat& format, bool& na
     // long enough to be, each on its own frames, and when it played again its brightness and colour came
     // from different frames for a frame or two (FM2 port, report #15). REGPU_STAGGER_CHANGING=1: as before.
     static LiveSwitch noChangingCheck("REGPU_STAGGER_CHANGING");
-    if (cached.resource && !checkAlways && !forceDecode && cached.unchanged >= 30 &&
+    if (cached.resource && !checkAlways && !forceDecode && !watchedClean && cached.unchanged >= 30 &&
         (cached.changes < 8 || noChangingCheck) && ((g_r.frame + (textureKey >> 32)) & checkMask) != 0)
     {
         if (((g_r.frame + 1 + (textureKey >> 32)) & checkMask) == 0) // due next frame: hashed ahead
@@ -8617,8 +8661,42 @@ GpuImage* GetTextureLocked(const TextureFetch& fetch, VkFormat& format, bool& na
     const uint8_t* source;
     size_t sourceBytes, hashStride;
     TextureHashSpan(fetch, w, h, source, sourceBytes, hashStride);
+    const bool watchWritten = cached.watchArmed && !watchedClean; // (armed, and a write was seen)
+    if (textureWatch && !watchedClean)
+    {
+        cached.watchArmed = false;
+        if (g_r.frame >= cached.watchQuietUntil)
+        {
+            cached.watchSeq = host.watchSeq() + 1; // (armed before the hash: a write after it faults and is seen)
+            cached.watchArmed = host.watchArm(texturePhysical, uint32_t(sourceBytes));
+            if (!cached.watchArmed)
+                cached.watchQuietUntil = g_r.frame + 600;
+        }
+    }
     const uint64_t hash = prehash::Hash(textureKey, source, sourceBytes, hashStride) ^ (bc ? 0 : uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Pitch()) << 24) ^
         (uint64_t(fetch.Tiled()) << 40) ^ (uint64_t(fetch.Endian()) << 44);
+    if (watchedClean && cached.contentHash != hash)
+    {
+        static std::atomic<int> logged{ 0 };
+        if (logged++ < 20)
+            Log("texture watch: %08X %ux%u (frame %llu) changed with no write seen", fetch.Address(), w, h, (unsigned long long)g_r.frame);
+        cached.watchArmed = false;
+    }
+    if (textureWatch && cached.resource && !watchedClean)
+    {
+        if (cached.contentHash != hash)
+        {
+            cached.watchArmed = false; // (changing: hashed for a while)
+            cached.watchQuietUntil = g_r.frame + 120;
+            cached.watchFalseWrites = 0;
+        }
+        else if (watchWritten && ++cached.watchFalseWrites >= 2)
+        {
+            cached.watchArmed = false; // (its pages are written, its contents not: a fault a frame for nothing)
+            cached.watchQuietUntil = g_r.frame + 1200;
+            cached.watchFalseWrites = 0;
+        }
+    }
     if (cached.resource && cached.contentHash == hash && !forceDecode)
     {
         cached.unchanged++;

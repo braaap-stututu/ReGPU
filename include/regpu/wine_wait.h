@@ -1,6 +1,6 @@
 #pragma once
-// Short waits that stay out of Wine's wineserver: REGPU_WINE_WAITS=1 (off by default; a port turns it on for Wine
-// platforms, e.g. FM3's Steam Deck profile). Read at each wait until it is seen on, then on for good.
+// Short waits that stay out of Wine's wineserver: on by default under Wine (REGPU_WINE_WAITS=0 turns it off; never on
+// outside Wine). Read at each wait until it is seen on, then on for good.
 //
 // Under Wine a waitable timer is a wineserver object: every SetWaitableTimer plus its wait is a round trip to the
 // server process. ReGPU's vblank ticks (twice the frame cap: 720 Hz at a 360 cap), the command processor's idle
@@ -58,8 +58,9 @@ inline bool On()
     static std::atomic<bool> seen{ false };
     if (seen.load(std::memory_order_relaxed))
         return true;
+    // Unset: on (under Wine; measured on a Steam Deck, Proton 11). =0: the waitable timers.
     const char* v = getenv("REGPU_WINE_WAITS");
-    const bool on = v && *v && strcmp(v, "0") != 0;
+    const bool on = !v || !*v || strcmp(v, "0") != 0;
     if (on)
         seen.store(true, std::memory_order_relaxed);
     return on;
