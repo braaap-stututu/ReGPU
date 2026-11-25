@@ -6244,6 +6244,8 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
         options.fetchBranches = DirectFetchBranches();
         if (TranslateSpirv(parsed, cs.info, words, why, options))
         {
+            void DumpDirectSpirv(uint64_t, const std::vector<uint32_t>&, const char*);
+            DumpDirectSpirv(hash, words, "base");
             auto code = std::make_shared<SpirvCode>();
             code->words = std::move(words);
             cs.code = std::move(code);
@@ -6266,6 +6268,8 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
             Log("spirv direct: %s %016llx falls back to HLSL: %s", pixel ? "ps" : "vs", (unsigned long long)hash, why.c_str());
     }
     cs.cacheKey = Fnv(cs.info.hlsl.data(), cs.info.hlsl.size(), pixel ? 1 : 2);
+    if (static const uint64_t dumpSpv = getenv("REGPU_DUMP_SPV") ? strtoull(getenv("REGPU_DUMP_SPV"), nullptr, 16) : 0; dumpSpv && dumpSpv == hash)
+        Log("dump spv: %016llx HLSL path cache key %016llx (shadercache/%016llx.vk1.spv)", (unsigned long long)hash, (unsigned long long)cs.cacheKey, (unsigned long long)cs.cacheKey);
     if (auto b = g_bytecode.find(cs.cacheKey); b != g_bytecode.end())
     {
         cs.code = b->second;
@@ -6542,6 +6546,25 @@ std::string NoKillVariant(const std::string& hlsl)
     return h;
 }
 
+// REGPU_DUMP_SPV=<shader hash> (start-time, diagnostic): that shader's direct SPIR-V (base and each variant) to
+// <userDir>/shaders/<hash>_direct_<n>.spv, and the HLSL path's cache key logged (its DXC SPIR-V is
+// shadercache/<key>.vk1.spv), to compare the two translations of one shader.
+void DumpDirectSpirv(uint64_t hash, const std::vector<uint32_t>& words, const char* what)
+{
+    static const uint64_t want = getenv("REGPU_DUMP_SPV") ? strtoull(getenv("REGPU_DUMP_SPV"), nullptr, 16) : 0;
+    if (!want || hash != want)
+        return;
+    static std::atomic<uint32_t> n{ 0 };
+    const auto dir = RegpuUserDir() / "shaders";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    char name[80];
+    const uint32_t k = n++;
+    snprintf(name, sizeof(name), "%016llx_direct_%u.spv", (unsigned long long)hash, k);
+    std::ofstream(dir / name, std::ios::binary).write(reinterpret_cast<const char*>(words.data()), std::streamsize(words.size() * 4));
+    Log("dump spv: %016llx %s -> shaders/%s", (unsigned long long)hash, what, name);
+}
+
 // A direct shader's variant (REGPU_SPIRV_DIRECT): translated again from the microcode with the variant's options, as
 // the HLSL path edits its text (~1 ms, so here, not on a compile worker). False: the variant takes the HLSL path.
 // REGPU_SPIRV_FETCH_BRANCHES=0|1 (start-time): SpirvOptions::fetchBranches; unset: on for integrated GPUs (whose vector
@@ -6570,6 +6593,7 @@ bool DirectVariant(const CompiledShader& base, const SpirvOptions& options, Comp
         LOG_ONCE("spirv direct: a variant of %s %016llx takes the HLSL path: %s", base.pixel ? "ps" : "vs", (unsigned long long)base.hash, why.c_str());
         return false;
     }
+    DumpDirectSpirv(base.hash, words, "variant");
     auto code = std::make_shared<SpirvCode>();
     code->words = std::move(words);
     cs.code = std::move(code);
