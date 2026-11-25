@@ -2643,6 +2643,16 @@ void InitVulkan()
         // and the frame a world loads in filled 64 MB and dropped draws until the ring had grown.)
         : regpu::GetConfig().uploadRingMB ? std::clamp<UINT64>(regpu::GetConfig().uploadRingMB, 16, 2048) : g_r.vkPhysical && !getenv("REGPU_NO_DIRECT_FETCH") ? 128 : 384) << 20;
     Log("renderer: upload ring %llu MB per frame", (unsigned long long)(kRingSize >> 20));
+    // REGPU_FRAME_ROOM_HEIGHT=<rows> (start-time; PGR3 port, session 5): the smallest guest frame height the title will
+    // use (regpu-frame-size). The EDRAM surfaces are made tall enough for it from the start: otherwise the first such
+    // frame (PGR3's first race frame, 600 rows) dropped every surface and made them again taller, ~50 ms off the draw
+    // thread at 1440p 4x (each surface up to ~200 MB), right after the ones it had just made for the race.
+    if (const char* v = getenv("REGPU_FRAME_ROOM_HEIGHT"))
+        if (const uint32_t rows = std::clamp<uint32_t>(uint32_t(atoi(v)), 360, kHeight); rows < g_frameRoomHeight.load())
+        {
+            g_frameRoomHeight = rows;
+            Log("renderer: EDRAM surfaces made for guest frames down to %u rows", rows);
+        }
     // GPU upload heaps (D3D12's name; on Vulkan device-local memory the CPU can write, which a discrete GPU has with
     // resizable BAR / Smart Access Memory on): the upload ring (per-draw constants, vertex and texture uploads) can live
     // in VRAM instead of system memory. A second ring per frame slot is made there for the live A/B
