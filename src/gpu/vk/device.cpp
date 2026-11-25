@@ -427,6 +427,7 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
             optional(name);
     // (A debugging aid: drivers may keep more about each pipeline with it.)
     d.shaderInfo = getenv("REGPU_SHADER_STATS") && optional(VK_AMD_SHADER_INFO_EXTENSION_NAME);
+    const bool execStats = getenv("REGPU_SHADER_STATS") && optional(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     // NVIDIA's NGX (DLSS on Vulkan, dlss.cpp) needs these two where the driver has them.
     d.ngx = optional("VK_NVX_binary_import") && optional("VK_NVX_image_view_handle");
 
@@ -592,6 +593,15 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     {
         *tail = &dyn3;
         tail = &dyn3.pNext;
+    }
+    // REGPU_SHADER_STATS: the driver's statistics of each pipeline (pipelines.cpp LogShaderStats).
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR execOn{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
+    execOn.pipelineExecutableInfo = VK_TRUE;
+    if (execStats)
+    {
+        *tail = &execOn;
+        tail = &execOn.pNext;
+        d.execStats = true;
     }
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gplOn{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT };
     gplOn.graphicsPipelineLibrary = haveGpl.graphicsPipelineLibrary;

@@ -5896,9 +5896,10 @@ std::atomic<bool> g_psEdits{ false };
 std::unordered_set<uint64_t> g_psEditEver; // every alias made (kept out of the pipeline manifest)
 std::atomic<bool> g_psEditAny{ false };    // g_psEditEver has one (IsPsEditAlias's fast path)
 // The debug server's drawstats: draws per (vs, ps) over one frame.
+std::atomic<uint32_t> g_drawStatsSeq[4]; // drawstats: draws issued, after a pipeline bind, of those with the vertex shader changed, with only the pixel shader changed
 std::atomic<int> g_drawStats{ 0 }; // 1 armed for the next frame, 2 counting, 0 off
 std::mutex g_drawStatsMutex;
-std::map<std::pair<uint64_t, uint64_t>, uint32_t> g_drawStatsCounts;
+std::map<std::pair<uint64_t, uint64_t>, std::pair<uint32_t, uint64_t>> g_drawStatsCounts; // draws, indices (NUM_INDICES)
 bool IsPsEditAlias(uint64_t hash)
 {
     if (!g_psEditAny.load(std::memory_order_acquire))
@@ -15244,7 +15245,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (g_drawStats.load(std::memory_order_relaxed) == 2) // the debug server's drawstats: every draw of a frame
     {
         std::lock_guard lock(g_drawStatsMutex);
-        g_drawStatsCounts[{ psAlias.realVs, psAlias.real }]++;
+        auto& n = g_drawStatsCounts[{ psAlias.realVs, psAlias.real }];
+        n.first++;
+        n.second += initiator >> 16;
     }
     const CompiledShader& ps = GetShader(C().psHash, C().psCode, true);
     Section(1);
@@ -17414,6 +17417,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             const bool oneTriangle = exp == 2 || exp >= 4;
             const bool skip = (exp == 5 && g_pipelineBoundSinceDraw) || (exp >= 6 && !g_pipelineBoundSinceDraw) || (exp == 7 && !vsChanged) ||
                 (exp == 8 && (vsChanged || !psChanged));
+            if (g_drawStats.load(std::memory_order_relaxed) == 2)
+            {
+                g_drawStatsSeq[0]++;
+                if (g_pipelineBoundSinceDraw)
+                    g_drawStatsSeq[1]++, g_drawStatsSeq[vsChanged ? 2 : 3] += vsChanged || psChanged;
+            }
             g_pipelineBoundSinceDraw = false;
             for (int call = 0; call < (exp == 4 ? 2 : 1); call++)
                 if (exp == 1 || skip)
@@ -19307,20 +19316,24 @@ std::string RendererDrawStats()
     {
         std::lock_guard lock(g_drawStatsMutex);
         g_drawStatsCounts.clear();
+        for (auto& n : g_drawStatsSeq)
+            n = 0;
     }
     g_drawStats = 1;
     for (int i = 0; i < 400 && g_drawStats.load() != 0; i++)
         Sleep(5);
     std::lock_guard lock(g_drawStatsMutex);
     std::string out;
-    char buf[96];
+    char buf[128];
     for (const auto& [k, n] : g_drawStatsCounts)
     {
-        snprintf(buf, sizeof(buf), "%s{\"vs\":\"%016llx\",\"ps\":\"%016llx\",\"draws\":%u}", out.empty() ? "" : ",", (unsigned long long)k.first,
-            (unsigned long long)k.second, n);
+        snprintf(buf, sizeof(buf), "%s{\"vs\":\"%016llx\",\"ps\":\"%016llx\",\"draws\":%u,\"indices\":%llu}", out.empty() ? "" : ",",
+            (unsigned long long)k.first, (unsigned long long)k.second, n.first, (unsigned long long)n.second);
         out += buf;
     }
-    return out;
+    // (After the pairs: "seq":[draws issued, after a pipeline bind, of those vs changed, ps changed only].)
+    snprintf(buf, sizeof(buf), "],\"seq\":[%u,%u,%u,%u", g_drawStatsSeq[0].load(), g_drawStatsSeq[1].load(), g_drawStatsSeq[2].load(), g_drawStatsSeq[3].load());
+    return out + buf;
 }
 
 void regpu::SetGameWidescreen(bool on) { g_gameWidescreen.store(on, std::memory_order_relaxed); }

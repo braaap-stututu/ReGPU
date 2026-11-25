@@ -66,6 +66,7 @@ struct Device
     bool dynamicBlend = false;
     // VK_EXT_graphics_pipeline_library with fast linking: the renderer builds its draws' pipelines from cached parts.
     bool pipelineLibrary = false;
+    bool execStats = false; // VK_KHR_pipeline_executable_properties, with REGPU_SHADER_STATS only (registers, spills, waves per pipeline)
     bool shaderInfo = false; // VK_AMD_shader_info, with REGPU_SHADER_STATS only (vk::CreateGraphicsPipeline logs each pipeline's) // VK_EXT_mutable_descriptor_type: XeSS's descriptor sets use it
     bool ngx = false;                  // VK_NVX_binary_import and VK_NVX_image_view_handle (DLSS through NGX)
     bool storageReadWithoutFormat = false; // shaderStorageImageReadWithoutFormat (the post filters read storage images)

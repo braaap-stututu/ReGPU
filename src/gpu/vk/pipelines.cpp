@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "log.h"
 
@@ -33,6 +34,83 @@ void Destroy(Device& d, ShaderModule& m)
 // REGPU_SHADER_STATS (see below), for a complete or linked pipeline.
 static void LogShaderStats(Device& d, VkPipeline pipeline, const char* name)
 {
+    // REGPU_SHADER_STATS=1 with VK_KHR_pipeline_executable_properties (RADV and others): every statistic the driver
+    // gives for each executable, "shader stats: <name> [<executable>] <stat> <value>, ...".
+    if (d.execStats && vkGetPipelineExecutablePropertiesKHR && vkGetPipelineExecutableStatisticsKHR)
+    {
+        VkPipelineInfoKHR pi{ VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR };
+        pi.pipeline = pipeline;
+        uint32_t count = 0;
+        vkGetPipelineExecutablePropertiesKHR(d.device, &pi, &count, nullptr);
+        std::vector<VkPipelineExecutablePropertiesKHR> props(count, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR });
+        if (count)
+            vkGetPipelineExecutablePropertiesKHR(d.device, &pi, &count, props.data());
+        for (uint32_t i = 0; i < count; i++)
+        {
+            VkPipelineExecutableInfoKHR ei{ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR };
+            ei.pipeline = pipeline;
+            ei.executableIndex = i;
+            uint32_t n = 0;
+            vkGetPipelineExecutableStatisticsKHR(d.device, &ei, &n, nullptr);
+            std::vector<VkPipelineExecutableStatisticKHR> stats(n, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR });
+            if (n)
+                vkGetPipelineExecutableStatisticsKHR(d.device, &ei, &n, stats.data());
+            std::string line;
+            for (const auto& st : stats)
+            {
+                char part[128];
+                switch (st.format)
+                {
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: snprintf(part, sizeof(part), "%s=%u", st.name, st.value.b32); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: snprintf(part, sizeof(part), "%s=%lld", st.name, (long long)st.value.i64); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: snprintf(part, sizeof(part), "%s=%llu", st.name, (unsigned long long)st.value.u64); break;
+                default: snprintf(part, sizeof(part), "%s=%g", st.name, st.value.f64); break;
+                }
+                line += (line.empty() ? "" : ", ") + std::string(part);
+            }
+            Log("shader stats: %s [%s] %s", name ? name : "?", props[i].name, line.c_str());
+            // REGPU_SHADER_ISA=<part of a pipeline name>[,<part>...]: the driver's internal representations (RADV: NIR,
+            // ACO IR, disassembly) to out/isa_<name>_<executable>.txt.
+            static const char* isaWant = getenv("REGPU_SHADER_ISA");
+            bool want = false;
+            if (isaWant && name)
+                for (const char* s = isaWant; *s;)
+                {
+                    const char* e = strchr(s, ',');
+                    const std::string part(s, e ? size_t(e - s) : strlen(s));
+                    if (!part.empty() && strstr(name, part.c_str()))
+                        want = true;
+                    s = e ? e + 1 : s + strlen(s);
+                }
+            if (want && vkGetPipelineExecutableInternalRepresentationsKHR)
+            {
+                uint32_t nr = 0;
+                vkGetPipelineExecutableInternalRepresentationsKHR(d.device, &ei, &nr, nullptr);
+                std::vector<VkPipelineExecutableInternalRepresentationKHR> reps(nr, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR });
+                if (nr)
+                    vkGetPipelineExecutableInternalRepresentationsKHR(d.device, &ei, &nr, reps.data());
+                std::vector<std::string> texts(nr);
+                for (uint32_t r = 0; r < nr; r++)
+                {
+                    texts[r].resize(reps[r].dataSize);
+                    reps[r].pData = texts[r].data();
+                }
+                if (nr)
+                    vkGetPipelineExecutableInternalRepresentationsKHR(d.device, &ei, &nr, reps.data());
+                std::string base = name;
+                for (char& ch : base)
+                    if (ch == '/')
+                        ch = '_';
+                const std::string file = "out/isa_" + base + "_" + props[i].name + ".txt";
+                if (FILE* f = fopen(file.c_str(), "wb"))
+                {
+                    for (uint32_t r = 0; r < nr; r++)
+                        fprintf(f, "==== %s: %s\n%s\n", reps[r].name, reps[r].description, texts[r].c_str());
+                    fclose(f);
+                }
+            }
+        }
+    }
     // REGPU_SHADER_STATS=1 (AMD, VK_AMD_shader_info): each stage's registers, scratch and code size, to compare shader
     // translations (gpu/spirv against HLSL): "shader stats: <name> vs vgpr V sgpr S scratch B isa N | ps ...".
     if (d.shaderInfo && vkGetShaderInfoAMD)
@@ -228,6 +306,8 @@ static VkPipeline BuildGraphics(Device& d, const PipelineDesc& p, const char* na
     gi.pDynamicState = dynamic.empty() ? nullptr : &dyn;
     gi.layout = pre || frag ? p.layout : VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    if (d.execStats)
+        gi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | (getenv("REGPU_SHADER_ISA") ? VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR : 0);
     const VkResult result = vkCreateGraphicsPipelines(d.device, d.pipelineCache, 1, &gi, nullptr, &pipeline);
     if (result != VK_SUCCESS)
     {
@@ -262,6 +342,8 @@ VkPipeline LinkGraphicsPipeline(Device& d, const VkPipeline* libraries, uint32_t
     gi.flags = optimize ? VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT : 0;
     gi.layout = layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    if (d.execStats)
+        gi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | (getenv("REGPU_SHADER_ISA") ? VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR : 0);
     const VkResult result = vkCreateGraphicsPipelines(d.device, d.pipelineCache, 1, &gi, nullptr, &pipeline);
     if (result != VK_SUCCESS)
     {

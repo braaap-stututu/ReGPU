@@ -1482,6 +1482,78 @@ struct Translator
         });
         return Load(tU, out);
     }
+    // REGPU_VFETCH_BATCH=1 (start-time, opt-in; unset or 0: LoadGuest per word): a vertex fetch's words loaded
+    // together, so the driver can issue them back to back and wait once. LoadGuest put each word in its own branch (the
+    // bounds check, divergent) and its own gmem/gphys branch, and swapped it at once: RADV waited for every load before
+    // the next (Steam Deck, FM4's grid: 18 full waits in a 24-load vertex shader, latency 18,000 cycles a wave). Here
+    // one uniform branch picks the buffer for all words, each address is clamped into the buffer and the word past its
+    // end (dword >= vf.w) is replaced by 0 after the load (the Xenos fetches 0 there, as LoadGuest), and the swap is two
+    // steps (bytes in halves for endian 1 and 2, halves for 2 and 3) instead of all three forms and three selects.
+    // Measured (Deck, 24 Nov 2026): RADV's estimate fell (instructions -12%, latency -22%, index-weighted), the frame
+    // didn't (grid GPU 12.27 against 12.52 ms, vertex work alone 11.21 against 11.34 ms: noise). Kept as an option for
+    // GPUs where vertex fetch latency shows.
+    static bool BatchVertexFetch()
+    {
+        static const bool on = [] {
+            const char* v = getenv("REGPU_VFETCH_BATCH");
+            return v && *v && strcmp(v, "0") != 0;
+        }();
+        return on;
+    }
+    static uint32_t FetchWords(uint32_t format)
+    {
+        switch (format)
+        {
+        case 26: case 32: case 34: case 37: return 2;
+        case 57: return 3;
+        case 35: case 38: return 4;
+        default: return 1; // (6, 7, 16, 17, 25, 31, 33, 36; unknown formats read no word)
+        }
+    }
+    void LoadGuestWords(uint32_t fetch, uint32_t dword, uint32_t count, uint32_t* words)
+    {
+        const SpirvOptions::VertexSpec* vspec = nullptr;
+        if (options.vsSpec)
+            for (const SpirvOptions::VertexSpec& v : options.vertexSpecs)
+                if (v.fetch == fetch)
+                    vspec = &v;
+        const uint32_t size = Vf(fetch, 3);
+        // (An empty buffer: every word 0, and the address is the buffer's first dword, never vf.x's.)
+        const uint32_t last = UOp(spv::OpISub, b.Ext(tU, GLSLstd450UMax, { size, U(1) }), U(1));
+        const uint32_t base = SelU(UEq(size, 0), U(0), Vf(fetch, 0));
+        uint32_t addr[4], raw[4];
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint32_t di = i ? UOp(spv::OpIAdd, dword, U(i)) : dword;
+            const uint32_t clamped = b.Ext(tU, GLSLstd450UMin, { di, last });
+            addr[i] = UOp(spv::OpIAdd, base, UOp(spv::OpIMul, clamped, U(4)));
+        }
+        if (vspec)
+            for (uint32_t i = 0; i < count; i++)
+                raw[i] = GuestWord(vspec->phys ? gphysV : gmemV, addr[i]);
+        else
+        {
+            uint32_t vars[4];
+            for (uint32_t i = 0; i < count; i++)
+                vars[i] = b.Variable(pFnU);
+            b.If(Bin(spv::OpINotEqual, tB, Vf(fetch, 2), U(0)),
+                [&] { for (uint32_t i = 0; i < count; i++) Store(vars[i], GuestWord(gphysV, addr[i])); },
+                [&] { for (uint32_t i = 0; i < count; i++) Store(vars[i], GuestWord(gmemV, addr[i])); });
+            for (uint32_t i = 0; i < count; i++)
+                raw[i] = Load(tU, vars[i]);
+        }
+        const uint32_t e = vspec ? U(vspec->endian) : Vf(fetch, 1);
+        const uint32_t bytes = Bin(spv::OpLogicalOr, tB, UEq(e, 1), UEq(e, 2));
+        const uint32_t halves = Bin(spv::OpUGreaterThanEqual, tB, e, U(2));
+        for (uint32_t i = 0; i < count; i++)
+        {
+            uint32_t v = raw[i];
+            v = SelU(bytes, UOr(UShl(UAnd(v, 0x00FF00FFu), 8), UAnd(UShr(v, 8), 0x00FF00FFu)), v);
+            v = SelU(halves, UOr(UShl(v, 16), UShr(v, 16)), v);
+            const uint32_t di = i ? UOp(spv::OpIAdd, dword, U(i)) : dword;
+            words[i] = SelU(Bin(spv::OpULessThan, tB, di, size), v, U(0));
+        }
+    }
     uint32_t SignExtend(uint32_t v, uint32_t bits)
     {
         const uint32_t i = b.Op(spv::OpBitcast, tI, { UShl(v, 32 - bits) });
@@ -1587,6 +1659,8 @@ struct Translator
         const uint32_t idx = b.Ext(tF, lastRound ? GLSLstd450RoundEven : GLSLstd450Floor, { Load(tF, vfi) });
         const uint32_t d = UOp(spv::OpIAdd, UOp(spv::OpIMul, b.Op(spv::OpConvertFToU, tU, { FMax(idx, F(0)) }), U(lastStride)), U(f.offset));
         uint32_t words[4] = {};
+        if (BatchVertexFetch())
+            LoadGuestWords(constIndex, d, FetchWords(f.format), words);
         auto w = [&](uint32_t i) {
             if (!words[i])
                 words[i] = LoadGuest(constIndex, i ? UOp(spv::OpIAdd, d, U(i)) : d);
