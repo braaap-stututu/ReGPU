@@ -39,6 +39,7 @@ struct Translator
     bool lastRound = false;
     // Function variables.
     uint32_t r = 0, ps = 0, p = 0, a0 = 0, aL = 0, oC[4] = {}, oD = 0;
+    std::vector<size_t> order; // Scan: blocks in a topological order (an acyclic program with backward jumps), else empty
     uint32_t cfpc = 0, loopCount = 0, loopSaved = 0, loopDepth = 0, callRet = 0, callDepth = 0, guard = 0;
     uint32_t regCount = 1;
     uint32_t regLod = 0; // setTexLOD's value (hlsl.cpp's regLod)
@@ -1123,6 +1124,64 @@ struct Translator
                     pending.push_back(i + 1);
             }
         }
+        // Jumps backward by index that never form a cycle (no loops or calls; PGR3's compiler puts out-of-line branches
+        // after the main path and jumps back into its shared tail): the blocks in a topological order of the jump graph
+        // run once each in one pass, as forward programs do, instead of the loop over all blocks. RADV/ACO doesn't thread
+        // that loop (DXC/LLVM does): PGR3's blended fetch-heavy pixel shaders cost 2x the GPU time of their DXC builds.
+        // REGPU_SPIRV_NO_DAG_ORDER=1 (start-time): the loop, as before.
+        order.clear();
+        static const bool noDag = getenv("REGPU_SPIRV_NO_DAG_ORDER") != nullptr;
+        if (!linear && !forward && !noDag)
+        {
+            const size_t n = shader.cf.size();
+            bool acyclicCandidate = true;
+            std::vector<std::vector<size_t>> next(n);
+            std::vector<uint32_t> indegree(n, 0);
+            for (size_t i = 0; i < n && acyclicCandidate; i++)
+            {
+                if (!reachable[i])
+                    continue;
+                const Cf& cf = shader.cf[i];
+                const CfOp op = cf.op();
+                if (op == CfOp::LoopStart || op == CfOp::LoopEnd || op == CfOp::CondCall || op == CfOp::Return)
+                    acyclicCandidate = false;
+                const bool unconditionalJump = op == CfOp::CondJmp && ((cf.lo >> 13) & 1);
+                if (op == CfOp::CondJmp && (cf.lo & 0x1FFF) < n)
+                    next[i].push_back(cf.lo & 0x1FFF);
+                if (!cf.IsEnd() && !unconditionalJump && i + 1 < n)
+                    next[i].push_back(i + 1);
+            }
+            if (acyclicCandidate)
+            {
+                for (size_t i = 0; i < n; i++)
+                    if (reachable[i])
+                        for (size_t t : next[i])
+                            if (reachable[t])
+                                indegree[t]++;
+                // Kahn's algorithm, lowest index first (keeps the program's own order where it can).
+                std::vector<size_t> ready;
+                for (size_t i = 0; i < n; i++)
+                    if (reachable[i] && !indegree[i])
+                        ready.push_back(i);
+                size_t reached = 0;
+                for (size_t i = 0; i < n; i++)
+                    reached += reachable[i];
+                while (!ready.empty())
+                {
+                    const auto it = std::min_element(ready.begin(), ready.end());
+                    const size_t i = *it;
+                    ready.erase(it);
+                    order.push_back(i);
+                    for (size_t t : next[i])
+                        if (reachable[t] && --indegree[t] == 0)
+                            ready.push_back(t);
+                }
+                if (order.size() == reached && !order.empty() && order[0] == 0)
+                    forward = true;
+                else
+                    order.clear();
+            }
+        }
         uint32_t maxReg = 0;
         auto useReg = [&](uint32_t n) { maxReg = std::max(maxReg, n & 127); };
         for (size_t i = 0; i < shader.cf.size(); i++)
@@ -1392,6 +1451,12 @@ struct Translator
             cfpc = b.Variable(pFnU);
             Store(cfpc, U(0));
             auto blocks = [&] {
+                if (!order.empty())
+                {
+                    for (size_t i : order) // (Scan: a topological order of an acyclic jump graph)
+                        b.If(Bin(spv::OpIEqual, tB, Load(tU, cfpc), U(uint32_t(i))), [&] { EmitCf(i, false); });
+                    return;
+                }
                 for (size_t i = 0; i < shader.cf.size(); i++)
                     if (reachable[i])
                         b.If(Bin(spv::OpIEqual, tB, Load(tU, cfpc), U(uint32_t(i))), [&] { EmitCf(i, false); });
