@@ -114,4 +114,7 @@ Same scene, same settings, both sides: if the console shows it too, it isn't a R
 | `src/render/presenter.cpp` | Window, swap chain, frame pacing |
 | `src/gpu/vk/` | The Vulkan layer under the renderer (device, recorder, resources, bindings, pipelines, passes): see [`docs/vulkan.md`](docs/vulkan.md) |
 | `src/debug.cpp` | The debug server (`tools/regpuctl.py`) |
-| `tools/` | regpuctl, XBDM tools, shader disassembler (`xenos_dis.cpp`), frame comparison |
+| `tools/` | regpuctl, XBDM tools, shader disassembler (`xenos_dis.cpp`), frame comparison, `frametimes.py` (p99, 1% lows), `gpusensors.py` (AMD clocks and power, Windows), `resdiff.py` (resolve dumps compared) |
+| `tools/rgp/` | Radeon GPU Profiler captures read as text: pipeline binaries, registers, per-draw times, barriers |
+| `docs/ports/` | The ports' records on the Vulkan ReGPU (FM4, the Steam Deck briefing); FM3's summary is in `docs/vulkan.md` |
+| `docs/research/` | Background research reports (Vulkan porting and optimisation; console and DOS recompilation) |
