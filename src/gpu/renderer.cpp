@@ -8615,6 +8615,8 @@ GpuImage* GetTexture(const TextureFetch& fetch, VkFormat& format, bool& native)
 // N2 (FM3 port session 43): REGPU_UMA_TEXTURES=1 wrote a new texture in place on a UMA GPU (D3D12's CPU-writable
 // custom heaps, WriteToSubresource), saving the upload ring's copy and the GPU copy. Measured 63 vs 65 fps on the
 // Radeon iGPU (opt-in); not on Vulkan (VK_EXT_host_image_copy would be the way): the switch is ignored.
+namespace texjobs { void Copy(const TextureFetch& fetch, uint8_t* dst, uint32_t rowPitch); } // (below, by SubmitVkLists)
+
 GpuImage* GetTextureLocked(const TextureFetch& fetch, VkFormat& format, bool& native)
 {
     TextureScope textureScope;
@@ -8843,7 +8845,7 @@ GpuImage* GetTextureLocked(const TextureFetch& fetch, VkFormat& format, bool& na
                 NoteTextureFailure("upload ring full (compressed)", fetch);
                 return nullptr;
             }
-            CopyTextureBlocks(levels[l], Frame().ringCpu + offset, rowPitch);
+            texjobs::Copy(levels[l], Frame().ringCpu + offset, rowPitch);
             CopyFromRing(*C().vkList, *cached.resource, offset, rowPitch, l, 0, lw, lh);
         }
         vk::Transition(*C().vkList, *cached.resource, vk::Use::Sampled);
@@ -12990,10 +12992,81 @@ std::mutex g_pendingMutex;
 
 // Submits the queued lists, then these.
 // Queues lists for the next submission (or submits them, with REGPU_NO_DEFER_LISTS).
+// Block-compressed texture levels copied into the upload ring on helper threads (PGR3 port, D3D12 session 5; on Vulkan
+// session 6, Steam Deck): a track streaming 50-150 new DXT textures in one frame untiled and byte-swapped them one after
+// another on the draw thread (PGR3 on the Deck: up to ~7 ms of a frame with 82 new textures). The copy command is
+// recorded at once and the helpers write the ring meanwhile; every submission waits for them first (SubmitVkLists), as
+// the GPU reads the ring only when the command buffer runs. Same bytes. REGPU_SYNC_TEXTURE_COPIES=1 (live): on the draw
+// thread, as before.
+namespace texjobs
+{
+struct Job
+{
+    TextureFetch fetch;
+    uint8_t* dst;
+    uint32_t rowPitch;
+};
+std::mutex g_mutex;
+std::condition_variable g_wake, g_done;
+std::deque<Job> g_queue;
+uint32_t g_pending = 0; // queued or running (under g_mutex)
+bool g_started = false;
+
+bool RunOne(std::unique_lock<std::mutex>& lock)
+{
+    if (g_queue.empty())
+        return false;
+    const Job job = g_queue.front();
+    g_queue.pop_front();
+    lock.unlock();
+    CopyTextureBlocks(job.fetch, job.dst, job.rowPitch);
+    lock.lock();
+    if (--g_pending == 0)
+        g_done.notify_all();
+    return true;
+}
+void Copy(const TextureFetch& fetch, uint8_t* dst, uint32_t rowPitch)
+{
+    static LiveSwitch sync("REGPU_SYNC_TEXTURE_COPIES");
+    if (sync)
+    {
+        CopyTextureBlocks(fetch, dst, rowPitch);
+        return;
+    }
+    std::lock_guard lock(g_mutex);
+    if (!g_started)
+    {
+        g_started = true;
+        for (int i = 0; i < 3; i++)
+            std::thread([] {
+                SetThreadDescription(GetCurrentThread(), L"gpu texture copier");
+                std::unique_lock lock(g_mutex);
+                for (;;)
+                {
+                    g_wake.wait(lock, [] { return !g_queue.empty(); });
+                    RunOne(lock);
+                }
+            }).detach();
+    }
+    g_queue.push_back({ fetch, dst, rowPitch });
+    g_pending++;
+    g_wake.notify_one();
+}
+// Before a submission: the queued copies done (the caller takes some itself).
+void WaitAll()
+{
+    std::unique_lock lock(g_mutex);
+    while (g_pending)
+        if (!RunOne(lock))
+            g_done.wait(lock, [] { return g_pending == 0 || !g_queue.empty(); });
+}
+} // namespace texjobs
+
 // The same for Vulkan command buffers (ended): one vkQueueSubmit2 for all queued.
 std::vector<VkCommandBuffer> g_vkPendingLists;
 void SubmitVkLists(uint32_t n, const VkCommandBuffer* lists)
 {
+    texjobs::WaitAll(); // (texture levels still being copied into the ring)
     vk::FlushTextureWrites(*g_r.vkd, g_r.vkBindings); // (bindless entries the buffers use, written before they run)
     std::lock_guard lock(g_pendingMutex);
     g_vkPendingLists.insert(g_vkPendingLists.end(), lists, lists + n);
