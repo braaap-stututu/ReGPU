@@ -694,6 +694,20 @@ const PassScaleSnapshot& PassScalesSlow()
     n.scaleY = float(n.outH) / float(frameH) * n.scene * n.passScale;
     n.scaleWide = float(n.outW) / float(frameW) * n.scene * n.passScale;
     n.scaleX = WidePass() ? n.scaleWide : n.scaleY;
+    // Tiny passes (surface pitch up to one EDRAM tile, 80 px) at the console's own 1:1 texel grid: they are
+    // reductions and lookup tables, not pictures. PGR3's auto-exposure averages log luminance 64x64 -> 16x16 ->
+    // 4x4 -> 1x1 with taps placed for exact guest texels; drawn at the output's scale (1.2 at 720p, 2.4 at 1440p)
+    // the averages came out low and the exposure high: races brighter than console footage (live race at 720p vs a
+    // capture: sky +0.05 -> +0.01 and other surfaces +0.05 -> +0.03..0.04 before the display ramp; the frozen grid
+    // can't show it, PGR3's composite skips its HDR branch while time is frozen). REGPU_SCALE_TINY_PASSES=1 (start-time):
+    // scaled as before. REGPU_TINY_PASS_PITCH=<px> (start-time): the largest pitch counted (default 80).
+    static const bool scaleTiny = getenv("REGPU_SCALE_TINY_PASSES") != nullptr;
+    static const uint32_t tinyPitch = getenv("REGPU_TINY_PASS_PITCH") ? uint32_t(atoi(getenv("REGPU_TINY_PASS_PITCH"))) : 80u;
+    if (!scaleTiny && !n.big && (surface & 0x3FFF) <= tinyPitch && n.scaleY > 0.0f && !(g_tallHeight && (surface == g_tallInfo || TallView())))
+    {
+        n.passScale /= n.scaleY;
+        n.scaleY = n.scaleWide = n.scaleX = 1.0f;
+    }
     return n;
 }
 float PassScale() { return PassScales().passScale; }
