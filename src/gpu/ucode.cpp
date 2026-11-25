@@ -195,6 +195,22 @@ Shader Parse(const uint32_t* microcodeBE, uint32_t dwords, bool pixel)
             // A branch reached past the end falls through until its own end (or a return or an unconditional jump):
             // keep reading while the last instruction parsed after the end leaves the tail open.
             bool parsedMore = false;
+            // The end in the first half of its pair and a jump or call target in the second half (PGR3's tree
+            // shaders: end at CF 4, the leaf branch jumped to at CF 5): that branch starts past the end and falls
+            // through too, but it arrived with the end's own pair, so nothing counted as read past it and CF 6
+            // on was never parsed (the leaves' colour and alpha stayed 0: alpha-to-mask dropped every tree pixel).
+            // REGPU_NO_END_PAIR_TARGET=1: as before (read at translation).
+            static const bool noEndPairTarget = getenv("REGPU_NO_END_PAIR_TARGET") != nullptr;
+            if (!callsOnly && !noEndPairTarget && pair[0].IsEnd() && !pair[1].IsEnd())
+            {
+                const uint32_t second = uint32_t(shader.cf.size() - 1);
+                for (const Cf& c : shader.cf)
+                {
+                    const CfOp op = c.op();
+                    if ((op == CfOp::CondCall || op == CfOp::CondJmp || op == CfOp::LoopStart || op == CfOp::LoopEnd) && (c.lo & 0x1FFF) == second)
+                        parsedMore = true;
+                }
+            }
             const auto tailOpen = [&] {
                 if (callsOnly || !parsedMore)
                     return false;
