@@ -2078,16 +2078,22 @@ TranslatedShader TranslateShader(const Shader& shader)
             h += "    if (!flat) r.pos.x += vdepth.y;\n";
         // Triple screen: the screen's view of the game's wide frustum (x' = a x + b w, w' = c x + d w, y' = e y; depth
         // kept for the screen's view: z += w' - w, exact for a projection with z = w + B, close for far >> near).
+        // REGPU_TRIPLE_DEPTH=keep (PGR3): z left as it is, exact for a reversed infinite projection (z = B, depth B / w).
         if (TripleShaders())
+        {
+            const char* depth = getenv("REGPU_TRIPLE_DEPTH");
+            const bool keep = depth && strcmp(depth, "keep") == 0;
             h += "    if (!flat && vdepth.w != 0.0)\n"
                  "    {\n"
                  "        const float x0 = r.pos.x, w0 = r.pos.w;\n"
                  "        const float w1 = vtriple.z * x0 + vtriple.w * w0;\n"
                  "        r.pos.x = vtriple.x * x0 + vtriple.y * w0;\n"
-                 "        r.pos.y *= vdepth.z;\n"
-                 "        r.pos.z += w1 - w0;\n"
-                 "        r.pos.w = w1;\n"
+                 "        r.pos.y *= vdepth.z;\n";
+            if (!keep)
+                h += "        r.pos.z += w1 - w0;\n";
+            h += "        r.pos.w = w1;\n"
                  "    }\n";
+        }
         h += "    if (!flat) r.pos.xy *= vwide.xy;\n"
              "    float w = r.pos.w;\n"
              "    // (VTX_W0_FMT set means w is the true W0, the normal case.)\n"

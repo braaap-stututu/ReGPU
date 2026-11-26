@@ -639,6 +639,7 @@ bool g_stereoReplay = false; // the second eye's pass (no write-backs to guest m
 // Triple screen (FM3 port, session 39): the pass's view (RendererSetTripleView) and the triple-wide picture.
 float g_tripleView[5] = {}; // a b c d e of this pass (RendererSetTripleView), e 0 = off
 bool g_tripleSide = false;
+bool g_hudOverSkipping = false; // (HudOverSkip: a side screen's HUD draws are being skipped, up to the next resolve)
 bool g_tripleReady = false; // all three screens captured this frame (the swap shows g_tripleImage)
 ImageRef g_tripleImage, g_tripleScreen[3];
 // REGPU_NO_PASS_SNAPSHOT=1: worked out at every call (A/B, live).
@@ -11385,6 +11386,7 @@ void Resolve()
         return;
 
     const uint32_t sourceSelect = control & 7;
+    g_hudOverSkipping = false; // (a resolve ends a side screen's skipped HUD draws)
     const uint64_t traceFrame = TraceFrame();
     // REGPU_TRACE_RESOLVES=1: every resolve (not just those of the traced frame), with its time.
     static LiveSwitch traceAllResolves("REGPU_TRACE_RESOLVES");
@@ -14607,9 +14609,38 @@ void ScanVrTag()
     }
 }
 
+// Triple screen, the HUD on the centre screen only, for a title that draws its HUD over the scene's composite (PGR3:
+// the tone-map composite, then the HUD's quads, then the front-buffer resolve; FM3 draws its HUD first and uses
+// REGPU_VR_HUD_UNDER). REGPU_HUD_OVER=<composite's pixel shader hash>: in a side screen's pass the draws after that
+// composite are skipped up to the next resolve. (PGR3 session 7.)
+bool HudOverSkip()
+{
+    static const uint64_t hudOver = [] {
+        const char* v = getenv("REGPU_HUD_OVER");
+        return v && *v ? strtoull(v, nullptr, 16) : 0ull;
+    }();
+    if (!hudOver || !g_tripleSide)
+    {
+        g_hudOverSkipping = false;
+        return false;
+    }
+    if (RendererIsResolveDraw())
+    {
+        g_hudOverSkipping = false;
+        return false;
+    }
+    if (g_hudOverSkipping)
+        return true;
+    if (C().psHash == hudOver && WidePass())
+        g_hudOverSkipping = true; // (the composite itself is drawn)
+    return false;
+}
+
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
     ScanVrTag();
+    if (HudOverSkip())
+        return;
     if (StereoHudDraw())
     {
         if (!g_stereoReplay)

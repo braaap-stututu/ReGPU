@@ -837,11 +837,55 @@ void OnShader(uint32_t type, uint32_t address, const uint32_t* code, uint32_t dw
     g_shaderAddress[type] = address;
 }
 
+// REGPU_TRIPLE_SHARE_PASSES=1 (PGR3 session 7): a title whose first full-width draw comes before its shadow maps and
+// reflections (PGR3 clears the frame first) would draw those again for each side screen / eye. With this the recording
+// starts again at the first full-width draw after a narrower pass, until REGPU_TRIPLE_SHARE_LOCK (default 64)
+// full-width draws in a row have been recorded (the main view: later narrow passes, bloom and the like, belong to it).
+bool g_shareLocked = false, g_shareSawNarrow = false;
+uint32_t g_shareWide = 0;
+void ShareRestart()
+{
+    static const bool on = [] {
+        const char* v = getenv("REGPU_TRIPLE_SHARE_PASSES");
+        return v && *v && strcmp(v, "0") != 0;
+    }();
+    static const uint32_t lock = [] {
+        const char* v = getenv("REGPU_TRIPLE_SHARE_LOCK");
+        return v && *v ? uint32_t(atoi(v)) : 64u;
+    }();
+    if (!on || !g_armed || g_shareLocked)
+        return;
+    if (!RendererMainViewNow())
+    {
+        g_shareSawNarrow = true;
+        g_shareWide = 0;
+        return;
+    }
+    if (g_shareSawNarrow)
+    {
+        // Start again here: the state as at this draw (its record is appended again by the caller).
+        g_shareSawNarrow = false;
+        g_startFile = work::g_file;
+        for (int t = 0; t < 2; t++)
+            g_startShader[t] = g_shader[t], g_startShaderAddress[t] = g_shaderAddress[t];
+        g_log.clear();
+    }
+    if (++g_shareWide >= lock)
+        g_shareLocked = true;
+}
+
 // Before a draw record runs: the frame's first main-view draw starts the recording.
 void BeforeDraw()
 {
-    if (!Mode() || g_checked || !RendererMainViewNow())
+    if (g_checked)
+    {
+        ShareRestart();
         return;
+    }
+    if (!Mode() || !RendererMainViewNow())
+        return;
+    g_shareLocked = g_shareSawNarrow = false;
+    g_shareWide = 1;
     g_checked = true;
     if (TripleMode())
     {
@@ -871,6 +915,10 @@ void BeforeDraw()
         g_log.clear();
         g_armed = true;
         RendererSetTripleView(g_tripleViews[1], false); // the game's own pass: the centre screen
+        // REGPU_TRACE_TRIPLE=1 (live, debug): where each frame's recording starts, the swap and the side replays.
+        static LiveSwitch trace("REGPU_TRACE_TRIPLE");
+        if (trace)
+            Log("triple trace: recording from a draw on surface %08X colour %08X", gpureg::Get(0x2000), gpureg::Get(0x2001));
         return;
     }
     float p00 = 0, half = 0;
@@ -935,11 +983,18 @@ void Replay()
             FrameOnShaderLoad(ShaderType(t), g_startShader[t].data(), uint32_t(g_startShader[t].size()), g_startShaderAddress[t]);
     RendererSetStereoReplay(true);
     bool inQuery = false;
+    static LiveSwitch trace("REGPU_TRACE_TRIPLE");
+    uint32_t types[16] = {}, skipped = 0, queries = 0;
     for (size_t i = 0; i < g_log.size();)
     {
         const uint32_t* p = &g_log[i];
         const uint32_t type = p[0] >> 24, words = p[0] & 0xFFFFFF;
         const uint32_t* a = p + 1;
+        types[type & 15]++;
+        if (type == work::kDraw && inQuery)
+            skipped++;
+        if (type == work::kQuery && a[0] == 0)
+            queries++;
         switch (type)
         {
         case work::kRegs:
@@ -963,12 +1018,19 @@ void Replay()
         }
         i += size_t(words) + 1;
     }
+    if (trace)
+        Log("triple trace: replayed regs %u shaders %u draws %u (in queries, skipped %u; queries begun %u) swaps %u write-backs %u stores %u queries %u, ended %s a query",
+            types[work::kRegs], types[work::kShader], types[work::kDraw], skipped, queries, types[work::kSwap], types[work::kWriteBack], types[work::kStore],
+            types[work::kQuery], inQuery ? "inside" : "outside");
     RendererSetStereoReplay(false);
 }
 
 // Triple screen at the swap: the centre (the game's pass) captured, then the left and right screens drawn again turned.
 void TripleAtSwap(uint32_t frontBuffer)
 {
+    static LiveSwitch trace("REGPU_TRACE_TRIPLE");
+    if (trace)
+        Log("triple trace: swap, front buffer %08X, %zu words recorded", frontBuffer, g_log.size());
     RendererTripleCapture(1, frontBuffer);
     g_endFile = work::g_file;
     // REGPU_TRIPLE_CENTRE_ONLY=1 (live): the side screens not drawn (their cost; the centre alone, black sides).
@@ -978,7 +1040,11 @@ void TripleAtSwap(uint32_t frontBuffer)
         {
             RendererSetTripleView(g_tripleViews[side], true);
             g_countScreen = side;
+            if (trace)
+                Log("triple trace: replay %d", side);
             Replay();
+            if (trace)
+                Log("triple trace: replay %d done", side);
             g_countScreen = 1;
             RendererTripleCapture(side, frontBuffer);
         }
@@ -1619,7 +1685,14 @@ uint32_t ExecutePacket(uint32_t ptr)
         auto* c = GuestPtr<uint32_t>(counts);
         const uint32_t finished = __builtin_bswap32(0xFFFFFEED);
         // Layout (little-endian dwords): Total A/B, ZFail A/B, ZPass A/B, StencilFail A/B.
-        const bool end = (c[4] == finished && c[5] == finished) || (c[2] == finished && c[3] == finished);
+        // PGR3's D3D marks only the A counters (Total/ZFail/ZPass/StencilFail A = 0xFFFFFEED, the B ones 0; PGR3 session
+        // 7): taken as an end too. Before, PGR3's queries never ended: the game was never answered (no sun glare change
+        // with REGPU_ZPD_SCALE), and the triple-screen / stereo replays skipped every draw after the frame's first
+        // query (the post-processing and the front-buffer resolve: the side screens showed the centre picture).
+        // REGPU_ZPD_STRICT_END=1: both A and B needed, as before (A/B).
+        static LiveSwitch strictEnd("REGPU_ZPD_STRICT_END");
+        const bool end = (c[4] == finished && c[5] == finished) || (c[2] == finished && c[3] == finished) ||
+                         (!strictEnd && c[0] == finished && c[2] == finished && c[4] == finished && c[6] == finished);
         static int logged = 0;
         static LiveSwitch traceZpd("REGPU_TRACE_ZPD"); // (a getenv per query was ~1% of the command processor)
         if (!traceZpd)
