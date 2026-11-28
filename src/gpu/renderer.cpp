@@ -4240,14 +4240,30 @@ bool DynamicBuffer(uint32_t address, uint32_t bytes)
         return *a;
     static std::unordered_map<uint64_t, Seen> seen;
     static std::mutex mutex; // the draw workers (REGPU_DRAW_WORKERS) check buffers too
-    std::lock_guard lock(mutex);
-    Seen& s = seen[key];
+    std::unique_lock lock(mutex);
+    Seen* sp = &seen[key];
     // Hashing is the cost: a buffer that stopped changing (static geometry, most of them) is
     // checked every 16th frame, one that changes every frame.
-    const bool due = s.frame == ~0ull || g_r.frame <= s.dynamicUntil || g_r.frame >= s.frame + 16;
+    const bool due = sp->frame == ~0ull || g_r.frame <= sp->dynamicUntil || g_r.frame >= sp->frame + 16;
+    uint64_t hash = 0;
+    if (sp->frame != g_r.frame && due)
+    {
+        // Hashed outside the lock (PGR4 8033301): the draw pieces otherwise queued behind one another's hashing of the
+        // buffers that change every frame. Two may both hash a buffer; the first to finish records it (the entry is
+        // looked up again: the map may have grown meanwhile). REGPU_DYNAMIC_HASH_LOCKED=1 (at launch): under the lock.
+        static const bool hashLocked = getenv("REGPU_DYNAMIC_HASH_LOCKED") != nullptr;
+        if (!hashLocked)
+            lock.unlock();
+        hash = ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(address)), bytes);
+        if (!hashLocked)
+        {
+            lock.lock();
+            sp = &seen[key];
+        }
+    }
+    Seen& s = *sp;
     if (s.frame != g_r.frame && due)
     {
-        const uint64_t hash = ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(address)), bytes);
         // A buffer seen changing once stays copied: one written in bursts (FH1's skid marks, appended
         // while the car slides) went back to being read in place 120 frames after its last change and
         // checked every 16th frame, so the next burst was read while the title wrote it (rare exploded
@@ -5110,7 +5126,17 @@ bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, I
     static LiveSwitch noWatch("REGPU_INDEX_NO_WATCH");
     const bool watch = host.watchArm && host.watchClean && host.watchSeq && !noWatch && !sampledIndexHash && !C().worker;
     const uint64_t hash = watch ? 0 : sampledIndexHash ? ContentHash(src, bytes) : FullHash(src, bytes);
-    std::lock_guard textureLock(g_textureMutex);
+    // The index arena has a lock of its own (PGR4 591e573): under the texture mutex, the draw pieces queued behind one
+    // another's texture and bindless work for index buffers. Only this path and the frame end's FlushIndexCopies (no
+    // pieces running then) touch the arena. REGPU_INDEX_TEXTURE_LOCK=1 (at launch): the texture mutex, as before.
+    static std::mutex indexMutex;
+    static const bool textureLock = getenv("REGPU_INDEX_TEXTURE_LOCK") != nullptr;
+    std::unique_lock<std::recursive_mutex> sharedLock(g_textureMutex, std::defer_lock);
+    std::unique_lock<std::mutex> ownLock(indexMutex, std::defer_lock);
+    if (textureLock)
+        sharedLock.lock();
+    else
+        ownLock.lock();
     g_indexChanging = false;
     if (!GetIndexBufferLocked(base, count, is32, endian, view, hash, watch))
         return false;
@@ -13156,21 +13182,33 @@ void SplitMainList()
 // queue submitted) by the replay thread when it gets there (vk::RecordedList::HandOffNew, which also begins the next
 // buffer there: the pool is the replay's). Lists queued by the command processor itself go through the stream too
 // (QueueInStream), so the order holds; whatever queues directly drains first (Real(), WaitForQueueIdle).
-void SplitMainListAsync(bool submit)
+// With signal, the timeline is signalled to that value after the submission, on the replay thread too (PGR4 eb31e61;
+// every other signal drains the replay first, so the values stay in order).
+void QueueClosedSubmitAndSignal(VkCommandBuffer closed, void* ctx)
+{
+    QueueClosedAndSubmit(closed, ctx);
+    SignalFence(uint64_t(uintptr_t(ctx)));
+}
+void SplitMainListAsync(bool submit, uint64_t signal = 0)
 {
     static LiveSwitch sync("REGPU_SYNC_SPLITS"); // (A/B: wait for the replay as before)
     if (sync)
     {
         SplitMainList();
-        if (submit)
+        if (submit || signal)
             SubmitVkLists(0, nullptr);
+        if (signal)
+            SignalFence(signal);
         return;
     }
     FlushReadbackBarrier();
     const bool queryOpen = g_occlusionOpen;
     if (queryOpen)
         EndOcclusionPart();
-    g_r.vkRecorder.HandOffNew(AcquireVkListFor, &Frame(), submit ? QueueClosedAndSubmit : QueueClosed, nullptr);
+    if (signal)
+        g_r.vkRecorder.HandOffNew(AcquireVkListFor, &Frame(), QueueClosedSubmitAndSignal, reinterpret_cast<void*>(uintptr_t(signal)));
+    else
+        g_r.vkRecorder.HandOffNew(AcquireVkListFor, &Frame(), submit ? QueueClosedAndSubmit : QueueClosed, nullptr);
     ListPrologue(g_r.vkRecorder);
     g_drawState.Invalidate();
     SelectSurfaces(true);
@@ -13764,10 +13802,19 @@ uint64_t FenceSubmitImpl()
     lastFrame = g_r.frame;
     lastDraws = draws;
     BeginFrameIfNeeded();
-    SplitMainList();
-    SubmitVkLists(0, nullptr); // (the signal must follow this fence's draws)
+    // The split, submission and signal are handed to the replay thread rather than waited for here (PGR4 eb31e61: the
+    // wait for the replay was ~2.6% of PGR4's command processor, the buffer's end ~1.7%). The fence writer waits on the
+    // value either way. REGPU_SYNC_FENCE_SPLITS=1 (live): waits as before.
+    static LiveSwitch syncSplit("REGPU_SYNC_FENCE_SPLITS");
     lastValue = g_r.nextFence++;
-    SignalFence(lastValue);
+    if (syncSplit)
+    {
+        SplitMainList();
+        SubmitVkLists(0, nullptr); // (the signal must follow this fence's draws)
+        SignalFence(lastValue);
+    }
+    else
+        SplitMainListAsync(true, lastValue);
     if (FenceWritebacks())
     {
         // The write-backs recorded before this fence: the fence writer lands them before the fence.
@@ -13870,6 +13917,13 @@ namespace
 void WorkerMain()
 {
     SetThreadDescription(GetCurrentThread(), L"gpu draw piece worker");
+    // Above normal (PGR4 6adffd9): the command processor waits at each segment's end for the slowest piece, and a worker
+    // sharing its cores with the game's own threads finished late. REGPU_WORKER_PRIORITY=n (at launch, -2..2): this
+    // priority instead (0: normal, as before).
+    {
+        const char* priority = getenv("REGPU_WORKER_PRIORITY");
+        SetThreadPriority(GetCurrentThread(), priority ? std::clamp(atoi(priority), -2, 2) : THREAD_PRIORITY_ABOVE_NORMAL);
+    }
     if (!g_profiledWorker)
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_profiledWorker, 0, FALSE, DUPLICATE_SAME_ACCESS);
     DrawContext ctx;

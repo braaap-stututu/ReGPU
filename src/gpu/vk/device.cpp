@@ -651,6 +651,14 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
     aci.physicalDevice = d.physical;
     aci.device = d.device;
     aci.pVulkanFunctions = &functions;
+    // REGPU_VMA_BLOCK_MB=n (at launch): VMA's block size for large heaps (default 256 MB). A new block's vkAllocateMemory
+    // clears it, and on a Steam Deck (RADV) a 256 MB block took ~30 ms, stalling the frame that streamed a texture into
+    // it, also when made ahead on another thread (PGR3, Deck session 9). Smaller blocks spread that cost.
+    if (const char* mb = getenv("REGPU_VMA_BLOCK_MB"); mb && atoi(mb) > 0)
+    {
+        aci.preferredLargeHeapBlockSize = VkDeviceSize(atoi(mb)) << 20;
+        Log("vk: VMA blocks of %d MB", atoi(mb));
+    }
     aci.flags = (d.memoryBudget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0) |
         (w12.bufferDeviceAddress ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0);
     Check(vmaCreateAllocator(&aci, &d.allocator), "vmaCreateAllocator");
